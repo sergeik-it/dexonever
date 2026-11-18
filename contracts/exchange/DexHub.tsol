@@ -1,0 +1,94 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/Upgrade.tsol";
+
+/// The root's side of its event hubs
+interface IDexHubAnswers {
+    function onHubDeployed(uint8 family, uint8 index, address sendGasTo) external;
+}
+
+/// @title DexHub - one event hub: off-chain readers follow the exchange by DexConstants.HUB_FAMILIES × HUBS_PER_FAMILY
+/// hubs (subscriptions by address), not by the whole network. A contract of a family (pair, launch curve, token root, vault) rings its hub — a
+/// message with no body — in every transaction that emits an event; the hub keeps nothing and checks nothing: who rang
+/// is the message's sender, and a reader reads that contract's own transactions. Its address is the root's platform with
+/// the family and the index (the root computes it), so the hub moves to a new code in place. The bell's value is its
+/// gas (DexGas.hubBellValue): what is left of it stays here
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DexHub {
+
+    address public root;
+    TvmCell public platformCode;
+    uint32 public version;
+    uint8 public family;
+    uint8 public index;
+
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+
+    modifier onlyRoot() {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice A bell: a transaction of the contract that sent it. Nothing to do — the transaction itself is the signal
+    receive() external pure {}
+
+    /// @notice The root moves the hub to its installed code: only a newer version (a hub has no state to keep still
+    /// while it moves); anything else gives the gas back
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external onlyRoot {
+        if (newVersion <= version) {
+            _returnGas(sendGasTo);
+            return;
+        }
+        TvmCell state = abi.encode(root, platformCode, family, index);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(DexConstants.HUB_STATE_LAYOUT, version, newVersion, sendGasTo, state));
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        require(layout == DexConstants.HUB_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (root, platformCode, family, index) = abi.decode(state, (address, TvmCell, uint8, uint8));
+        version = newVersion;
+        emit CodeUpgraded(oldVersion, version);
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice Initialize from DexPlatform (the root deployed it: the params are the family and the index), or take over
+    /// the state of the previous code. A fresh hub tells the root it is there; the value left goes to whoever paid for its
+    /// deploy (send_gas_to)
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        root = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        address sendGasTo = s.load(address);
+        platformCode = s.loadRef();
+        TvmSlice params = s.loadRef().toSlice();
+        (family, index) = params.load(uint8, uint8);
+        tvm.rawReserve(varuint16(DexGas.HUB_MIN_BALANCE), 0);
+        IDexHubAnswers(root).onHubDeployed{ value: varuint16(DexGas.gasValue(DexGas.REGISTRY_HOP)), flag: 0, bounce: false }(family, index, sendGasTo);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    function _returnGas(address to) private pure {
+        tvm.rawReserve(math.max(varuint16(DexGas.HUB_MIN_BALANCE), address(this).balance - msg.value), 2);
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The hub's root, family, index and code version
+    function getDetails() internalMsg externalMsg external view returns (address _root, uint8 _family, uint8 _index, uint32 _version) {
+        return (root, family, index, version);
+    }
+}

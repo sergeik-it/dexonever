@@ -1,0 +1,248 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/Upgrade.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./DexPlatform.tsol";
+
+interface IDexPairLpDeposit {
+    function addLiquidity(uint64 opId, address owner, uint128 leftAmount, uint128 rightAmount, uint128 minLpOut) external;
+    function refundLpAccount(uint64 opId, address owner, uint128 leftAmount, uint128 rightAmount) external;
+}
+
+/// @title LpAccount - Escrow for dual-sided liquidity deposits
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract LpAccount {
+    address public root;
+    address public pair;
+    address public owner;
+    uint32 public version;
+
+    uint128 public leftAmount;
+    uint128 public rightAmount;
+    // the least LP the whole deposit must give: the value of the last half counts
+    uint128 public minLpOut;
+
+    // the halves handed to the pair and not taken by it yet: the pair answers onPairTook, a pair's
+    // transaction that failed bounces with the id, and the halves come back here. One at a time; until the answer new
+    // halves wait here. The id is the first field of the call, inside the 256 bits of a bounce
+    struct InFlight {
+        uint64 id;
+        uint128 left;
+        uint128 right;
+    }
+    uint64 nextOpId;
+    optional(InFlight) inFlight;
+
+    modifier onlyPair() {
+        require(msg.sender == pair, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice Initialize from DexPlatform, or take the state of the old code (Upgrade.tsol)
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        root = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        address sendGasTo = s.load(address);
+        s.loadRef(); // platform code
+
+        TvmSlice params = s.loadRef().toSlice();
+        pair = params.load(address);
+        owner = params.load(address);
+
+        sendGasTo.transfer({
+            value: varuint16(0),
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /// @notice The pair sends the platform's deploy again with every half of a deposit (DexPair.onVaultLpDeposit); on this
+    /// account it lands here. It carries the pair's LpAccount code and version: a newer version moves the account to
+    /// that code before the half that follows, so accounts move on their next deposit and nobody walks a list of them.
+    /// An equal or older version changes nothing; the value stays and goes on with the next forward. Any other
+    /// message is refused. Only the pair
+    fallback() external {
+        TvmSlice body = msg.body;
+        require(msg.sender == pair && body.bits() >= 32 && body.load(uint32) == abi.functionId(DexPlatform), DexErrors.UNKNOWN_OPERATION);
+        (TvmCell code, uint32 newVersion, , ) = abi.decodeFunctionParams(DexPlatform, body);
+        if (newVersion <= version) {
+            return;
+        }
+        TvmCell state = abi.encode(root, pair, owner, leftAmount, rightAmount, minLpOut, nextOpId, inFlight);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(DexConstants.LP_ACCOUNT_STATE_LAYOUT, version, newVersion, owner, state));
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, , uint32 newVersion, , TvmCell state) = Upgrade.unpack(data);
+        // the only layout so far; a code that changes the layout unpacks this one too
+        require(layout == DexConstants.LP_ACCOUNT_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (root, pair, owner, leftAmount, rightAmount, minLpOut, nextOpId, inFlight) =
+            abi.decode(state, (address, address, address, uint128, uint128, uint128, uint64, optional(InFlight)));
+        version = newVersion;
+    }
+
+    /// @notice Deposit one of the tokens. Only the pair
+    function depositSide(bool isLeft, uint128 amount, uint128 _minLpOut) external onlyPair {
+        minLpOut = _minLpOut;
+        if (isLeft) {
+            leftAmount += amount;
+        } else {
+            rightAmount += amount;
+        }
+        bool both = leftAmount > 0 && rightAmount > 0;
+        if (both && inFlight.hasValue()) {
+            // this gas stays here and goes with the halves on the pair's answer
+            _reserveOwnBalance();
+            return;
+        }
+        if (!both || !_sendHalves()) {
+            _returnGas();
+        }
+    }
+
+    /// @notice The owner takes back a half-filled deposit (for example, the pair was paused between the halves). Not while
+    /// halves are with the pair (NOT_READY): its answer comes first. Only the owner
+    function cancel() external {
+        require(msg.sender == owner, DexErrors.NOT_AUTHORIZED);
+        require(leftAmount > 0 || rightAmount > 0, DexErrors.INVALID_AMOUNT);
+        require(!inFlight.hasValue(), DexErrors.NOT_READY);
+        require(msg.value >= DexGas.lpAccountCancelMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        _reserveOwnBalance();
+        uint64 opId = _handOver();
+        IDexPairLpDeposit(pair).refundLpAccount{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: true
+        }(opId, owner, inFlight.get().left, inFlight.get().right);
+    }
+
+    /// @notice Both halves to the pair, if the gas here pays its whole path; otherwise false and they wait (a pair that runs out of
+    /// gas neither answers nor bounces: the halves would stay in flight for good). Of a gas above that, the part that pays
+    /// their way back stays on the account: if the pair's transaction fails, onBounce returns them to the owner by itself,
+    /// and the pair's answer gives it back to the owner. Reserves the account's balance
+    function _sendHalves() private returns (bool) {
+        uint128 needed = DexGas.LP_ACCOUNT_MIN_BALANCE + DexGas.lpDepositMinValue();
+        uint128 balance = uint128(address(this).balance);
+        if (balance < needed) {
+            return false;
+        }
+        uint128 returnGas = DexGas.lpAccountCancelMinValue();
+        tvm.rawReserve(DexGas.LP_ACCOUNT_MIN_BALANCE + (balance >= needed + returnGas ? returnGas : 0), 2);
+        uint64 opId = _handOver();
+        IDexPairLpDeposit(pair).addLiquidity{
+            value: varuint16(0),
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: true
+        }(opId, owner, inFlight.get().left, inFlight.get().right, minLpOut);
+        return true;
+    }
+
+    /// @notice Everything above the account's reserve goes back to the owner; while halves are with the pair, the gas of their way back
+    /// stays here
+    function _returnGas() private view {
+        if (inFlight.hasValue()) {
+            tvm.rawReserve(DexGas.LP_ACCOUNT_MIN_BALANCE + DexGas.lpAccountCancelMinValue(), 2);
+        } else {
+            _reserveOwnBalance();
+        }
+        owner.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The halves go to the pair: off this account, kept as in flight under a new id
+    function _handOver() private returns (uint64) {
+        nextOpId++;
+        inFlight.set(InFlight(nextOpId, leftAmount, rightAmount));
+        leftAmount = 0;
+        rightAmount = 0;
+        return nextOpId;
+    }
+
+    /// @notice The pair took the halves (a deposit or a refund): they are its own now. Halves that gathered meanwhile go to
+    /// the pair on the gas they left here; otherwise the gas left of the answer is the owner's: it
+    /// goes back, the account keeps only its reserve. Only the pair
+    function onPairTook(uint64 opId) external onlyPair {
+        // the answer carries gas for itself only, and a handler out of gas would leave the halves in flight: paid from the
+        // account (only the pair gets here)
+        tvm.accept();
+        if (inFlight.hasValue() && inFlight.get().id == opId) {
+            delete inFlight;
+        }
+        if (leftAmount > 0 && rightAmount > 0 && !inFlight.hasValue()) {
+            if (_sendHalves()) {
+                return;
+            }
+        }
+        _returnGas();
+    }
+
+    /// @notice The pair's transaction failed: the halves of that call are back here. A failed deposit goes back to the owner by
+    /// itself, on the gas kept for it (_sendHalves); a failed return only stays here, so a pair that keeps failing cannot loop
+    onBounce(TvmSlice body) external {
+        uint32 functionId = body.load(uint32);
+        bool deposit = functionId == abi.functionId(IDexPairLpDeposit.addLiquidity);
+        bool handOver = deposit || functionId == abi.functionId(IDexPairLpDeposit.refundLpAccount);
+        if (msg.sender != pair || !handOver || !inFlight.hasValue() || inFlight.get().id != body.load(uint64)) {
+            return;
+        }
+        // the bounce may carry almost no gas: what follows is paid from the account, this handler must not run out of it
+        tvm.accept();
+        leftAmount += inFlight.get().left;
+        rightAmount += inFlight.get().right;
+        delete inFlight;
+        if (deposit && address(this).balance >= DexGas.LP_ACCOUNT_MIN_BALANCE + DexGas.lpAccountCancelMinValue()) {
+            _reserveOwnBalance();
+            uint64 opId = _handOver();
+            IDexPairLpDeposit(pair).refundLpAccount{
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED,
+                bounce: true
+            }(opId, owner, inFlight.get().left, inFlight.get().right);
+        }
+    }
+
+    /// @notice Keeps only a small own balance (storage fees) out of the outgoing gas; once per transaction.
+    /// Everything above it is the owner's gas: the pair redeploys this account on every half, the deploy fails
+    /// on an existing account and its value stays here, so it must go on with the next forward
+    function _reserveOwnBalance() private pure {
+        tvm.rawReserve(varuint16(DexGas.LP_ACCOUNT_MIN_BALANCE), 2);
+    }
+
+    /// @notice Pair, owner and the amounts deposited and not handed to the pair yet. Anyone (getter)
+    function getLpAccountData() internalMsg externalMsg external view returns (
+        address _pair,
+        address _owner,
+        uint128 _leftAmount,
+        uint128 _rightAmount
+    ) {
+        return (pair, owner, leftAmount, rightAmount);
+    }
+
+    /// @notice Whether halves are with the pair and its answer has not come: `cancel` waits for it. Anyone (getter)
+    function isInFlight() internalMsg externalMsg external view returns (bool) {
+        return inFlight.hasValue();
+    }
+
+    /// @notice Same as getLpAccountData. Anyone (getter)
+    function getDetails() internalMsg externalMsg external view returns (
+        address _pair,
+        address _owner,
+        uint128 _leftAmount,
+        uint128 _rightAmount
+    ) {
+        return (pair, owner, leftAmount, rightAmount);
+    }
+}

@@ -1,0 +1,38 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title IDexPairEvents - events of DexPair
+interface IDexPairEvents {
+    // Reserves — the pair after the operation, beneficiary fees accrued and not paid out yet
+    struct Reserves {
+        uint128 leftReserve;
+        uint128 rightReserve;
+        uint128 lpSupply;
+        uint128 beneficiaryLeft;
+        uint128 beneficiaryRight;
+    }
+    /// A swap, a route step included; sender — the sender of the route, fees in the given token
+    event Exchange(address sender, bool spentLeft, uint128 amountIn, uint128 amountOut, uint128 poolFee, uint128 beneficiaryFee, Reserves reserves);
+    /// A deposit: what went into the pool and the LP to the owner (the locked first LP are in lpSupply, not in lpOut)
+    event Deposit(address owner, uint128 leftAmount, uint128 rightAmount, uint128 lpOut, Reserves reserves);
+    event Withdraw(address owner, uint128 lpAmount, uint128 leftOut, uint128 rightOut, Reserves reserves);
+    /// The pair refused an operation (or a deposit was cancelled): `amount` of `token` goes back to `recipient`;
+    /// a refused withdrawal gives back LP (token — lpRoot)
+    event OperationRefunded(address recipient, address token, uint128 amount);
+    event BeneficiaryFeePaid(address beneficiary, uint128 leftAmount, uint128 rightAmount);
+    event BeneficiaryChanged(address beneficiary);
+    event PairStatus(bool paused, bool frozen);
+    /// The upgrader stopped the pair for a move to a new code, or the stop was lifted
+    event UpgradeStatus(bool upgrading);
+    /// The owner let users take their funds out of the frozen pair (withdrawals of liquidity, LP kept for their
+    /// wallets) or took it back; the unfreeze takes it back by itself
+    event WithdrawalsAllowed(bool allowed);
+    event FeeProposed(uint128 poolNumerator, uint128 beneficiaryNumerator, uint32 availableAt, uint32 expiresAt);
+    event FeeChanged(uint128 poolNumerator, uint128 beneficiaryNumerator);
+    event AmplificationProposed(uint32 target, uint32 duration, uint32 readyAt, uint32 expiresAt);
+    /// A × A_PRECISION goes linearly from aFrom at rampStart to aTo at rampEnd
+    event AmplificationRamp(uint32 aFrom, uint32 aTo, uint32 rampStart, uint32 rampEnd);
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+    /// A payout the vault refused: kept for the recipient, ordered again by claimUnpaid
+    event PayoutBounced(address recipient, address token, uint128 amount);
+    event UnpaidClaimed(address recipient, uint128 leftAmount, uint128 rightAmount);
+}

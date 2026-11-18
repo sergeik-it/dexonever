@@ -1,0 +1,10 @@
+pragma tvm-solidity >= 0.79.0;
+
+interface IExchangeResult {
+    struct ExchangeResult {
+        uint128 expectedAmount;
+        uint128 poolFee;
+        uint128 beneficiaryFee;
+        uint128 referrerFee;
+    }
+}

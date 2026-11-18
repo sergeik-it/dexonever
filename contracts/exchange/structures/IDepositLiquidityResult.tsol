@@ -1,0 +1,19 @@
+pragma tvm-solidity >= 0.79.0;
+
+interface IDepositLiquidityResult {
+    struct DepositLiquidityResult {
+        uint128 step1LeftDeposit;
+        uint128 step1RightDeposit;
+        uint128 step1LpReward;
+
+        bool step2LeftToRight;
+        bool step2RightToLeft;
+        uint128 step2Spent;
+        uint128 step2Fee;
+        uint128 step2Received;
+
+        uint128 step3LeftDeposit;
+        uint128 step3RightDeposit;
+        uint128 step3LpReward;
+    }
+}

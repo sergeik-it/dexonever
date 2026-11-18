@@ -1,0 +1,942 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./BridgeStructs.tsol";
+import "./DepositEvent.tsol";
+import "./WithdrawalEvent.tsol";
+import "./libraries/BridgeErrors.tsol";
+import "./libraries/BridgeConstants.tsol";
+import "./libraries/BridgeGas.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/MsgFlag.tsol";
+import "../../../dexonever/everscale/contracts/contracts/tip3/interfaces/ITokenRoot.tsol";
+import "../../../dexonever/everscale/contracts/contracts/tip3/interfaces/IDisableableMintTokenRoot.tsol";
+import "../../../dexonever/everscale/contracts/contracts/tip3/TokenRoot.tsol";
+import "../../../dexonever/everscale/contracts/contracts/tip3/interfaces/IAcceptTokensBurnCallback.tsol";
+
+/// A token of the bridge: its EVM address, the exchange's TIP-3 root the bridge owns, the scale between them and the limits
+struct TokenConfig {
+    address everRoot;
+    // 10^(decimals in the EVM network - decimals in Everscale): USDT of BSC 10^12
+    uint256 scale;
+    // mints, in Everscale units: one at once up to instantMax, all at once within an hour and a day; above — the delay
+    uint128 instantMax;
+    uint128 hourLimit;
+    uint128 dayLimit;
+    // the fixed fees in Everscale units: of a mint — the EVER gas the bridge pays; of a withdrawal
+    // sent by the sender service — its BNB gas
+    uint128 depositFee;
+    uint128 withdrawFee;
+    // the least burn for a withdrawal
+    uint128 minWithdraw;
+}
+
+/// What instant mints of a token gave in the current hour and day
+struct Window {
+    uint32 hour;
+    uint128 hourSpent;
+    uint32 day;
+    uint128 daySpent;
+}
+
+/// A new token waiting for its root's answers (BridgeRoot.setToken): what to set and who gets the gas back
+struct PendingToken {
+    uint160 evmToken;
+    TokenConfig config;
+    address gasTo;
+}
+
+/// What a new token's root was deployed with: its code, key and static data (BridgeRoot.addToken derives its address)
+struct TokenRootInit {
+    TvmCell code;
+    uint256 pubkey;
+    uint256 randomNonce;
+    address deployer;
+    string name;
+    string symbol;
+    uint8 decimals;
+    address rootOwner;
+    TvmCell walletCode;
+}
+
+/// A mint waiting for the delay (above the instant amount or the limits) or for the root's EVER
+struct QueuedMint {
+    uint160 evmToken;
+    address recipient;
+    uint128 amount;
+    uint32 releaseAt;
+}
+
+/// @title The bridge's root in Everscale: the round of the relays, the tokens, mints of deposits, burns of withdrawals
+/// @notice Roles: the owner (the exchange's owner multisig) sets the round, the guardians, the tokens, the limits, the fees
+/// and the delay, unpauses and cancels a queued mint (the veto); a change that loosens the protection is announced first and
+/// applies after codeDelay, the owner or a guardian may cancel it (a guardian's removal — the owner only); a guardian (a watcher) and the owner pause; the upgrader
+/// (the exchange's upgrader multisig) only proposes a new code, which the owner applies after codeDelay, naming the hash it
+/// saw; after renounceUpgrades the code never changes. The codes of the events are set once in the constructor: an event's
+/// address follows from its code, and a new code would give a deposit a second event — a second mint
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract BridgeRoot is IBridgeRootEvents, IAcceptTokensBurnCallback {
+    uint32 version;
+    address owner;
+    address pendingOwner;
+    address upgrader;
+    address pendingUpgrader;
+    mapping(address => bool) guardians;
+    bool paused;
+
+    // the EVM network and its vault: the deposits of this vault only
+    uint32 evmChainId;
+    uint160 evmVault;
+
+    uint32 round;
+    mapping(address => bool) relays;
+    uint8 threshold;
+    // the round of the relays' EVM keys in the vault (BridgeVault.round)
+    uint32 evmRound;
+
+    mapping(uint160 => TokenConfig) tokens;
+    mapping(address => uint160) tokenOfRoot;
+    // new tokens whose roots are being asked: root → what to set; EVM token → its root. Not carried over a code upgrade: an answer
+    // after it finds nothing, and the owner sets the token again
+    mapping(address => PendingToken) pendingTokens;
+    mapping(uint160 => address) pendingRootOf;
+    mapping(uint160 => Window) windows;
+    // fees kept, in Everscale units, minted to the fee recipient by the owner
+    mapping(uint160 => uint128) fees;
+    address feeRecipient;
+
+    uint32 delay;
+    mapping(uint64 => QueuedMint) queued;
+    uint64 nextWithdrawalId;
+
+    TvmCell depositEventCode;
+    TvmCell withdrawalEventCode;
+
+    TvmCell proposedCode;
+    uint32 proposedAt;
+    // how long a proposed code and an announced change wait: set by the deploy, never changed, at most
+    // BridgeConstants.CODE_UPGRADE_DELAY; 0 — they apply at once
+    uint32 codeDelay;
+    // renounced, the code never changes again
+    bool upgradesRenounced;
+
+    // the deposits minted, queued or parked, PROCESSED_WORD_BITS ids a word: a deposit is taken once, even if its event is
+    // deployed again
+    mapping(uint64 => uint256) processed;
+    // confirmed deposits of a token the bridge does not know: they wait for it (releaseParked)
+    mapping(uint64 => DepositData) parked;
+    // the changes the owner announced: the hash of the kind and the call → when
+    mapping(uint256 => uint32) announced;
+    // the code hashes of the exchange's TIP-3 root and wallet: a new token's root must be of them
+    uint256 tokenRootCodeHash;
+    uint256 tokenWalletCodeHash;
+
+    event RoundSet(uint32 round, address[] relays, uint8 threshold, uint32 evmRound);
+    event TokenSet(uint160 evmToken, TokenConfig config);
+    event TokenRefused(uint160 evmToken, address everRoot, uint8 reason);
+    event DepositMinted(uint64 depositId, uint160 evmToken, address recipient, uint128 amount, uint128 fee);
+    event DepositQueued(uint64 depositId, uint160 evmToken, address recipient, uint128 amount, uint32 releaseAt);
+    event DepositCancelled(uint64 depositId);
+    event DepositReopened(uint64 depositId, uint32 round);
+    event DepositReplayed(uint64 depositId);
+    event DepositParked(uint64 depositId, uint160 evmToken);
+    event ChangeAnnounced(uint8 kind, uint256 changeHash, uint32 applicableAt);
+    event ChangeCancelled(uint256 changeHash, address by);
+    event TokenCodesSet(uint256 rootCodeHash, uint256 walletCodeHash);
+    event WithdrawalCreated(uint64 withdrawalId, address withdrawal, WithdrawalData data);
+    event WithdrawalRefused(address everSender, uint128 amount);
+    event FeesMinted(uint160 evmToken, address recipient, uint128 amount);
+    event Paused(address by);
+    event Unpaused();
+    event GuardianSet(address guardian, bool enabled);
+    event DelaySet(uint32 delay);
+    event FeeRecipientSet(address recipient);
+    event OwnershipOffered(address to);
+    event OwnershipTransferred(address from, address to);
+    event UpgraderOffered(address to);
+    event UpgraderTransferred(address from, address to);
+    event CodeProposed(uint256 codeHash, uint32 applicableAt);
+    event CodeProposalRevoked(uint256 codeHash);
+    event UpgradesRenounced();
+    event CodeUpgraded(uint32 oldVersion, uint32 newVersion);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, BridgeErrors.NOT_OWNER);
+        _;
+    }
+
+    modifier onlyUpgrader() {
+        require(msg.sender == upgrader, BridgeErrors.NOT_UPGRADER);
+        _;
+    }
+
+    /// @notice Deployed by the deploy key: the owner and the upgrader are different addresses,
+    /// the codes of the events are final; the code hashes of the exchange's TIP-3 root and wallet
+    constructor(
+        address owner_, address upgrader_, address feeRecipient_, uint32 evmChainId_, uint160 evmVault_, uint32 delay_,
+        TvmCell depositEventCode_, TvmCell withdrawalEventCode_, uint32 codeDelay_, uint256 tokenRootCodeHash_,
+        uint256 tokenWalletCodeHash_
+    ) externalMsg {
+        require(tvm.pubkey() != 0 && msg.pubkey() == tvm.pubkey(), BridgeErrors.NOT_OWNER);
+        require(owner_.value != 0 && upgrader_.value != 0 && owner_ != upgrader_, BridgeErrors.NOT_OWNER);
+        require(feeRecipient_.value != 0 && evmChainId_ != 0 && evmVault_ != 0, BridgeErrors.BAD_RECIPIENT);
+        require(delay_ > 0 && delay_ <= BridgeConstants.MAX_DELAY, BridgeErrors.BAD_DELAY);
+        require(codeDelay_ <= BridgeConstants.CODE_UPGRADE_DELAY, BridgeErrors.BAD_DELAY);
+        require(tokenRootCodeHash_ != 0 && tokenWalletCodeHash_ != 0, BridgeErrors.BAD_CODE);
+        tvm.accept();
+        tokenRootCodeHash = tokenRootCodeHash_;
+        tokenWalletCodeHash = tokenWalletCodeHash_;
+        version = 1;
+        owner = owner_;
+        upgrader = upgrader_;
+        feeRecipient = feeRecipient_;
+        evmChainId = evmChainId_;
+        evmVault = evmVault_;
+        delay = delay_;
+        depositEventCode = depositEventCode_;
+        withdrawalEventCode = withdrawalEventCode_;
+        codeDelay = codeDelay_;
+    }
+
+    // ---------------------------------------------------------------- deposits
+
+    /// @notice A relay's first vote for a deposit: deploys its event with this vote. A second deploy of the same
+    /// event fails there and bounces; relays read the chain and vote at the event when it exists
+    function deployDepositEvent(DepositData data) external view {
+        require(relays.exists(msg.sender), BridgeErrors.NOT_RELAY);
+        require(tokens.exists(data.evmToken), BridgeErrors.BAD_TOKEN);
+        require(msg.value >= BridgeGas.eventDeployValue(DexGas.gasPrice()), BridgeErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(0, 4);
+        new DepositEvent{
+            stateInit: _depositStateInit(data.depositId),
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: true
+        }(data, round, relays, threshold, msg.sender);
+    }
+
+    /// @notice Only from the event of `data.depositId`: it reached its threshold. A deposit already taken (its event deployed
+    /// again) mints nothing: DepositReplayed. Votes of an old round reopen it for the current one; a token the bridge does
+    /// not know parks it (releaseParked); otherwise the deposit is minted at once (within the instant amount and the limits,
+    /// not paused, with the root's EVER) or queued. No reserve of the root's own balance on a mint: the mint is paid from it
+    /// (_canMint), a relay's last vote carries only BridgeGas.voteValue — a failed mint here would leave the event confirmed
+    /// and the deposit never minted
+    function onDepositConfirmed(DepositData data, uint32 eventRound) external override {
+        require(msg.sender == depositEventAddress(data.depositId), BridgeErrors.NOT_EVENT);
+        if (_isProcessed(data.depositId)) {
+            emit DepositReplayed(data.depositId);
+            return;
+        }
+        if (eventRound != round) {
+            tvm.rawReserve(0, 4);
+            emit DepositReopened(data.depositId, round);
+            DepositEvent(msg.sender).reopen{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(round, relays, threshold);
+            return;
+        }
+        _markProcessed(data.depositId);
+        optional(TokenConfig) found = tokens.fetch(data.evmToken);
+        if (!found.hasValue()) {
+            parked[data.depositId] = data;
+            emit DepositParked(data.depositId, data.evmToken);
+            return;
+        }
+        TokenConfig config = found.get();
+        uint128 amount = uint128(data.amount / config.scale);
+        // the limits are taken only by a mint that goes now: a queued one (no EVER for it) does not spend the hour and the day
+        // of the instant ones
+        uint128 price = DexGas.gasPrice();
+        if (!paused && _canMint(price) && _takeLimits(data.evmToken, config, amount, uint32(block.timestamp))) {
+            _mintDeposit(data.depositId, data.evmToken, data.recipient, amount, price);
+        } else {
+            _queue(data.depositId, data.evmToken, data.recipient, amount);
+        }
+    }
+
+    /// @notice A parked deposit once its token is set: queued for the delay, so the owner's veto still applies; anyone calls it
+    function releaseParked(uint64 depositId) external {
+        optional(DepositData) found = parked.fetch(depositId);
+        require(found.hasValue(), BridgeErrors.NOT_QUEUED);
+        DepositData data = found.get();
+        optional(TokenConfig) config = tokens.fetch(data.evmToken);
+        require(config.hasValue(), BridgeErrors.BAD_TOKEN);
+        tvm.rawReserve(0, 4);
+        delete parked[depositId];
+        _queue(depositId, data.evmToken, data.recipient, uint128(data.amount / config.get().scale));
+        _returnGas();
+    }
+
+    /// @notice A queued mint after its delay; anyone calls it. Not while paused and not without the root's own EVER: the
+    /// mint is paid from them. An internal call pays only itself and gets the rest of its gas back.
+    /// An external one (the sender service, without an Everscale wallet) is paid by the root: every check comes before tvm.accept, so a refused one costs the root nothing, and a mint deletes its queue
+    /// entry, so a replay is refused before tvm.accept too. Nothing after tvm.accept may fail: a failed action phase rolls
+    /// the state back with the gas paid, and the same message would drain the root
+    function releaseMint(uint64 depositId) internalMsg externalMsg external {
+        require(!paused, BridgeErrors.PAUSED);
+        optional(QueuedMint) found = queued.fetch(depositId);
+        require(found.hasValue(), BridgeErrors.NOT_QUEUED);
+        QueuedMint q = found.get();
+        require(uint32(block.timestamp) >= q.releaseAt, BridgeErrors.TOO_EARLY);
+        uint128 price = DexGas.gasPrice();
+        require(address(this).balance - msg.value >= BridgeGas.ROOT_KEEP + BridgeGas.mintValue(price), BridgeErrors.NOT_ENOUGH_GAS);
+        if (msg.isExternal) {
+            tvm.accept();
+        }
+        delete queued[depositId];
+        uint128 spent = _mintDeposit(depositId, q.evmToken, q.recipient, q.amount, price);
+        if (msg.isInternal) {
+            // the root keeps its balance before the call less the mint's EVER (+4 — of the balance before the call, +8 — less)
+            tvm.rawReserve(spent, spent > 0 ? 12 : 4);
+            _returnGas();
+        }
+    }
+
+    /// @notice Asks the event of `depositId` to count votes of the current round (the round changed while it waited); anyone
+    /// calls it
+    function refreshDeposit(uint64 depositId) external view {
+        require(msg.value >= BridgeGas.voteValue(DexGas.gasPrice()), BridgeErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(0, 4);
+        IBridgeEvent(depositEventAddress(depositId)).refresh{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(round, relays, threshold);
+    }
+
+    // ---------------------------------------------------------------- withdrawals
+
+    /// @notice Only from the root of a bridge token: a user burned its tokens with the payload (uint160 EVM recipient, bool by the sender service).
+    /// The burn is done: a withdrawal the bridge does not take (paused, a bad payload, below the least amount, less gas
+    /// than BridgeGas.withdrawalMinValue) is minted back to the user. Otherwise the withdrawal is deployed for the relays'
+    /// signatures with BridgeGas.withdrawalDeployValue, and the rest of the gas goes back to remainingGasTo (the wallet of the
+    /// TIP-3 token takes a burn with a callback only with enough gas for at least the refund, TokenGas.BURN_WITH_CALLBACK_GAS)
+    function onAcceptTokensBurn(uint128 amount, address walletOwner, address, address remainingGasTo, TvmCell payload) external override {
+        optional(uint160) evmToken = tokenOfRoot.fetch(msg.sender);
+        require(evmToken.hasValue(), BridgeErrors.BAD_TOKEN);
+        tvm.rawReserve(0, 4);
+        TokenConfig config = tokens[evmToken.get()];
+        TvmSlice s = payload.toSlice();
+        bool readable = s.bits() == BridgeConstants.BURN_PAYLOAD_BITS && s.refs() == 0;
+        uint160 recipient = readable ? uint160(s.loadUint(160)) : 0;
+        bool bySender = readable && s.loadUint(1) == 1;
+        uint128 fee = bySender ? config.withdrawFee : 0;
+        uint128 price = DexGas.gasPrice();
+        if (paused || recipient == 0 || amount < config.minWithdraw || amount <= fee || msg.value < BridgeGas.withdrawalMinValue(price)) {
+            emit WithdrawalRefused(walletOwner, amount);
+            TvmCell empty;
+            ITokenRoot(config.everRoot).mint{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(
+                amount, walletOwner, 0, remainingGasTo, false, empty
+            );
+            return;
+        }
+        fees[evmToken.get()] += fee;
+        uint64 id = nextWithdrawalId;
+        nextWithdrawalId += 1;
+        WithdrawalData data = WithdrawalData(evmToken.get(), recipient, uint256(amount - fee) * config.scale, walletOwner, amount, bySender);
+        emit WithdrawalCreated(id, withdrawalEventAddress(id), data);
+        new WithdrawalEvent{
+            stateInit: _withdrawalStateInit(id),
+            value: varuint16(BridgeGas.withdrawalDeployValue(price)),
+            flag: 0,
+            bounce: false
+        }(data, evmRound, relays, threshold);
+        remainingGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Asks a withdrawal to take signatures of the current EVM round; anyone calls it
+    function refreshWithdrawal(uint64 withdrawalId) external view {
+        require(msg.value >= BridgeGas.voteValue(DexGas.gasPrice()), BridgeErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(0, 4);
+        IBridgeEvent(withdrawalEventAddress(withdrawalId)).refresh{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(evmRound, relays, threshold);
+    }
+
+    // ---------------------------------------------------------------- the owner and the guardians
+
+    /// @notice The owner sets a new round: relay wallets without repeats, a threshold of more than a half, and the round of their EVM keys
+    /// in the vault (the owner sets the same signers there, BridgeVault.setRound). The first round goes at once; a later one
+    /// is announced first (_takeChange)
+    function setRound(address[] relays_, uint8 threshold_, uint32 evmRound_) external onlyOwner {
+        uint256 n = relays_.length;
+        require(n > 0 && n <= BridgeConstants.MAX_RELAYS && uint256(threshold_) * 2 > n && threshold_ <= n, BridgeErrors.BAD_ROUND);
+        require(evmRound_ > evmRound, BridgeErrors.BAD_ROUND);
+        mapping(address => bool) set;
+        for (address relay : relays_) {
+            require(relay.value != 0 && !set.exists(relay), BridgeErrors.BAD_ROUND);
+            set[relay] = true;
+        }
+        tvm.rawReserve(0, 4);
+        if (round == 0 || _takeChange(BridgeConstants.KIND_ROUND, abi.encode(relays_, threshold_, evmRound_))) {
+            round += 1;
+            relays = set;
+            threshold = threshold_;
+            evmRound = evmRound_;
+            emit RoundSet(round, relays_, threshold_, evmRound_);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner adds a token of the bridge: its EVM address, the exchange's TIP-3 root, the scale, the limits and the
+    /// fees. The root is proved by `init`: its address follows from the exchange's TokenRoot code and these data. The first
+    /// token goes at once; a later one is announced first (_takeChange). The owner gives the root to the bridge
+    /// (transferOwnership of the exchange's TIP-3) with its supply 0. The token is set only after its root answers that the
+    /// bridge owns it, its supply is 0 and its mint is open; otherwise TokenRefused. The gas left goes back to the owner
+    /// either way
+    function addToken(uint160 evmToken, TokenConfig config, TokenRootInit init) external onlyOwner {
+        require(evmToken != 0 && config.scale > 0 && !tokens.exists(evmToken) && !pendingRootOf.exists(evmToken), BridgeErrors.BAD_TOKEN);
+        require(!tokenOfRoot.exists(config.everRoot) && !pendingTokens.exists(config.everRoot), BridgeErrors.BAD_TOKEN);
+        require(_isExchangeRoot(config.everRoot, init), BridgeErrors.BAD_TOKEN);
+        require(config.minWithdraw > config.withdrawFee, BridgeErrors.BAD_AMOUNT);
+        tvm.rawReserve(0, 4);
+        bool first = tokens.empty() && pendingTokens.empty();
+        if (!first && !_takeChange(BridgeConstants.KIND_NEW_TOKEN, abi.encode(evmToken, config, init))) {
+            _returnGas();
+            return;
+        }
+        pendingTokens[config.everRoot] = PendingToken(evmToken, config, msg.sender);
+        pendingRootOf[evmToken] = config.everRoot;
+        ITokenRoot(config.everRoot).rootOwner{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: BridgeRoot.onTokenRootOwner }();
+    }
+
+    /// @notice The owner drops a new token whose root has not answered: the EVM token and the root may be added again
+    function cancelPendingToken(uint160 evmToken) external onlyOwner {
+        optional(address) everRoot = pendingRootOf.fetch(evmToken);
+        require(everRoot.hasValue(), BridgeErrors.NOT_PENDING);
+        tvm.rawReserve(0, 4);
+        _forgetPending(everRoot.get(), evmToken);
+        emit TokenRefused(evmToken, everRoot.get(), BridgeConstants.REFUSED_CANCELLED);
+        _returnGas();
+    }
+
+    /// @notice The owner changes the limits and the fees of a bridge token; its root and scale stay (deposits and withdrawals
+    /// in flight are counted with them). Lower limits and fees go at once; higher ones are announced first (_takeChange)
+    function setToken(uint160 evmToken, TokenConfig config) external onlyOwner {
+        optional(TokenConfig) old = tokens.fetch(evmToken);
+        require(old.hasValue() && old.get().everRoot == config.everRoot && old.get().scale == config.scale, BridgeErrors.BAD_TOKEN);
+        require(config.minWithdraw > config.withdrawFee, BridgeErrors.BAD_AMOUNT);
+        tvm.rawReserve(0, 4);
+        if (_tightens(old.get(), config) || _takeChange(BridgeConstants.KIND_TOKEN_CONFIG, abi.encode(evmToken, config))) {
+            _setToken(evmToken, config);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner sets the code hashes of the exchange's TIP-3 root and wallet a new token must have; announced first
+    function setTokenCodes(uint256 rootCodeHash, uint256 walletCodeHash) external onlyOwner {
+        require(rootCodeHash != 0 && walletCodeHash != 0, BridgeErrors.BAD_CODE);
+        tvm.rawReserve(0, 4);
+        if (_takeChange(BridgeConstants.KIND_TOKEN_CODES, abi.encode(rootCodeHash, walletCodeHash))) {
+            tokenRootCodeHash = rootCodeHash;
+            tokenWalletCodeHash = walletCodeHash;
+            emit TokenCodesSet(rootCodeHash, walletCodeHash);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner or a guardian drops an announced change; a guardian's removal is cancelled by the owner only.
+    /// A removal is announced only for a guardian (setGuardian), so its hash is one of the
+    /// guardians': no kind is kept, the state layout stays
+    function cancelChange(uint256 changeHash) external {
+        require(guardians.exists(msg.sender) || msg.sender == owner, BridgeErrors.NOT_GUARDIAN);
+        require(announced.exists(changeHash), BridgeErrors.NOT_ANNOUNCED);
+        if (msg.sender != owner) {
+            for ((address guardian, ) : guardians) {
+                require(changeHash != _changeHash(BridgeConstants.KIND_GUARDIAN, abi.encode(guardian, false)), BridgeErrors.OWNER_CANCELS_ONLY);
+            }
+        }
+        tvm.rawReserve(0, 4);
+        delete announced[changeHash];
+        emit ChangeCancelled(changeHash, msg.sender);
+        _returnGas();
+    }
+
+    /// @notice Only from the root of a pending token: it answers who owns it; the bridge — next its supply
+    function onTokenRootOwner(address tokenRootOwner) external {
+        PendingToken pending = _pendingOf(msg.sender);
+        tvm.rawReserve(0, 4);
+        if (tokenRootOwner != address(this)) {
+            _refuseToken(msg.sender, pending, BridgeConstants.REFUSED_OWNER);
+            return;
+        }
+        TIP3TokenRoot(msg.sender).totalSupply{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: BridgeRoot.onTokenRootSupply }();
+    }
+
+    /// @notice Only from the root of a pending token: its supply; 0 — next whether its mint is open
+    function onTokenRootSupply(uint128 tokenRootSupply) external {
+        PendingToken pending = _pendingOf(msg.sender);
+        tvm.rawReserve(0, 4);
+        if (tokenRootSupply != 0) {
+            _refuseToken(msg.sender, pending, BridgeConstants.REFUSED_SUPPLY);
+            return;
+        }
+        IDisableableMintTokenRoot(msg.sender).mintDisabled{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: BridgeRoot.onTokenRootMint }();
+    }
+
+    /// @notice Only from the root of a pending token: whether its mint is disabled; open — the token is set
+    function onTokenRootMint(bool tokenRootMintDisabled) external {
+        PendingToken pending = _pendingOf(msg.sender);
+        tvm.rawReserve(0, 4);
+        if (tokenRootMintDisabled) {
+            _refuseToken(msg.sender, pending, BridgeConstants.REFUSED_MINT);
+            return;
+        }
+        _forgetPending(msg.sender, pending.evmToken);
+        _setToken(pending.evmToken, pending.config);
+        pending.gasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice A question to the root of a new token bounced (no token root at that address): the token is refused
+    onBounce(TvmSlice body) external {
+        uint32 functionId = body.load(uint32);
+        optional(PendingToken) pending = pendingTokens.fetch(msg.sender);
+        bool asked = functionId == abi.functionId(ITokenRoot.rootOwner) || functionId == abi.functionId(TIP3TokenRoot.totalSupply)
+            || functionId == abi.functionId(IDisableableMintTokenRoot.mintDisabled);
+        if (asked && pending.hasValue()) {
+            tvm.rawReserve(0, 4);
+            _refuseToken(msg.sender, pending.get(), BridgeConstants.REFUSED_NO_ANSWER);
+        }
+    }
+
+    /// @notice A guardian or the owner pauses mints and withdrawals
+    function pause() external {
+        require(guardians.exists(msg.sender) || msg.sender == owner, BridgeErrors.NOT_GUARDIAN);
+        tvm.rawReserve(0, 4);
+        paused = true;
+        emit Paused(msg.sender);
+        _returnGas();
+    }
+
+    /// @notice The owner unpauses
+    function unpause() external onlyOwner {
+        tvm.rawReserve(0, 4);
+        paused = false;
+        emit Unpaused();
+        _returnGas();
+    }
+
+    /// @notice The owner's veto: a queued mint is dropped
+    function cancelMint(uint64 depositId) external onlyOwner {
+        require(queued.exists(depositId), BridgeErrors.NOT_QUEUED);
+        tvm.rawReserve(0, 4);
+        delete queued[depositId];
+        emit DepositCancelled(depositId);
+        _returnGas();
+    }
+
+    /// @notice The owner's veto for a batch of queued mints, at most BridgeConstants.MAX_CANCELS at once.
+    /// Atomic: an id that is not queued refuses the whole call
+    function cancelMints(uint64[] depositIds) external onlyOwner {
+        require(depositIds.length > 0 && depositIds.length <= BridgeConstants.MAX_CANCELS, BridgeErrors.BAD_AMOUNT);
+        tvm.rawReserve(0, 4);
+        for (uint64 depositId : depositIds) {
+            require(queued.exists(depositId), BridgeErrors.NOT_QUEUED);
+            delete queued[depositId];
+            emit DepositCancelled(depositId);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner mints the fees kept of a token to the fee recipient
+    function mintFees(uint160 evmToken) external onlyOwner {
+        uint128 amount = fees[evmToken];
+        require(amount > 0, BridgeErrors.BAD_AMOUNT);
+        uint128 price = DexGas.gasPrice();
+        require(_canMint(price), BridgeErrors.NOT_ENOUGH_GAS);
+        delete fees[evmToken];
+        emit FeesMinted(evmToken, feeRecipient, amount);
+        TvmCell empty;
+        ITokenRoot(tokens[evmToken].everRoot).mint{ value: varuint16(BridgeGas.mintValue(price)), flag: MsgFlag.SENDER_PAYS_FEES, bounce: false }(
+            amount, feeRecipient, BridgeGas.deployWalletValue(price), feeRecipient, false, empty
+        );
+    }
+
+    /// @notice The owner adds a guardian at once or removes one after announcing it (_takeChange)
+    function setGuardian(address guardian, bool enabled) external onlyOwner {
+        require(guardian.value != 0, BridgeErrors.NOT_GUARDIAN);
+        tvm.rawReserve(0, 4);
+        if (enabled) {
+            guardians[guardian] = true;
+            emit GuardianSet(guardian, enabled);
+        } else if (!guardians.exists(guardian) || _takeChange(BridgeConstants.KIND_GUARDIAN, abi.encode(guardian, enabled))) {
+            delete guardians[guardian];
+            emit GuardianSet(guardian, enabled);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner brings the EVER settled on a bridged token's root back to the bridge's root, which pays mints from
+    /// them: TIP-3 sends a wallet deploy with every mint (the root cannot know whether the recipient's wallet exists), and to
+    /// an existing wallet it bounces to the token root. Only the token root's owner — this root — takes them; the token root
+    /// keeps its own target balance
+    function collectTokenGas(uint160 evmToken) external view onlyOwner {
+        require(tokens.exists(evmToken), BridgeErrors.BAD_TOKEN);
+        tvm.rawReserve(0, 4);
+        TokenRoot(tokens[evmToken].everRoot).sendSurplusGas{ value: varuint16(BridgeGas.tokenRootCallValue(DexGas.gasPrice())), flag: 0, bounce: false }(address(this));
+        _returnGas();
+    }
+
+    /// @notice The owner sets the delay of a queued mint, at most BridgeConstants.MAX_DELAY: a longer one at once, a shorter
+    /// one after announcing it (_takeChange)
+    function setDelay(uint32 delay_) external onlyOwner {
+        require(delay_ > 0 && delay_ <= BridgeConstants.MAX_DELAY, BridgeErrors.BAD_DELAY);
+        tvm.rawReserve(0, 4);
+        if (delay_ >= delay || _takeChange(BridgeConstants.KIND_DELAY, abi.encode(delay_))) {
+            delay = delay_;
+            emit DelaySet(delay_);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner sets who gets the minted fees, after announcing it (_takeChange)
+    function setFeeRecipient(address recipient) external onlyOwner {
+        require(recipient.value != 0, BridgeErrors.BAD_RECIPIENT);
+        tvm.rawReserve(0, 4);
+        if (_takeChange(BridgeConstants.KIND_FEE_RECIPIENT, abi.encode(recipient))) {
+            feeRecipient = recipient;
+            emit FeeRecipientSet(recipient);
+        }
+        _returnGas();
+    }
+
+    /// @notice The owner offers the ownership to `to`; it takes effect on acceptOwnership
+    function transferOwnership(address to) external onlyOwner {
+        tvm.rawReserve(0, 4);
+        pendingOwner = to;
+        emit OwnershipOffered(to);
+        _returnGas();
+    }
+
+    /// @notice The offered owner accepts; it may not be the upgrader
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner && msg.sender.value != 0 && msg.sender != upgrader, BridgeErrors.NOT_OWNER);
+        tvm.rawReserve(0, 4);
+        emit OwnershipTransferred(owner, msg.sender);
+        owner = msg.sender;
+        pendingOwner = address(0);
+        _returnGas();
+    }
+
+    // ---------------------------------------------------------------- the code
+
+    /// @notice The upgrader proposes a new code (replacing a proposed one); the owner may apply it after codeDelay. Not after
+    /// renounceUpgrades
+    function proposeCode(TvmCell code) external onlyUpgrader {
+        require(!upgradesRenounced, BridgeErrors.NOT_UPGRADER);
+        tvm.rawReserve(0, 4);
+        proposedCode = code;
+        proposedAt = uint32(block.timestamp);
+        emit CodeProposed(tvm.hash(code), proposedAt + codeDelay);
+        _returnGas();
+    }
+
+    /// @notice The upgrader gives up changing the code for good: a proposed code is revoked, nothing is proposed or applied again
+    function renounceUpgrades() external onlyUpgrader {
+        require(!upgradesRenounced, BridgeErrors.NOT_UPGRADER);
+        tvm.rawReserve(0, 4);
+        upgradesRenounced = true;
+        if (proposedAt != 0) {
+            emit CodeProposalRevoked(tvm.hash(proposedCode));
+            _clearProposal();
+        }
+        emit UpgradesRenounced();
+        _returnGas();
+    }
+
+    /// @notice The upgrader revokes the proposed code
+    function revokeCode() external onlyUpgrader {
+        require(proposedAt != 0, BridgeErrors.BAD_CODE);
+        tvm.rawReserve(0, 4);
+        emit CodeProposalRevoked(tvm.hash(proposedCode));
+        _clearProposal();
+        _returnGas();
+    }
+
+    /// @notice The upgrader offers its role to `to`; it takes effect on acceptUpgrader
+    function transferUpgrader(address to) external onlyUpgrader {
+        tvm.rawReserve(0, 4);
+        pendingUpgrader = to;
+        emit UpgraderOffered(to);
+        _returnGas();
+    }
+
+    /// @notice The offered upgrader accepts; it may not be the owner
+    function acceptUpgrader() external {
+        require(msg.sender == pendingUpgrader && msg.sender.value != 0 && msg.sender != owner, BridgeErrors.NOT_UPGRADER);
+        tvm.rawReserve(0, 4);
+        emit UpgraderTransferred(upgrader, msg.sender);
+        upgrader = msg.sender;
+        pendingUpgrader = address(0);
+        _returnGas();
+    }
+
+    /// @notice The owner applies the proposed code after codeDelay, within BridgeConstants.CODE_APPLY_WINDOW, naming its
+    /// hash: it applies exactly what it saw. The address and the whole state stay
+    function applyCode(uint256 expectedHash) external onlyOwner {
+        require(!upgradesRenounced, BridgeErrors.NOT_UPGRADER);
+        require(proposedAt != 0 && tvm.hash(proposedCode) == expectedHash, BridgeErrors.BAD_CODE);
+        uint32 now_ = uint32(block.timestamp);
+        require(now_ >= proposedAt + codeDelay, BridgeErrors.TOO_EARLY);
+        require(now_ <= proposedAt + codeDelay + BridgeConstants.CODE_APPLY_WINDOW, BridgeErrors.BAD_CODE);
+        TvmCell code = proposedCode;
+        _clearProposal();
+        TvmCell state = abi.encode(
+            abi.encode(
+                abi.encode(version, owner, pendingOwner, upgrader, pendingUpgrader, guardians, paused),
+                abi.encode(evmChainId, evmVault, round, relays, threshold, evmRound),
+                abi.encode(tokens, tokenOfRoot, windows, fees, feeRecipient),
+                abi.encode(delay, queued, nextWithdrawalId, depositEventCode, withdrawalEventCode),
+                abi.encode(codeDelay, upgradesRenounced)
+            ),
+            abi.encode(processed, parked, announced, tokenRootCodeHash, tokenWalletCodeHash)
+        );
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(abi.encode(BridgeConstants.STATE_LAYOUT, msg.sender, state));
+    }
+
+    /// @notice The new code reads the state of the layouts it knows; another layout throws, and the upgrade rolls back. The
+    /// previous layout has no processed deposits: its queued ones are marked; no token codes: they are set by setTokenCodes
+    function onCodeUpgrade(TvmCell data) private {
+        (uint16 layout, address sendGasTo, TvmCell state) = abi.decode(data, (uint16, address, TvmCell));
+        require(layout == BridgeConstants.STATE_LAYOUT || layout == BridgeConstants.PREVIOUS_STATE_LAYOUT, BridgeErrors.BAD_CODE);
+        tvm.resetStorage();
+        uint32 oldVersion;
+        if (layout == BridgeConstants.STATE_LAYOUT) {
+            (TvmCell base, TvmCell added) = abi.decode(state, (TvmCell, TvmCell));
+            oldVersion = _decodeBaseState(base);
+            (processed, parked, announced, tokenRootCodeHash, tokenWalletCodeHash) = abi.decode(added, (
+                mapping(uint64 => uint256), mapping(uint64 => DepositData), mapping(uint256 => uint32), uint256, uint256
+            ));
+        } else {
+            oldVersion = _decodeBaseState(state);
+            for ((uint64 depositId, ) : queued) {
+                _markProcessed(depositId);
+            }
+        }
+        version = oldVersion + 1;
+        emit CodeUpgraded(oldVersion, version);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The state of the previous layout (in the current one — its first part); returns the old version
+    function _decodeBaseState(TvmCell state) private returns (uint32 oldVersion) {
+        (TvmCell roles, TvmCell network, TvmCell tokenState, TvmCell rest, TvmCell upgrades) =
+            abi.decode(state, (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell));
+        (oldVersion, owner, pendingOwner, upgrader, pendingUpgrader, guardians, paused) =
+            abi.decode(roles, (uint32, address, address, address, address, mapping(address => bool), bool));
+        (evmChainId, evmVault, round, relays, threshold, evmRound) =
+            abi.decode(network, (uint32, uint160, uint32, mapping(address => bool), uint8, uint32));
+        (tokens, tokenOfRoot, windows, fees, feeRecipient) = abi.decode(tokenState, (
+            mapping(uint160 => TokenConfig), mapping(address => uint160), mapping(uint160 => Window), mapping(uint160 => uint128), address
+        ));
+        (delay, queued, nextWithdrawalId, depositEventCode, withdrawalEventCode) =
+            abi.decode(rest, (uint32, mapping(uint64 => QueuedMint), uint64, TvmCell, TvmCell));
+        (codeDelay, upgradesRenounced) = abi.decode(upgrades, (uint32, bool));
+    }
+
+    // ---------------------------------------------------------------- views
+
+    /// @notice The address of the event of deposit `depositId`
+    function depositEventAddress(uint64 depositId) internalMsg externalMsg public view returns (address) {
+        return address(tvm.hash(_depositStateInit(depositId)));
+    }
+
+    /// @notice The address of the event of withdrawal `withdrawalId`
+    function withdrawalEventAddress(uint64 withdrawalId) internalMsg externalMsg public view returns (address) {
+        return address(tvm.hash(_withdrawalStateInit(withdrawalId)));
+    }
+
+    /// @notice The root's roles, network, round, delay and counters
+    function getDetails() internalMsg externalMsg external view responsible returns (
+        uint32 _version, address _owner, address _upgrader, bool _paused, uint32 _evmChainId, uint160 _evmVault,
+        uint32 _round, mapping(address => bool) _relays, uint8 _threshold, uint32 _evmRound, uint32 _delay,
+        uint64 _nextWithdrawalId, address _feeRecipient
+    ) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (
+            version, owner, upgrader, paused, evmChainId, evmVault, round, relays, threshold, evmRound, delay,
+            nextWithdrawalId, feeRecipient
+        );
+    }
+
+    /// @notice A token's config, its window of instant mints and its fees kept
+    function getToken(uint160 evmToken) internalMsg externalMsg external view responsible returns (optional(TokenConfig) config, Window window, uint128 fee) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (tokens.fetch(evmToken), windows[evmToken], fees[evmToken]);
+    }
+
+    /// @notice A queued mint of deposit `depositId`, if any
+    function getQueued(uint64 depositId) internalMsg externalMsg external view responsible returns (optional(QueuedMint)) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } queued.fetch(depositId);
+    }
+
+    /// @notice What the bridge's messages need at the network's gas price now (BridgeGas): the first vote of a deposit, any
+    /// other vote or signature, the least gas of a withdrawal's burn, and what one mint takes of the root's own EVER (it mints
+    /// only above ROOT_KEEP and that). Callers send these (and more — the rest comes back), not values of their own.
+    /// `gasPrice_` — the gas price of the network config (param 21, 1/65536 nanoEVER a gas): a getter run locally has no
+    /// network config; 0 — the contract's own reading. The argument is uint256: with a uint64 or uint128 argument a local
+    /// run of this responsible getter failed (TvmException -8)
+    function getGasValues(uint256 gasPrice_) internalMsg externalMsg external pure responsible returns (uint128 eventDeploy, uint128 vote, uint128 withdrawalMin, uint128 mint) {
+        uint128 at = gasPrice_ > 0 ? uint128(gasPrice_) : DexGas.gasPrice();
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (
+            BridgeGas.eventDeployValue(at), BridgeGas.voteValue(at), BridgeGas.withdrawalMinValue(at), BridgeGas.mintValue(at)
+        );
+    }
+
+    /// @notice Whether `guardian` is a guardian
+    function isGuardian(address guardian) internalMsg externalMsg external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } guardians.exists(guardian);
+    }
+
+    /// @notice Whether deposit `depositId` was minted, queued or parked
+    function isProcessed(uint64 depositId) internalMsg externalMsg external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } _isProcessed(depositId);
+    }
+
+    /// @notice A parked deposit (its token unknown), if any
+    function getParked(uint64 depositId) internalMsg externalMsg external view responsible returns (optional(DepositData)) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } parked.fetch(depositId);
+    }
+
+    /// @notice The announced changes: the hash of the kind and the call → when announced
+    function getAnnounced() internalMsg externalMsg external view responsible returns (mapping(uint256 => uint32)) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } announced;
+    }
+
+    // ---------------------------------------------------------------- internal
+
+    function _depositStateInit(uint64 depositId) private view returns (TvmCell) {
+        return abi.encodeStateInit({ contr: DepositEvent, varInit: { root: address(this), depositId: depositId }, code: depositEventCode });
+    }
+
+    function _withdrawalStateInit(uint64 withdrawalId) private view returns (TvmCell) {
+        return abi.encodeStateInit({ contr: WithdrawalEvent, varInit: { root: address(this), withdrawalId: withdrawalId }, code: withdrawalEventCode });
+    }
+
+    /// @notice Whether an instant mint of `amount` fits the token's instant amount and its hour and day; takes it if so
+    function _takeLimits(uint160 evmToken, TokenConfig config, uint128 amount, uint32 now_) private returns (bool) {
+        if (amount > config.instantMax) {
+            return false;
+        }
+        Window w = windows[evmToken];
+        uint32 hour = now_ / BridgeConstants.HOUR;
+        uint32 day = now_ / BridgeConstants.DAY;
+        uint128 hourSpent = w.hour == hour ? w.hourSpent : 0;
+        uint128 daySpent = w.day == day ? w.daySpent : 0;
+        if (hourSpent + amount > config.hourLimit || daySpent + amount > config.dayLimit) {
+            return false;
+        }
+        windows[evmToken] = Window(hour, hourSpent + amount, day, daySpent + amount);
+        return true;
+    }
+
+    /// @notice The root pays a mint from its own EVER and keeps ROOT_KEEP (the mint at the gas `price`)
+    function _canMint(uint128 price) private view returns (bool) {
+        return address(this).balance >= BridgeGas.ROOT_KEEP + BridgeGas.mintValue(price);
+    }
+
+    /// @notice The deposit less the fixed fee to its recipient (the fee is kept for mintFees); the EVER of the mint — the
+    /// root's at the gas `price`. The EVER the mint took of the root (0 — a deposit not above the fee mints nothing)
+    function _mintDeposit(uint64 depositId, uint160 evmToken, address recipient, uint128 amount, uint128 price) private returns (uint128) {
+        uint128 fee = math.min(tokens[evmToken].depositFee, amount);
+        fees[evmToken] += fee;
+        emit DepositMinted(depositId, evmToken, recipient, amount - fee, fee);
+        if (amount > fee) {
+            TvmCell empty;
+            uint128 value = BridgeGas.mintValue(price);
+            ITokenRoot(tokens[evmToken].everRoot).mint{ value: varuint16(value), flag: MsgFlag.SENDER_PAYS_FEES, bounce: false }(
+                amount - fee, recipient, BridgeGas.deployWalletValue(price), recipient, false, empty
+            );
+            return value;
+        }
+        return 0;
+    }
+
+    function _queue(uint64 depositId, uint160 evmToken, address recipient, uint128 amount) private {
+        uint32 releaseAt = uint32(block.timestamp) + delay;
+        queued[depositId] = QueuedMint(evmToken, recipient, amount, releaseAt);
+        emit DepositQueued(depositId, evmToken, recipient, amount, releaseAt);
+    }
+
+    function _isProcessed(uint64 depositId) private view returns (bool) {
+        uint256 word = processed[depositId / BridgeConstants.PROCESSED_WORD_BITS];
+        return (word >> (depositId % BridgeConstants.PROCESSED_WORD_BITS)) & 1 == 1;
+    }
+
+    function _markProcessed(uint64 depositId) private {
+        processed[depositId / BridgeConstants.PROCESSED_WORD_BITS] |= uint256(1) << (depositId % BridgeConstants.PROCESSED_WORD_BITS);
+    }
+
+    /// @notice Whether an announced change applies now: announced at least codeDelay ago, within CHANGE_APPLY_WINDOW after
+    /// it (then it is used up). Otherwise it is announced (anew after its window) and false returned; before its delay — refused
+    function _takeChange(uint8 kind, TvmCell call) private returns (bool) {
+        uint256 hash = _changeHash(kind, call);
+        uint32 now_ = uint32(block.timestamp);
+        optional(uint32) at = announced.fetch(hash);
+        if (at.hasValue() && now_ <= at.get() + codeDelay + BridgeConstants.CHANGE_APPLY_WINDOW) {
+            require(now_ >= at.get() + codeDelay, BridgeErrors.TOO_EARLY);
+            delete announced[hash];
+            return true;
+        }
+        announced[hash] = now_;
+        emit ChangeAnnounced(kind, hash, now_ + codeDelay);
+        return false;
+    }
+
+    function _changeHash(uint8 kind, TvmCell call) private pure returns (uint256) {
+        return tvm.hash(abi.encode(kind, call));
+    }
+
+    /// @notice Whether a token's new config only lowers its limits and fees
+    function _tightens(TokenConfig old, TokenConfig config) private pure returns (bool) {
+        return config.instantMax <= old.instantMax && config.hourLimit <= old.hourLimit && config.dayLimit <= old.dayLimit
+            && config.depositFee <= old.depositFee && config.withdrawFee <= old.withdrawFee;
+    }
+
+    /// @notice Whether `everRoot` is a root of the exchange's TIP-3 deployed with `init`: its code and its wallets' code have
+    /// the hashes kept here, and its address follows from them and the data
+    function _isExchangeRoot(address everRoot, TokenRootInit init) private view returns (bool) {
+        if (tvm.hash(init.code) != tokenRootCodeHash || tvm.hash(init.walletCode) != tokenWalletCodeHash) {
+            return false;
+        }
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: TokenRoot,
+            varInit: {
+                randomNonce_: init.randomNonce,
+                deployer_: init.deployer,
+                name_: init.name,
+                symbol_: init.symbol,
+                decimals_: init.decimals,
+                rootOwner_: init.rootOwner,
+                walletCode_: init.walletCode
+            },
+            pubkey: init.pubkey,
+            code: init.code
+        });
+        return everRoot == address.makeAddrStd(0, tvm.hash(stateInit));
+    }
+
+    function _clearProposal() private {
+        TvmCell empty;
+        proposedCode = empty;
+        proposedAt = 0;
+    }
+
+    function _setToken(uint160 evmToken, TokenConfig config) private {
+        tokens[evmToken] = config;
+        tokenOfRoot[config.everRoot] = evmToken;
+        emit TokenSet(evmToken, config);
+    }
+
+    function _pendingOf(address everRoot) private view returns (PendingToken) {
+        optional(PendingToken) pending = pendingTokens.fetch(everRoot);
+        require(pending.hasValue(), BridgeErrors.NOT_PENDING);
+        return pending.get();
+    }
+
+    function _forgetPending(address everRoot, uint160 evmToken) private {
+        delete pendingTokens[everRoot];
+        delete pendingRootOf[evmToken];
+    }
+
+    function _refuseToken(address everRoot, PendingToken pending, uint8 reason) private {
+        _forgetPending(everRoot, pending.evmToken);
+        emit TokenRefused(pending.evmToken, everRoot, reason);
+        pending.gasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    function _returnGas() private pure {
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+}

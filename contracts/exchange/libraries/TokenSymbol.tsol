@@ -1,0 +1,141 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+
+/// The text of a token's symbol and name (the factory, launches and the owner's tokens): valid UTF-8 within the byte
+/// limit and no character that is invisible, blank or a control one: «USDT» with such a character would pass the reserve
+/// of USDT and look like it. Every other character is allowed: letters of any script, digits, signs, emoji. A symbol has
+/// no space; a name has single U+0020 between words, none first or last.
+///
+/// Forbidden code points: White_Space, Cc, Cf, Default_Ignorable_Code_Point, private use, noncharacters and the blank
+/// look-alikes U+2800, U+1D159, U+FFFC (Unicode 17):
+///   0000-0020 007F-00A0 00AD 034F 0600-0605 061C 06DD 070F 0890-0891 08E2 115F-1160 1680 17B4-17B5 180B-180F
+///   2000-200F 2028-202F 205F-206F 2800 3000 3164 E000-F8FF FDD0-FDEF FE00-FE0F FEFF FFA0 FFF0-FFFC
+///   110BD 110CD 13430-1343F 1BCA0-1BCA3 1D159 1D173-1D17A E0000-E0FFF F0000-10FFFF and xFFFE-xFFFF of every plane.
+/// Allowed for emoji: U+FE0F right after an emoji code point; U+200D after an emoji code point or such a U+FE0F and right
+/// before an emoji code point. Emoji code points: 00A9 00AE 203C 2049 2122 2139 2190-2BFF 3030 303D 3297 3299 1F000-1FFFF
+library TokenSymbol {
+
+    uint32 constant SPACE = 0x20;
+    uint32 constant VARIATION_SELECTOR_16 = 0xFE0F;
+    uint32 constant ZERO_WIDTH_JOINER = 0x200D;
+    // bit b is set when the block U+bb00-U+bbFF has a forbidden code point (or a surrogate, D800-DFFF): a character of
+    // any other block passes at once
+    uint256 constant BMP_BLOCKS = 0xE1FFFFFFFF000000000000000000000000000000000000000003010101C201C9;
+
+    /// A symbol: 1..TOKEN_SYMBOL_MAX_BYTES bytes, no space
+    function valid(string symbol) internal returns (bool) {
+        return _visible(symbol, DexConstants.TOKEN_SYMBOL_MAX_BYTES, false);
+    }
+
+    /// A name: 1..TOKEN_NAME_MAX_BYTES bytes, single spaces between words
+    function validName(string name) internal returns (bool) {
+        return _visible(name, DexConstants.TOKEN_NAME_MAX_BYTES, true);
+    }
+
+    function _visible(string text, uint32 maxBytes, bool spaces) private returns (bool) {
+        // an empty text is refused at the end: nothing follows the space before it
+        if (text.byteLength() > maxBytes) {
+            return false;
+        }
+        // the limits fit in one cell (127 bytes): a text split over more cells is not one the ABI makes
+        TvmSlice rest = TvmSlice(bytes(text));
+        if (rest.refs() != 0) {
+            return false;
+        }
+        // a space before the text: a leading space or U+FE0F has nothing to follow
+        uint32 previous = SPACE;
+        bool joining = false;
+        while (!rest.empty()) {
+            uint32 code = rest.load(uint8);
+            // most characters: printable ASCII
+            if (code > SPACE && code < 0x7F && !joining) {
+                previous = code;
+                continue;
+            }
+            if (code >= 0x80) {
+                // UTF-8: a lead byte C2-DF, E0-EF or F0-F4 and 1, 2 or 3 continuation bytes 10xxxxxx, the shortest form
+                // of a code point (C0, C1 and the lower E0, F0 forms are longer ones); a surrogate and a code point above
+                // U+10FFFF (F4 90 and up) are refused as forbidden code points
+                bool malformed;
+                if (code < 0xE0) {
+                    malformed = code < 0xC2 || rest.bits() < 8;
+                    if (!malformed) {
+                        uint32 tail = rest.load(uint8);
+                        malformed = tail & 0xC0 != 0x80;
+                        code = ((code & 0x1F) << 6) | (tail & 0x3F);
+                    }
+                } else if (code < 0xF0) {
+                    malformed = rest.bits() < 16;
+                    if (!malformed) {
+                        uint32 tail = rest.load(uint16);
+                        code = ((code & 0x0F) << 12) | ((tail & 0x3F00) >> 2) | (tail & 0x3F);
+                        malformed = tail & 0xC0C0 != 0x8080 || code < 0x800;
+                    }
+                } else {
+                    malformed = code > 0xF4 || rest.bits() < 24;
+                    if (!malformed) {
+                        uint32 tail = rest.load(uint24);
+                        code = ((code & 0x07) << 18) | ((tail & 0x3F0000) >> 4) | ((tail & 0x3F00) >> 2) | (tail & 0x3F);
+                        malformed = tail & 0xC0C0C0 != 0x808080 || code < 0x10000;
+                    }
+                }
+                if (malformed) {
+                    return false;
+                }
+                // most of the rest: a BMP block with nothing forbidden
+                if (!joining && code < 0x10000 && (BMP_BLOCKS >> (code >> 8)) & 1 == 0) {
+                    previous = code;
+                    continue;
+                }
+            }
+            if (joining && !_emoji(code)) {
+                return false;
+            }
+            joining = false;
+            if (code == SPACE) {
+                if (!spaces || previous == SPACE) {
+                    return false;
+                }
+            } else if (_forbidden(code)) {
+                // the emoji's own invisible characters: U+FE0F after an emoji, U+200D after an emoji or that U+FE0F
+                if (code == ZERO_WIDTH_JOINER && (_emoji(previous) || previous == VARIATION_SELECTOR_16)) {
+                    joining = true;
+                } else if (code != VARIATION_SELECTOR_16 || !_emoji(previous)) {
+                    return false;
+                }
+            }
+            previous = code;
+        }
+        return !joining && previous != SPACE;
+    }
+
+    /// The forbidden code points of the list above, U+FE0F and U+200D among them; a surrogate is forbidden too
+    function _forbidden(uint32 c) private returns (bool) {
+        if (c < 0x800) {
+            return c <= 0x20 || (c >= 0x7F && c <= 0xA0) || c == 0xAD || c == 0x34F || (c >= 0x600 && c <= 0x605) || c == 0x61C ||
+                c == 0x6DD || c == 0x70F;
+        }
+        if (c < 0x2000) {
+            return c == 0x890 || c == 0x891 || c == 0x8E2 || c == 0x115F || c == 0x1160 || c == 0x1680 || c == 0x17B4 || c == 0x17B5 ||
+                (c >= 0x180B && c <= 0x180F);
+        }
+        if (c < 0xE000) {
+            return c <= 0x200F || (c >= 0x2028 && c <= 0x202F) || (c >= 0x205F && c <= 0x206F) || c == 0x2800 || c == 0x3000 ||
+                c == 0x3164 || c >= 0xD800;
+        }
+        if (c < 0x10000) {
+            return c <= 0xF8FF || (c >= 0xFDD0 && c <= 0xFDEF) || (c >= 0xFE00 && c <= 0xFE0F) || c == 0xFEFF || c == 0xFFA0 ||
+                (c >= 0xFFF0 && c != 0xFFFD);
+        }
+        return (c & 0xFFFE) == 0xFFFE || (c >= 0xE0000 && (c <= 0xE0FFF || c >= 0xF0000)) ||
+            (c <= 0x1D17A && (c == 0x110BD || c == 0x110CD || (c >= 0x13430 && c <= 0x1343F) ||
+            (c >= 0x1BCA0 && c <= 0x1BCA3) || c == 0x1D159 || c >= 0x1D173));
+    }
+
+    /// An emoji code point: the one U+FE0F and U+200D may follow
+    function _emoji(uint32 c) private returns (bool) {
+        return (c >= 0x2190 && c <= 0x2BFF) || (c >= 0x1F000 && c <= 0x1FFFF) || c == 0xA9 || c == 0xAE || c == 0x203C || c == 0x2049 ||
+            c == 0x2122 || c == 0x2139 || c == 0x3030 || c == 0x303D || c == 0x3297 || c == 0x3299;
+    }
+}

@@ -1,0 +1,26 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Transfer bounce callback (TIP-3.2)
+ * @notice Callback a token wallet sends to its owner when the receiving wallet rejects
+ * a transfer and the tokens are returned to the sender's balance.
+ *
+ *  walletOwner -> ITokenWallet(wallet).transfer(...) ->
+ *                 ITokenWallet(receiver).internal_transfer(...) (bounced) ->
+ *                 TokenWalletBase.onBounce(...) ->
+ *                 IBounceTokensTransferCallback(walletOwner).onBounceTokensTransfer(...)
+ */
+interface IBounceTokensTransferCallback {
+
+    /**
+     * @notice Called by the token wallet when a transfer is reverted.
+     * @param tokenRoot The TokenRoot of the wallet.
+     * @param amount The amount of tokens returned to the balance.
+     * @param revertedFrom The wallet that rejected the transfer.
+    */
+    function onBounceTokensTransfer(
+        address tokenRoot,
+        uint128 amount,
+        address revertedFrom
+    ) external;
+}

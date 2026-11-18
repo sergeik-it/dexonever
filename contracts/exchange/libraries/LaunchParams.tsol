@@ -1,0 +1,93 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+/// Parameters of launch curves: the bounds the root checks before the launchpad takes new parameters, and the check of a
+/// token's picture and description
+library LaunchParams {
+
+    /// Whether the threshold, the fees and the expiry of new curves are within the bounds of DexConstants
+    function valid(uint128 threshold, uint128 creatorFeeNumerator, uint128 platformFeeNumerator, uint128 launchFeeNumerator, uint32 expiry) internal returns (bool) {
+        return threshold >= DexConstants.LAUNCH_MIN_THRESHOLD && threshold <= DexConstants.LAUNCH_MAX_THRESHOLD && creatorFeeNumerator <= DexConstants.LAUNCH_MAX_TRADE_FEES &&
+            platformFeeNumerator <= DexConstants.LAUNCH_MAX_TRADE_FEES - creatorFeeNumerator && launchFeeNumerator <= DexConstants.LAUNCH_MAX_CREATION_FEE &&
+            expiry >= DexConstants.LAUNCH_MIN_EXPIRY && expiry <= DexConstants.LAUNCH_MAX_EXPIRY;
+    }
+
+    /// A token's picture and description: the picture is empty or ipfs://<CID> — no other
+    /// link, so the site never loads a picture from a host of the creator's choice — within TOKEN_IMAGE_MAX_BYTES, the CID
+    /// of ASCII letters and digits only: a wallet or an explorer that puts the link into a page or a gateway's path gets no
+    /// quote, slash or space from it. The description is within TOKEN_DESCRIPTION_MAX_BYTES, valid UTF-8 with no control
+    /// character but the line feed and no mark or embedding of text direction. The check of the description is paid by
+    /// the byte (DexGas.descriptionGas)
+    function validMeta(string image, string description) internal returns (bool) {
+        string prefix = "ipfs://";
+        uint32 length = image.byteLength();
+        bool imageValid = length == 0 ||
+            length > prefix.byteLength() && length <= DexConstants.TOKEN_IMAGE_MAX_BYTES && image.substr(0, prefix.byteLength()) == prefix &&
+            _alphanumeric(image.substr(prefix.byteLength()));
+        return imageValid && description.byteLength() <= DexConstants.TOKEN_DESCRIPTION_MAX_BYTES && _plainText(description);
+    }
+
+    /// ASCII letters and digits only; the text fits in one cell (TOKEN_IMAGE_MAX_BYTES)
+    function _alphanumeric(string text) private returns (bool) {
+        TvmSlice rest = TvmSlice(bytes(text));
+        if (rest.refs() != 0) {
+            return false;
+        }
+        while (!rest.empty()) {
+            uint8 c = rest.load(uint8);
+            if (!(c >= 0x30 && c <= 0x39 || c >= 0x41 && c <= 0x5A || c >= 0x61 && c <= 0x7A)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Valid UTF-8 over the cells of the text (a character may cross a cell's border), the shortest form of each code
+    /// point, no surrogate and nothing above U+10FFFF; no code point of _hidden
+    function _plainText(string text) private returns (bool) {
+        TvmSlice rest = TvmSlice(bytes(text));
+        // continuation bytes the character still needs, the code point so far and the least one its length may hold
+        uint32 needed = 0;
+        uint32 code = 0;
+        uint32 least = 0;
+        while (true) {
+            if (rest.bits() == 0) {
+                // a string the ABI makes is a chain: one reference a cell
+                if (rest.refs() != 1) {
+                    return rest.refs() == 0 && needed == 0;
+                }
+                rest = rest.loadRef().toSlice();
+                continue;
+            }
+            uint32 b = rest.load(uint8);
+            if (needed > 0) {
+                if (b & 0xC0 != 0x80) {
+                    return false;
+                }
+                code = (code << 6) | (b & 0x3F);
+                needed -= 1;
+                if (needed == 0 && (code < least || code > 0x10FFFF || code >= 0xD800 && code <= 0xDFFF || _hidden(code))) {
+                    return false;
+                }
+            } else if (b < 0x80) {
+                if (b < 0x20 && b != 0x0A || b == 0x7F) {
+                    return false;
+                }
+            } else if (b < 0xC2 || b > 0xF4) {
+                return false;
+            } else if (b < 0xE0) {
+                (needed, code, least) = (1, b & 0x1F, 0x80);
+            } else if (b < 0xF0) {
+                (needed, code, least) = (2, b & 0x0F, 0x800);
+            } else {
+                (needed, code, least) = (3, b & 0x07, 0x10000);
+            }
+        }
+    }
+
+    /// C1 controls and the marks, embeddings, overrides and isolates of text direction (U+061C, U+200E-U+200F,
+    /// U+202A-U+202E, U+2066-U+2069)
+    function _hidden(uint32 c) private returns (bool) {
+        return c <= 0x9F || c == 0x61C || c == 0x200E || c == 0x200F || c >= 0x202A && c <= 0x202E || c >= 0x2066 && c <= 0x2069;
+    }
+}

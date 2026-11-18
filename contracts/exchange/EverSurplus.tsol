@@ -1,0 +1,138 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./EventBell.tsol";
+
+/// The owner's withdrawals of what belongs to nobody (EVER above a contract's obligations, tokens that came without
+/// a notification, stuck LP) are announced with a reason for the exchange's log and run not before
+/// DexConstants.OWNER_WITHDRAWAL_DELAY, within DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW past that
+library OwnerWithdrawal {
+
+    /// A recipient in the basechain other than the contract itself and a reason that fits the limit
+    function validTarget(address recipient, string reason) internal returns (bool) {
+        return recipient.isStdAddrWithoutAnyCast() && recipient.wid == 0 && recipient.value != 0 && recipient != address(this) &&
+            reason.byteLength() <= DexConstants.OWNER_WITHDRAWAL_MAX_REASON_BYTES;
+    }
+}
+
+/// Calls of the root to a pair or a vault (the root runs its own surplus itself)
+interface IEverSurplusAdmin {
+    function announceEverSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external;
+    function cancelEverSurplus(address sendGasTo) external;
+    function withdrawEverSurplus(address sendGasTo) external;
+}
+
+/// EVER of a contract above what it keeps (_everKept: its reserve and the EVER it owes) belong to nobody: gas left of
+/// bounced payouts, unnotified transfers. The owner withdraws them only announced (OwnerWithdrawal): `amount` to
+/// `recipient` with `reason`. The withdrawal counts the balance the contract had before the call and leaves only
+/// within what is above _everKept, so what the contract owes is never touched. Refusals are quiet, the gas goes back
+abstract contract EverSurplus is EventBell {
+    struct EverSurplusRequest {
+        uint128 amount;
+        address recipient;
+        string reason;
+        uint32 readyAt;
+    }
+    optional(EverSurplusRequest) everSurplusRequest;
+
+    event EverSurplusAnnounced(uint128 amount, address recipient, string reason, uint32 readyAt, uint32 expiresAt);
+    event EverSurplusWithdrawn(uint128 amount, address recipient, string reason);
+    /// The announced amount is above the surplus at the withdrawal (`available`): nothing is sent, the request stays
+    event EverSurplusRefused(uint128 amount, uint128 available);
+    event EverSurplusCancelled(uint128 amount, address recipient);
+
+    /// EVER the contract keeps: its reserve and all it owes
+    function _everKept() internal view virtual returns (uint128);
+
+    /// A frozen contract sends nothing out
+    function _everSurplusFrozen() internal view virtual returns (bool);
+
+    /// A new announcement replaces the previous one. A zero amount or an invalid recipient or reason is refused
+    function _announceEverSurplus(uint128 amount, address recipient, string reason, address sendGasTo) internal {
+        if (amount > 0 && OwnerWithdrawal.validTarget(recipient, reason)) {
+            _dropEverSurplus();
+            uint32 readyAt = uint32(block.timestamp) + DexConstants.OWNER_WITHDRAWAL_DELAY;
+            everSurplusRequest = EverSurplusRequest(amount, recipient, reason, readyAt);
+            emit EverSurplusAnnounced(amount, recipient, reason, readyAt, readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW);
+            _ring();
+        }
+        _returnSurplusGas(sendGasTo);
+    }
+
+    function _cancelEverSurplus(address sendGasTo) internal {
+        _dropEverSurplus();
+        _returnSurplusGas(sendGasTo);
+    }
+
+    /// @notice Drops the announced withdrawal, if any, with its cancel event
+    function _dropEverSurplus() internal {
+        if (everSurplusRequest.hasValue()) {
+            emit EverSurplusCancelled(everSurplusRequest.get().amount, everSurplusRequest.get().recipient);
+            _ring();
+            delete everSurplusRequest;
+        }
+    }
+
+    /// Runs the announced withdrawal: refused before its readiness, after its window and while frozen; an amount
+    /// above the surplus is refused with EverSurplusRefused
+    function _withdrawEverSurplus(address sendGasTo) internal {
+        uint32 nowTime = uint32(block.timestamp);
+        bool ready = everSurplusRequest.hasValue() && nowTime >= everSurplusRequest.get().readyAt &&
+            nowTime <= everSurplusRequest.get().readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW;
+        if (!ready || _everSurplusFrozen()) {
+            _returnSurplusGas(sendGasTo);
+            return;
+        }
+        EverSurplusRequest request = everSurplusRequest.get();
+        uint128 available = _everSurplus();
+        if (request.amount > available) {
+            emit EverSurplusRefused(request.amount, available);
+            _ring();
+            _returnSurplusGas(sendGasTo);
+            return;
+        }
+        delete everSurplusRequest;
+        emit EverSurplusWithdrawn(request.amount, request.recipient, request.reason);
+        // everything the contract had but `amount` stays; the recipient gets exactly it, the caller the gas left
+        tvm.rawReserve(varuint16(_ownBefore() - request.amount), 0);
+        _ring();
+        request.recipient.transfer({ value: varuint16(request.amount), flag: MsgFlag.SENDER_PAYS_FEES, bounce: false });
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// The balance before this call: the incoming value is the caller's gas, not surplus
+    function _ownBefore() private pure returns (uint128) {
+        return uint128(address(this).balance - msg.value);
+    }
+
+    function _everSurplus() private view returns (uint128) {
+        uint128 own = _ownBefore();
+        uint128 kept = _everKept();
+        return own > kept ? own - kept : 0;
+    }
+
+    function _returnSurplusGas(address to) private pure {
+        tvm.rawReserve(varuint16(_ownBefore()), 0);
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The announced EVER withdrawal and the surplus now (the whole balance above what the contract keeps)
+    function getEverSurplus() internalMsg externalMsg external view returns (
+        bool _announced,
+        uint128 _amount,
+        address _recipient,
+        string _reason,
+        uint32 _readyAt,
+        uint32 _expiresAt,
+        uint128 _available
+    ) {
+        uint128 balance = uint128(address(this).balance);
+        uint128 kept = _everKept();
+        _available = balance > kept ? balance - kept : 0;
+        if (everSurplusRequest.hasValue()) {
+            EverSurplusRequest r = everSurplusRequest.get();
+            return (true, r.amount, r.recipient, r.reason, r.readyAt, r.readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW, _available);
+        }
+    }
+}

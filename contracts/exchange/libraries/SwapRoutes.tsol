@@ -1,0 +1,192 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+import "./DexGas.tsol";
+import "./MsgFlag.tsol";
+import "./VaultOps.tsol";
+
+interface IDexVaultRoute {
+    /// @notice Hands the next route step to the vault of the received token; sent by the pair of the previous step
+    function routeSwap(
+        uint128 amount,
+        address sender,
+        address prevOther,
+        bool prevStable,
+        TvmCell pairRef,
+        TvmCell routePayload
+    ) external;
+}
+
+/// @title SwapRoutes - swap routes after the first pair: chains and trees of SwapStep cells.
+/// A step swaps what the previous pair gave into `tokenOut` in the pair (token, tokenOut, isStable). Branches of one
+/// node are linked through `sibling`; `next` is the first branch after the step's pair. The pair splits what it
+/// received between the branches by `numerator` shares, the last branch gets the rounding rest. A chain is a tree
+/// without siblings. Parsing of an ordinary cell never throws: a wrong one is a refusal, since the tokens are already
+/// in a vault. An exotic cell (a library or pruned branch) in a payload makes the pair's transaction fail: the
+/// vault's operation then bounces and the vault returns the tokens.
+library SwapRoutes {
+
+
+    struct SwapStep {
+        address tokenOut;
+        bool isStable;
+        uint128 minOut;
+        uint32 numerator;
+        bool hasNext;
+        bool hasSibling;
+        TvmCell next;
+        TvmCell sibling;
+    }
+
+    struct RouteSize {
+        uint8 pairs;
+        uint8 stablePairs;
+        uint8 leaves;
+    }
+
+    /// @notice Swap payload of a pair: DexConstants.ROUTE_HEAD_BITS, or that and ROUTE_EXPIRY_BITS of expireAt (seconds; 0 —
+    /// none), at most one ref (the first branch after the pair). The recipient must be a standard address without anycast
+    /// (tag 100, otherwise minOut would be misread) in the basechain and not zero
+    function parseRoute(TvmCell payload) internal returns (
+        bool ok, address recipient, uint128 minOut, uint32 expireAt, bool hasNext, TvmCell next
+    ) {
+        TvmSlice s = payload.toSlice();
+        bool expiring = s.bits() == DexConstants.ROUTE_HEAD_BITS + DexConstants.ROUTE_EXPIRY_BITS;
+        if ((s.bits() != DexConstants.ROUTE_HEAD_BITS && !expiring) || s.refs() > 1 || s.preloadUint(3) != DexConstants.STD_ADDRESS_TAG) {
+            return (false, recipient, minOut, expireAt, hasNext, next);
+        }
+        (recipient, minOut) = s.load(address, uint128);
+        if (expiring) {
+            expireAt = s.load(uint32);
+        }
+        hasNext = s.refs() == 1;
+        if (hasNext) {
+            next = s.loadRef();
+        }
+        ok = recipient.wid == 0 && recipient.value != 0;
+    }
+
+    /// @notice A step cell: exactly DexConstants.ROUTE_STEP_BITS, a standard tokenOut, as many refs as flags
+    function parseStep(TvmCell cell) internal returns (bool ok, SwapStep step) {
+        TvmSlice s = cell.toSlice();
+        if (s.bits() != DexConstants.ROUTE_STEP_BITS || s.preloadUint(3) != DexConstants.STD_ADDRESS_TAG) {
+            return (false, step);
+        }
+        (step.tokenOut, step.isStable, step.minOut, step.numerator, step.hasNext, step.hasSibling) =
+            s.load(address, bool, uint128, uint32, bool, bool);
+        uint8 refs = (step.hasNext ? 1 : 0) + (step.hasSibling ? 1 : 0);
+        if (s.refs() != refs) {
+            return (false, step);
+        }
+        if (step.hasNext) {
+            step.next = s.loadRef();
+        }
+        if (step.hasSibling) {
+            step.sibling = s.loadRef();
+        }
+        return (true, step);
+    }
+
+    /// @notice Size of the tree whose first branch is `first` (hasFirst false — a payout, one leaf), within
+    /// `depthLeft` pairs on any path and `maxPairs` pairs in all; ok is false beyond them, on a zero share or a
+    /// wrong cell
+    function routeSize(bool hasFirst, TvmCell first, uint8 depthLeft, uint8 maxPairs) internal returns (bool ok, RouteSize size) {
+        if (!hasFirst) {
+            return (true, RouteSize(0, 0, 1));
+        }
+        if (depthLeft == 0) {
+            return (false, size);
+        }
+        bool hasBranch = true;
+        TvmCell branch = first;
+        while (hasBranch) {
+            (bool stepOk, SwapStep step) = parseStep(branch);
+            if (!stepOk || step.numerator == 0 || size.pairs >= maxPairs) {
+                return (false, size);
+            }
+            size.pairs += 1;
+            (bool subOk, RouteSize sub) = routeSize(step.hasNext, step.next, depthLeft - 1, maxPairs - size.pairs);
+            if (!subOk) {
+                return (false, size);
+            }
+            size.pairs += sub.pairs;
+            size.stablePairs += (step.isStable ? 1 : 0) + sub.stablePairs;
+            size.leaves += sub.leaves;
+            hasBranch = step.hasSibling;
+            branch = step.sibling;
+        }
+        return (true, size);
+    }
+
+    /// @notice Size of the tree after the first pair, in the limits of the whole route
+    function treeAfterFirstPair(bool hasNext, TvmCell next) internal returns (bool ok, RouteSize size) {
+        return routeSize(hasNext, next, DexConstants.ROUTE_MAX_DEPTH - 1, DexConstants.ROUTE_MAX_PAIRS - 1);
+    }
+
+    /// @notice EVER a pair needs for its subtree of `pairs` pairs (itself included) at the gas price `price`
+    function treeValue(uint128 price, uint8 pairs, uint8 stablePairs, uint8 leaves) internal returns (uint128) {
+        return DexGas.valueAt(price, DexGas.routeTreeGas(pairs, stablePairs, leaves));
+    }
+
+    /// @notice EVER a branch gets from its parent pair: the hop through the vault and the subtree of its pair
+    function branchValue(uint128 price, uint8 pairs, uint8 stablePairs, uint8 leaves) internal returns (uint128) {
+        return DexGas.valueAt(price, DexGas.ROUTE_HOP + DexGas.routeTreeGas(pairs, stablePairs, leaves));
+    }
+
+    /// @notice Swap payload of a pair: recipient, minOut and, if any, the first branch after it
+    function routePayload(address recipient, uint128 minOut, bool hasNext, TvmCell next) internal returns (TvmCell) {
+        TvmBuilder b;
+        b.store(recipient, minOut);
+        if (hasNext) {
+            b.storeRef(next);
+        }
+        return b.toCell();
+    }
+
+    /// @notice After a pair (tokenIn → tokenOut, isStable) of a route: hands every branch to the vault of the
+    /// received token, which journals the step and sends it to the branch's pair like a user swap (its bounce
+    /// returns the tokens to the sender). The received amount is split by the branches' shares, the last branch
+    /// gets the rounding rest and all gas left; any other branch gets exactly the gas of its subtree. The route
+    /// was checked by treeAfterFirstPair, so every step parses. `price` — the gas price the pair read for its check
+    function continueRoute(
+        address receiveVault,
+        address tokenIn,
+        address tokenOut,
+        bool isStable,
+        address sender,
+        address recipient,
+        uint128 amountOut,
+        TvmCell first,
+        uint128 price
+    ) internal {
+        uint128 denominator = 0;
+        bool hasBranch = true;
+        TvmCell branch = first;
+        while (hasBranch) {
+            (, SwapStep step) = parseStep(branch);
+            denominator += step.numerator;
+            hasBranch = step.hasSibling;
+            branch = step.sibling;
+        }
+
+        uint128 rest = amountOut;
+        hasBranch = true;
+        branch = first;
+        while (hasBranch) {
+            (, SwapStep step) = parseStep(branch);
+            bool isLast = !step.hasSibling;
+            uint128 amount = isLast ? rest : math.muldiv(amountOut, step.numerator, denominator);
+            rest -= amount;
+            (, RouteSize size) = treeAfterFirstPair(step.hasNext, step.next);
+            TvmBuilder pairRef;
+            pairRef.store(tokenOut, step.tokenOut, step.isStable);
+            IDexVaultRoute(receiveVault).routeSwap{
+                value: isLast ? 0 : varuint16(branchValue(price, 1 + size.pairs, (step.isStable ? 1 : 0) + size.stablePairs, size.leaves)),
+                flag: isLast ? MsgFlag.ALL_NOT_RESERVED : MsgFlag.SENDER_PAYS_FEES,
+                bounce: false
+            }(amount, sender, tokenIn, isStable, pairRef.toCell(), routePayload(recipient, step.minOut, step.hasNext, step.next));
+            hasBranch = step.hasSibling;
+            branch = step.sibling;
+        }
+    }
+}

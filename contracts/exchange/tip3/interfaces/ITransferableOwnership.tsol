@@ -1,0 +1,21 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../structures/ICallbackParamsStructure.tsol";
+
+/**
+ * @title Transferable ownership
+ * @notice One-step ownership transfer.
+ */
+interface ITransferableOwnership is ICallbackParamsStructure {
+    /**
+     * @notice Transfers ownership to `newOwner`; only the current owner.
+     * @param newOwner The new owner.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param callbacks Contracts to notify, with the value and payload of each callback.
+    */
+    function transferOwnership(
+        address newOwner,
+        address remainingGasTo,
+        mapping(address => CallbackParams) callbacks
+    ) external;
+}

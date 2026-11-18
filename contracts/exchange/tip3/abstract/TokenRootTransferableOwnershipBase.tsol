@@ -1,0 +1,63 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenRootBase.tsol";
+import "../interfaces/ITransferableOwnership.tsol";
+import "../interfaces/ITransferTokenRootOwnershipCallback.tsol";
+
+/**
+ * @title One-step ownership transfer of the TokenRoot ({ITransferableOwnership})
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenRootTransferableOwnershipBase is TokenRootBase, ITransferableOwnership {
+    /**
+     * @notice Transfers the root ownership to `newOwner`; only the root owner.
+     * @dev Each callback receives its own value; a callback to `remainingGasTo`
+     * is sent last and carries all the remaining gas.
+     */
+    function transferOwnership(
+        address newOwner,
+        address remainingGasTo,
+        mapping(address => CallbackParams) callbacks
+    )
+        override
+        external
+        onlyRootOwner
+    {
+        tvm.rawReserve(_reserve(), 0);
+        _ring();
+
+        address oldOwner = rootOwner_;
+        rootOwner_ = newOwner;
+
+        optional(TvmCell) callbackToGasOwner;
+        for ((address dest, CallbackParams p) : callbacks) {
+            if (!dest.isStdZero()) {
+                if (remainingGasTo != dest) {
+                    ITransferTokenRootOwnershipCallback(dest).onTransferTokenRootOwnership{
+                        value: varuint16(p.value),
+                        flag: MsgFlag.SENDER_PAYS_FEES,
+                        bounce: false
+                    }(oldOwner, rootOwner_, remainingGasTo, p.payload);
+                } else {
+                    callbackToGasOwner.set(p.payload);
+                }
+            }
+        }
+
+        if (!remainingGasTo.isStdZero()) {
+            if (callbackToGasOwner.hasValue()) {
+                ITransferTokenRootOwnershipCallback(remainingGasTo).onTransferTokenRootOwnership{
+                    value: 0,
+                    flag: MsgFlag.ALL_NOT_RESERVED,
+                    bounce: false
+                }(oldOwner, rootOwner_, remainingGasTo, callbackToGasOwner.get());
+            } else {
+                remainingGasTo.transfer({
+                    value: 0,
+                    flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                    bounce: false
+                });
+            }
+        }
+    }
+}

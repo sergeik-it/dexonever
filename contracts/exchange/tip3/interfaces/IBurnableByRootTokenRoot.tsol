@@ -1,0 +1,55 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Burn by root (TokenRoot side)
+ * @notice Lets the root owner burn tokens of any wallet, and disable this forever.
+ *
+ * Chain of calls:
+ *
+ * rootOwner -> IBurnableByRootTokenRoot(root).burnTokens(...) ->
+ *              IBurnableByRootTokenWallet(wallet).burnByRoot(...) ->
+ *              ITokenRoot(root).burn_notification(...) ->
+ *              IAcceptTokensBurnCallback(callbackTo).onAcceptTokensBurn(...)
+ */
+interface IBurnableByRootTokenRoot {
+
+    /**
+     * @notice Burns `amount` tokens from the wallet of `walletOwner`; only the root owner.
+     * @dev Disabled for good by `disableBurnByRoot()`.
+     *
+     * @param amount The amount of tokens to burn.
+     * @param walletOwner The owner of the token wallet.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param callbackTo The contract that receives {IAcceptTokensBurnCallback-onAcceptTokensBurn};
+     *        the zero address means no callback.
+     * @param payload Data delivered to {IAcceptTokensBurnCallback-onAcceptTokensBurn}.
+     *
+     * Preconditions:
+     *
+     *  - burning by the root is enabled;
+     *  - `walletOwner` is not the zero address;
+     *  - `amount` is greater than zero.
+     *
+     * Postconditions:
+     *
+     *  - the wallet balance and `totalSupply_` decrease by `amount`.
+     */
+    function burnTokens(
+        uint128 amount,
+        address walletOwner,
+        address remainingGasTo,
+        address callbackTo,
+        TvmCell payload
+    ) external;
+
+    /**
+     * @notice Disables `burnTokens` forever; only the root owner.
+     * @return `true`.
+     */
+    function disableBurnByRoot() external responsible returns (bool);
+
+    /**
+     * @notice Returns `true` if `burnTokens` is disabled.
+     */
+    function burnByRootDisabled() internalMsg externalMsg external view responsible returns (bool);
+}

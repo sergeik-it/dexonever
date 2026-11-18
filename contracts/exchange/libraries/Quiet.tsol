@@ -1,0 +1,40 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+/// @title Quiet - range checks over quiet integers.
+/// The pair math runs on quint256: an operation out of [0, 2^256) or a division by zero gives NaN instead of an
+/// exception (QADD, QMULDIV, ...: standard TVM opcodes). try/catch is not used: TVM Solidity compiles it to TRYKEEP,
+/// which not every target node supports. A failure is a NaN checked where a value must fit uint128 (u128()),
+/// and the calculation returns "not ok" there.
+library Quiet {
+
+    /// @notice x if it fits uint128, NaN otherwise. A uint256 check needs no call:
+    /// quint256 itself is NaN out of [0, 2^256)
+    function u128(quint256 x) internal returns (quint256) {
+        if (x.isNaN() || x.get() >= DexConstants.U128_LIMIT) {
+            return NaN;
+        }
+        return x;
+    }
+
+    /// @notice min of two values; NaN if either is NaN
+    function min(quint256 a, quint256 b) internal returns (quint256) {
+        if (a.isNaN() || b.isNaN()) {
+            return NaN;
+        }
+        return a.get() <= b.get() ? a : b;
+    }
+
+    /// @notice |a − b|; NaN if either is NaN
+    function absDiff(quint256 a, quint256 b) internal returns (quint256) {
+        if (a.isNaN() || b.isNaN()) {
+            return NaN;
+        }
+        return a.get() > b.get() ? a - b : b - a;
+    }
+
+    /// @notice A value already checked by u128(): its uint128
+    function get128(quint256 x) internal returns (uint128) {
+        return uint128(x.get());
+    }
+}

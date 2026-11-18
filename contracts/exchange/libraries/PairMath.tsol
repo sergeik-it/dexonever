@@ -1,0 +1,356 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+import "./Quiet.tsol";
+import "../structures/IFeeParams.tsol";
+import "../structures/IDepositLiquidityResult.tsol";
+import "../structures/IExchangeResult.tsol";
+
+/// @title PairMath - constant-product math of a pair: swaps, withdrawals and deposits with auto-change.
+/// Calculations run on quint256 (Quiet.tsol): `ok` is false where a value is out of range or a division is by zero.
+/// Without a referrer: the referrer part of the fee must be zero.
+library PairMath {
+
+    function totalNumerator(IFeeParams.FeeParams fee) internal returns (quint256) {
+        return Quiet.u128(Quiet.u128(quint256(fee.pool_numerator) + fee.beneficiary_numerator) + fee.referrer_numerator);
+    }
+
+    /// @notice Babylonian square root: an estimate by shifts and 7 iterations
+    function sqrt(quint256 qx) internal returns (quint256) {
+        if (qx.isNaN()) {
+            return NaN;
+        }
+        uint256 x = qx.get();
+        if (x == 0) {
+            return 0;
+        }
+
+        uint256 xx = x;
+        uint256 r0 = 1;
+        if (xx >= 0x100000000000000000000000000000000) {
+            xx >>= 128;
+            r0 <<= 64;
+        }
+        if (xx >= 0x10000000000000000) {
+            xx >>= 64;
+            r0 <<= 32;
+        }
+        if (xx >= 0x100000000) {
+            xx >>= 32;
+            r0 <<= 16;
+        }
+        if (xx >= 0x10000) {
+            xx >>= 16;
+            r0 <<= 8;
+        }
+        if (xx >= 0x100) {
+            xx >>= 8;
+            r0 <<= 4;
+        }
+        if (xx >= 0x10) {
+            xx >>= 4;
+            r0 <<= 2;
+        }
+        if (xx >= 0x8) {
+            r0 <<= 1;
+        }
+
+        quint256 r = r0;
+        for (uint8 i = 0; i < DexConstants.SQRT_ITERATIONS; i++) {
+            r = (r + qx / r) >> 1;
+        }
+        return Quiet.min(r, qx / r);
+    }
+
+    /// @notice Positive root of x^2 + p*x - q = 0
+    function solveQuadraticEquationPQ(quint256 p, quint256 q) internal returns (quint256) {
+        quint256 dSqrt = sqrt(math.muldiv(p, p, quint256(4)) + q);
+        quint256 halfP = p / 2;
+        if (dSqrt.isNaN() || halfP.isNaN()) {
+            return NaN;
+        }
+        if (dSqrt.get() > halfP.get()) {
+            return Quiet.u128(dSqrt - halfP);
+        }
+        return Quiet.u128(halfP - dSqrt);
+    }
+
+    /// @notice Output and fees of a swap of aAmount
+    function calculateExpectedExchange(
+        uint128 aAmount,
+        uint128 aPool,
+        uint128 bPool,
+        IFeeParams.FeeParams fee
+    ) internal returns (bool ok, IExchangeResult.ExchangeResult result) {
+        quint256 total = totalNumerator(fee);
+        quint256 aFee = Quiet.u128(math.muldivc(quint256(aAmount), total, quint256(fee.denominator)));
+        // the referrer share is computed unconditionally: a zero total fee divides by zero here (not ok)
+        quint256 aReferrerFee = Quiet.u128(math.muldiv(aFee, quint256(fee.referrer_numerator), total));
+        quint256 aPoolFee = Quiet.u128(math.muldivc(
+            aFee,
+            quint256(fee.pool_numerator),
+            Quiet.u128(quint256(fee.beneficiary_numerator) + fee.pool_numerator)
+        ));
+        quint256 aBeneficiaryFee = Quiet.u128(aFee - aPoolFee);
+
+        quint256 newAPool = Quiet.u128(quint256(aPool) + aAmount);
+        quint256 newBPool = Quiet.u128(math.muldivc(quint256(aPool), quint256(bPool), Quiet.u128(newAPool - aFee)));
+        quint256 expectedBAmount = Quiet.u128(quint256(bPool) - newBPool);
+        if (aReferrerFee.isNaN() || aBeneficiaryFee.isNaN() || expectedBAmount.isNaN()) {
+            return (false, result);
+        }
+        return (true, IExchangeResult.ExchangeResult(
+            Quiet.get128(expectedBAmount),
+            Quiet.get128(aPoolFee),
+            Quiet.get128(aBeneficiaryFee),
+            0
+        ));
+    }
+
+    /// @notice How much token A to give to receive bAmount of token B, and the fee from that amount
+    function calculateExpectedSpendAmount(
+        uint128 bAmount,
+        uint128 aPool,
+        uint128 bPool,
+        IFeeParams.FeeParams fee
+    ) internal returns (bool ok, uint128 expectedAAmount, uint128 aFee) {
+        quint256 feeDMinusN = Quiet.u128(Quiet.u128(Quiet.u128(
+            quint256(fee.denominator) - fee.pool_numerator) - fee.beneficiary_numerator) - fee.referrer_numerator
+        );
+        quint256 newBPool = Quiet.u128(quint256(bPool) - bAmount);
+        quint256 newAPool = Quiet.u128(math.muldivc(quint256(aPool), quint256(bPool), newBPool));
+        quint256 amount = Quiet.u128(math.muldivc(Quiet.u128(newAPool - aPool), quint256(fee.denominator), feeDMinusN));
+        quint256 qFee = Quiet.u128(math.muldivc(amount, totalNumerator(fee), quint256(fee.denominator)));
+        if (qFee.isNaN()) {
+            return (false, 0, 0);
+        }
+        return (true, Quiet.get128(amount), Quiet.get128(qFee));
+    }
+
+    /// @notice Shares of the reserves returned for lpAmount LP
+    function calculateExpectedWithdrawLiquidity(
+        uint128 lpAmount,
+        uint128 leftReserve,
+        uint128 rightReserve,
+        uint128 lpReserve
+    ) internal returns (bool ok, uint128 leftAmount, uint128 rightAmount) {
+        quint256 left = Quiet.u128(math.muldiv(quint256(leftReserve), quint256(lpAmount), quint256(lpReserve)));
+        quint256 right = Quiet.u128(math.muldiv(quint256(rightReserve), quint256(lpAmount), quint256(lpReserve)));
+        if (left.isNaN() || right.isNaN()) {
+            return (false, 0, 0);
+        }
+        return (true, Quiet.get128(left), Quiet.get128(right));
+    }
+
+    /// @notice How much of the surplus `amount` to swap so that the rest goes into the pool in its proportion
+    function surplusToExchange(
+        quint256 balance,
+        quint256 amount,
+        quint256 feeD,
+        quint256 feeDMinusN,
+        quint256 denominator
+    ) internal returns (quint256) {
+        quint256 p = math.muldiv(balance, feeD * (feeDMinusN + feeD), denominator);
+        quint256 q = math.muldiv(balance, feeD * feeD * amount, denominator);
+        return solveQuadraticEquationPQ(p, q);
+    }
+
+    /// @notice LP of step 3 of an auto-change deposit: the rest `amount` and `received` of the swap.
+    /// The smaller of both shares is taken, in favour of the pool.
+    /// balance — reserve of the side of `amount` after the swap, otherBalance — the other reserve before
+    /// `received` is paid out
+    function step3Reward(
+        quint256 amount,
+        quint256 balance,
+        quint256 received,
+        quint256 otherBalance,
+        quint256 lpSupply
+    ) internal returns (quint256) {
+        quint256 byAmount = math.muldiv(amount, lpSupply, balance);
+        quint256 byReceived = math.muldiv(received, lpSupply, otherBalance - received);
+        return Quiet.u128(Quiet.min(byAmount, byReceived));
+    }
+
+    /// @notice Result of a deposit and the fees of its step 2: (ok, result, poolFee, beneficiaryFee, referrerFee)
+    function calculateExpectedDepositLiquidity(
+        uint128 leftAmount,
+        uint128 rightAmount,
+        bool autoChange,
+        uint128 leftReserve,
+        uint128 rightReserve,
+        uint128 lpReserve,
+        IFeeParams.FeeParams fee
+    ) internal returns (
+        bool ok,
+        IDepositLiquidityResult.DepositLiquidityResult result,
+        uint128 poolFee,
+        uint128 beneficiaryFee,
+        uint128 referrerFee
+    ) {
+        if (lpReserve == 0) {
+            // first deposit: max(a, b); PairQuotes.firstDepositLp scales it and locks MINIMUM_LIQUIDITY
+            result.step1LeftDeposit = leftAmount;
+            result.step1RightDeposit = rightAmount;
+            result.step1LpReward = math.max(leftAmount, rightAmount);
+            return (true, result, 0, 0, 0);
+        }
+
+        Step2 s;
+        (ok, s, result) = depositStep1(leftAmount, rightAmount, leftReserve, rightReserve, lpReserve, autoChange);
+        // computed before the branch: a fee out of range fails any deposit into a non-empty pair
+        quint256 feeDMinusN = quint256(fee.denominator) - totalNumerator(fee);
+        quint256 denominator = feeDMinusN * (quint256(fee.denominator) - Quiet.u128(quint256(fee.beneficiary_numerator) + fee.referrer_numerator));
+        if (!ok || denominator.isNaN()) {
+            return (false, result, 0, 0, 0);
+        }
+
+        IExchangeResult.ExchangeResult exchange;
+        if (autoChange && (s.rightAmount.get() > 0 || s.leftAmount.get() > 0)) {
+            // step 2: swap of the surplus, the right one first
+            bool fromLeft = s.rightAmount.get() == 0;
+            (ok, exchange, result) = autoChangeStep(s, fromLeft, result, fee, feeDMinusN, denominator);
+            if (!ok) {
+                return (false, result, 0, 0, 0);
+            }
+            // step 2 dropped: the whole amount goes in at step 1
+            if (fromLeft && !result.step2LeftToRight) {
+                result.step1LeftDeposit = leftAmount;
+            } else if (!fromLeft && !result.step2RightToLeft) {
+                result.step1RightDeposit = rightAmount;
+            }
+        }
+        quint256 step2Fee = Quiet.u128(quint256(exchange.poolFee) + exchange.beneficiaryFee);
+        if (step2Fee.isNaN()) {
+            return (false, result, 0, 0, 0);
+        }
+        result.step2Fee = Quiet.get128(step2Fee);
+        return (true, result, exchange.poolFee, exchange.beneficiaryFee, exchange.referrerFee);
+    }
+
+    /// @notice Step 1 of a deposit: both amounts in the current proportion of the pool (zeros if one is zero). The
+    /// side in excess is floored to the proportion of the other. Without auto-change the other (limiting) side is then
+    /// cut to what the floored side pays for, rounded up: the LP reward is the same, and the part of the limiting side it
+    /// would not pay for goes back with the excess. With auto-change the limiting side goes in whole: only one side may be
+    /// left for the swap of step 2
+    function proportionalStep(
+        uint128 leftAmount,
+        uint128 rightAmount,
+        uint128 leftReserve,
+        uint128 rightReserve,
+        uint128 lpReserve,
+        bool autoChange
+    ) internal returns (quint256 leftDeposit, quint256 rightDeposit, quint256 lpReward) {
+        if (leftAmount == 0 || rightAmount == 0) {
+            return (0, 0, 0);
+        }
+        leftDeposit = Quiet.min(
+            quint256(leftAmount),
+            Quiet.u128(math.muldiv(quint256(leftReserve), quint256(rightAmount), quint256(rightReserve)))
+        );
+        rightDeposit = Quiet.min(
+            quint256(rightAmount),
+            Quiet.u128(math.muldiv(quint256(rightReserve), quint256(leftAmount), quint256(leftReserve)))
+        );
+        // at most one side is below its amount; the ceiling of the floored side's proportion never exceeds the other amount
+        if (!autoChange && !leftDeposit.isNaN() && !rightDeposit.isNaN()) {
+            if (leftDeposit.get() < leftAmount) {
+                rightDeposit = Quiet.u128(math.muldivc(leftDeposit, quint256(rightReserve), quint256(leftReserve)));
+            } else if (rightDeposit.get() < rightAmount) {
+                leftDeposit = Quiet.u128(math.muldivc(rightDeposit, quint256(leftReserve), quint256(rightReserve)));
+            }
+        }
+        lpReward = Quiet.min(
+            Quiet.u128(math.muldiv(rightDeposit, quint256(lpReserve), quint256(rightReserve))),
+            Quiet.u128(math.muldiv(leftDeposit, quint256(lpReserve), quint256(leftReserve)))
+        );
+    }
+
+    /// @notice Step 1 and what is left after it; ok is false if a value is out of range
+    function depositStep1(
+        uint128 leftAmount,
+        uint128 rightAmount,
+        uint128 leftReserve,
+        uint128 rightReserve,
+        uint128 lpReserve,
+        bool autoChange
+    ) internal returns (bool ok, Step2 s, IDepositLiquidityResult.DepositLiquidityResult result) {
+        (quint256 leftDeposit, quint256 rightDeposit, quint256 lpReward) = proportionalStep(
+            leftAmount, rightAmount, leftReserve, rightReserve, lpReserve, autoChange
+        );
+        s = Step2(
+            Quiet.u128(quint256(leftAmount) - leftDeposit),
+            Quiet.u128(quint256(rightAmount) - rightDeposit),
+            Quiet.u128(quint256(leftReserve) + leftDeposit),
+            Quiet.u128(quint256(rightReserve) + rightDeposit),
+            Quiet.u128(quint256(lpReserve) + lpReward)
+        );
+        if (s.leftAmount.isNaN() || s.rightAmount.isNaN() || s.leftBalance.isNaN() || s.rightBalance.isNaN() || s.lpSupply.isNaN()) {
+            return (false, s, result);
+        }
+        result.step1LeftDeposit = Quiet.get128(leftDeposit);
+        result.step1RightDeposit = Quiet.get128(rightDeposit);
+        result.step1LpReward = Quiet.get128(lpReward);
+        return (true, s, result);
+    }
+
+    /// @notice What is left to deposit after step 1
+    struct Step2 {
+        quint256 leftAmount;
+        quint256 rightAmount;
+        quint256 leftBalance;
+        quint256 rightBalance;
+        quint256 lpSupply;
+    }
+
+    /// @notice Steps 2 and 3 of an auto-change deposit: the surplus of one side (fromLeft — of the left one) is
+    /// swapped and the rest is deposited with the received amount. If nothing is left or received, step 2 is
+    /// dropped (its direction flag stays false) and the caller deposits the whole amount at step 1
+    function autoChangeStep(
+        Step2 s,
+        bool fromLeft,
+        IDepositLiquidityResult.DepositLiquidityResult result,
+        IFeeParams.FeeParams fee,
+        quint256 feeDMinusN,
+        quint256 denominator
+    ) internal returns (bool, IExchangeResult.ExchangeResult exchange, IDepositLiquidityResult.DepositLiquidityResult) {
+        quint256 amount = fromLeft ? s.leftAmount : s.rightAmount;
+        quint256 balance = fromLeft ? s.leftBalance : s.rightBalance;
+        quint256 otherBalance = fromLeft ? s.rightBalance : s.leftBalance;
+        quint256 spent = surplusToExchange(balance, amount, quint256(fee.denominator), feeDMinusN, denominator);
+        if (spent.isNaN()) {
+            return (false, exchange, result);
+        }
+        bool ok;
+        (ok, exchange) = calculateExpectedExchange(Quiet.get128(spent), Quiet.get128(balance), Quiet.get128(otherBalance), fee);
+        if (!ok) {
+            return (false, exchange, result);
+        }
+        amount = Quiet.u128(amount - spent);
+        balance = Quiet.u128(Quiet.u128(Quiet.u128(balance + spent) - exchange.beneficiaryFee) - exchange.referrerFee);
+        if (amount.isNaN() || balance.isNaN()) {
+            return (false, exchange, result);
+        }
+
+        result.step2Spent = Quiet.get128(spent);
+        result.step2Received = exchange.expectedAmount;
+        if (amount.get() == 0 || exchange.expectedAmount == 0) {
+            return (true, exchange, result);
+        }
+        // step 3: deposit of the swapped amounts
+        quint256 lpReward = step3Reward(amount, balance, quint256(exchange.expectedAmount), otherBalance, s.lpSupply);
+        if (lpReward.isNaN()) {
+            return (false, exchange, result);
+        }
+        if (fromLeft) {
+            result.step2LeftToRight = true;
+            result.step3LeftDeposit = Quiet.get128(amount);
+            result.step3RightDeposit = exchange.expectedAmount;
+        } else {
+            result.step2RightToLeft = true;
+            result.step3RightDeposit = Quiet.get128(amount);
+            result.step3LeftDeposit = exchange.expectedAmount;
+        }
+        result.step3LpReward = Quiet.get128(lpReward);
+        return (true, exchange, result);
+    }
+}

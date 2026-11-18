@@ -1,0 +1,8 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title EventBell - the hook of a bell at an event hub (DexHub): every transaction that emits an event calls _ring
+/// once. A contract of a hub family (a pair, a vault, a launch curve) rings its hub; the others (the root and what is
+/// followed by its own address) keep this empty hook
+abstract contract EventBell {
+    function _ring() internal virtual {}
+}

@@ -1,0 +1,280 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title DexConstants - every constant of the exchange's contracts in one place: terms, limits, formats and the
+/// parameters of new launches. A change is one edit here and a new code of the contracts (the usual upgrade). Gas
+/// amounts are in DexGas.tsol, error codes in DexErrors.tsol, message flags in MsgFlag.tsol
+library DexConstants {
+    // ==========================================
+    // Terms: delays before a change applies, windows to apply it, timeouts
+    // ==========================================
+
+    // the root: a fee increase of new pairs, a proposed code and a proposed launchpad wait this, then apply within the window
+    uint32 constant NEW_PAIR_FEE_INCREASE_DELAY = 2 days;
+    // the most a proposed code may wait: the root's codeDelay, set at its deploy, is at most this
+    uint32 constant CODE_UPGRADE_DELAY = 2 days;
+    uint32 constant ROOT_PROPOSAL_APPLY_WINDOW = 7 days;
+    // a pair: a fee change and an amplification change wait this, then apply within the window
+    uint32 constant PAIR_FEE_CHANGE_DELAY = 2 days;
+    uint32 constant PAIR_FEE_CHANGE_APPLY_WINDOW = 7 days;
+    uint32 constant AMPLIFICATION_CHANGE_DELAY = 2 days;
+    uint32 constant AMPLIFICATION_CHANGE_APPLY_WINDOW = 7 days;
+    // the owner's withdrawals of what belongs to nobody (EVER and token surplus) are announced with a reason and run not
+    // before the delay, within the window past it; the reason is at most this long
+    uint32 constant OWNER_WITHDRAWAL_DELAY = 2 days;
+    uint32 constant OWNER_WITHDRAWAL_APPLY_WINDOW = 7 days;
+    uint32 constant OWNER_WITHDRAWAL_MAX_REASON_BYTES = 256;
+    // a curve's question to a buyer's wallet without an answer this long is taken as lost: retryDelivery asks anew
+    uint32 constant DELIVERY_ANSWER_TIMEOUT = 1 days;
+
+    // ==========================================
+    // Platform children: the kinds of contract the root deploys on DexPlatform (a part of their addresses) and the
+    // layouts of the state carried over a code upgrade
+    // ==========================================
+
+    uint8 constant PLATFORM_TYPE_TOKEN_VAULT = 1;
+    uint8 constant PLATFORM_TYPE_PAIR = 2;
+    uint8 constant PLATFORM_TYPE_LP_ACCOUNT = 3;
+    uint8 constant PLATFORM_TYPE_NATIVE_VAULT = 4;
+    // a launch curve: the platform's root is the launchpad, its params the curve's number
+    uint8 constant PLATFORM_TYPE_LAUNCH_CURVE = 5;
+    // a shard of the deploy registry (DexRegistry): the platform's params are its index
+    uint8 constant PLATFORM_TYPE_REGISTRY = 6;
+    // an event hub (DexHub): the platform's params are its family and its index
+    uint8 constant PLATFORM_TYPE_HUB = 7;
+    // the layout of the state each contract packs for its next code (Upgrade.tsol); the root's layouts 1 to 4 are not taken.
+    // 6: a registry shard's or an event hub's deploy on its way keeps who gets its value back; the root takes layout 5 too
+    uint16 constant ROOT_STATE_LAYOUT = 6;
+    uint16 constant ROOT_STATE_LAYOUT_5 = 5;
+    uint16 constant REGISTRY_STATE_LAYOUT = 1;
+    uint16 constant HUB_STATE_LAYOUT = 1;
+    uint16 constant PAIR_STATE_LAYOUT = 2;
+    uint16 constant TOKEN_VAULT_STATE_LAYOUT = 1;
+    uint16 constant NATIVE_VAULT_STATE_LAYOUT = 1;
+    // includes the halves in flight to the pair; layout 1 is not taken
+    uint16 constant LP_ACCOUNT_STATE_LAYOUT = 2;
+    uint16 constant TOKEN_LIST_STATE_LAYOUT = 1;
+    // includes the pause and the platform code (the event hubs of new tokens); layouts 1 and 2 are not taken
+    uint16 constant TOKEN_FACTORY_STATE_LAYOUT = 3;
+    // 2: when the last launch registration left and the first launch number of the current token codes; layout 1 is taken
+    // too
+    uint16 constant LAUNCHPAD_STATE_LAYOUT = 2;
+    uint16 constant LAUNCHPAD_STATE_LAYOUT_1 = 1;
+    // includes the bounced transfers kept by wallet, the seeding's chain and the event hub; 6: when the seeding's chain
+    // started; layout 5 is taken too, older ones are not
+    uint16 constant LAUNCH_CURVE_STATE_LAYOUT = 6;
+    uint16 constant LAUNCH_CURVE_STATE_LAYOUT_5 = 5;
+    // the tag of the cell a contract hands to its next code (Upgrade.tsol)
+    uint8 constant UPGRADE_DATA_TAG = 0;
+    // the kinds of code the upgrader proposes (DexRoot.proposeCode)
+    uint8 constant CODE_KIND_PAIR = 1;
+    uint8 constant CODE_KIND_TOKEN_VAULT = 2;
+    uint8 constant CODE_KIND_NATIVE_VAULT = 3;
+    uint8 constant CODE_KIND_ROOT = 4;
+    uint8 constant CODE_KIND_LP_ACCOUNT = 5;
+    // the kinds below have one or two instances the root does not deploy: their code waits in the root
+    // (installedCodes) and goes to an instance named by its address (DexRoot.upgradeContract)
+    uint8 constant CODE_KIND_TOKEN_LIST = 6;
+    uint8 constant CODE_KIND_TOKEN_FACTORY = 7;
+    uint8 constant CODE_KIND_LAUNCHPAD = 8;
+    // the code of the curves: the root hands it to the launchpad (DexRoot.setLaunchCurveCode), which deploys new
+    // curves with it and moves the deployed ones (DexRoot.upgradeLaunches)
+    uint8 constant CODE_KIND_LAUNCH_CURVE = 9;
+    // the codes of new tokens: a cell of two references, the token root's and its wallet's code.
+    // New pairs take them for their LP at once; the root hands them to the token factory and the launchpad
+    // (DexRoot.setTokenCode). A token already deployed never changes
+    uint8 constant CODE_KIND_TOKEN = 10;
+    // the code of the deploy registry's shards: the root deploys them and moves them (DexRoot.upgradeRegistries), as vaults
+    uint8 constant CODE_KIND_REGISTRY = 11;
+    // the code of the event hubs: the root deploys them and moves them (DexRoot.upgradeHubs)
+    uint8 constant CODE_KIND_HUB = 12;
+    // the event hubs (DexHub): a family's contract rings hub number «first 4 bits of its own
+    // address» of its family; the families — pairs, launch curves, token roots, vaults (token and native)
+    uint8 constant HUB_FAMILIES = 4;
+    uint8 constant HUBS_PER_FAMILY = 16;
+    uint8 constant HUB_FAMILY_PAIR = 0;
+    uint8 constant HUB_FAMILY_CURVE = 1;
+    uint8 constant HUB_FAMILY_TOKEN = 2;
+    uint8 constant HUB_FAMILY_VAULT = 3;
+    // the shards of the deploy registry: the shard of an address is its first byte (DexRegistry)
+    uint16 constant REGISTRY_SHARDS = 256;
+    // a shard's answer about an address (DexRegistry): free (a claim takes it), deployed already, or the shard is stopped
+    // for an upgrade
+    uint8 constant REGISTRY_FREE = 0;
+    uint8 constant REGISTRY_TAKEN = 1;
+    uint8 constant REGISTRY_BUSY = 2;
+    // a launch's registration asks the registry about the token's vault, its pair with EVER and its stable pair with EVER
+    uint8 constant LAUNCH_CHECK_STEPS = 3;
+
+    // ==========================================
+    // The root's administration
+    // ==========================================
+
+    // pair fees: numerators of this denominator, at most MAX_PAIR_FEE_NUMERATOR (5%); new pairs start with 0.25% to the
+    // pool and 0.05% to the beneficiary
+    uint128 constant PAIR_FEE_DENOMINATOR = 10_000;
+    uint128 constant MAX_PAIR_FEE_NUMERATOR = 500;
+    uint128 constant DEFAULT_POOL_FEE = 25;
+    uint128 constant DEFAULT_BENEFICIARY_FEE = 5;
+    // addresses in one batch command of the root (pause, freeze, withdrawals, fees, upgrades, curves)
+    uint256 constant MAX_ADMIN_BATCH_TARGETS = 50;
+    // addresses of one batch move to a new code (upgradePairs, upgradeVaults): every message carries the code, and the node
+    // takes no more outgoing messages in one transaction than 2^21 bits and 2^13 cells in all (16 messages with the pair
+    // code fit, 40 with the vault code). The batches leave room for a code that grows
+    uint256 constant MAX_PAIR_UPGRADE_BATCH = 10;
+    uint256 constant MAX_VAULT_UPGRADE_BATCH = 25;
+    // addresses of one token list update: an event each, within the list's gas and its outgoing messages (50: about
+    // 310 000 gas of the list against the 1 000 000 limit of a transaction, measured on a list of 1000 addresses)
+    uint256 constant MAX_TOKEN_LIST_UPDATE = 50;
+
+    // ==========================================
+    // Vault operations and routes: the operation codes and the bit sizes of their payloads
+    // ==========================================
+
+    uint8 constant VAULT_OP_SWAP = 1;
+    uint8 constant VAULT_OP_DEPOSIT = 2;
+    uint8 constant VAULT_OP_LP_DEPOSIT = 3;
+    // a transfer's payload to a token vault: exactly uint8 op and two refs (PairRef, the operation's payload)
+    uint16 constant VAULT_PAYLOAD_BITS = 8;
+    uint8 constant VAULT_PAYLOAD_REFS = 2;
+    // an operation's payload: a deposit — minLpOut (uint128); a withdrawal — minLeftOut and minRightOut (uint128 each);
+    // a sale to a launch curve — minOut (uint128)
+    uint16 constant DEPOSIT_PAYLOAD_BITS = 128;
+    uint16 constant WITHDRAW_PAYLOAD_BITS = 256;
+    uint16 constant SELL_PAYLOAD_BITS = 128;
+    // addr_std without anycast: bits 100
+    uint8 constant STD_ADDRESS_TAG = 4;
+    // a pair reference: tokenA (267) + tokenB (267) + isStable (1)
+    uint16 constant PAIR_REF_BITS = 267 + 267 + 1;
+    // a route: at most this many pairs in its tree and this many on one path
+    uint8 constant ROUTE_MAX_PAIRS = 8;
+    uint8 constant ROUTE_MAX_DEPTH = 4;
+    // a route step: tokenOut (267) + isStable (1) + minOut (128) + numerator (32) + hasNext (1) + hasSibling (1)
+    uint16 constant ROUTE_STEP_BITS = 267 + 1 + 128 + 32 + 1 + 1;
+    // a route's head: recipient (267) + minOut (128)
+    uint16 constant ROUTE_HEAD_BITS = 267 + 128;
+    // the head may end with uint32 expireAt — the time after which the first pair refuses the swap (a deadline besides
+    // minOut); without it the swap does not expire
+    uint16 constant ROUTE_EXPIRY_BITS = 32;
+
+    // ==========================================
+    // Pool math
+    // ==========================================
+
+    // LP locked forever by the first deposit: inflating the LP price costs the attacker about this many times more than
+    // the next depositor loses
+    uint128 constant POOL_MINIMUM_LIQUIDITY = 1000;
+    // the first deposit mints max(a, b) × this LP, into a stable pair D × this, but not more than
+    // MAX_FIRST_DEPOSIT_LP, so lpSupply can still grow at least 16 times below MAX_TOKEN_AMOUNT
+    uint128 constant FIRST_DEPOSIT_LP_SCALE = 1_000_000;
+    uint128 constant MAX_FIRST_DEPOSIT_LP = (uint128(1) << 116) - 1;
+    // the largest amount of a token the exchange takes (TIP-3 sends amounts as varuint16)
+    uint128 constant MAX_TOKEN_AMOUNT = uint128(1) << 120;
+    // Newton iterations of the integer square root of a first deposit
+    uint8 constant SQRT_ITERATIONS = 7;
+    // the limit of uint128 in quiet 256-bit numbers (Quiet.tsol)
+    uint256 constant U128_LIMIT = uint256(1) << 128;
+
+    // ==========================================
+    // Stable pairs
+    // ==========================================
+
+    // A is stored multiplied by this: the step of A is 0.01. One change of A is at most MAX_AMPLIFICATION_CHANGE_FACTOR
+    // times, smooth, not faster than MIN_AMPLIFICATION_RAMP_TIME. Below A = 10 the Newton iteration stops converging
+    // already at a ~500:1 skew
+    uint32 constant AMPLIFICATION_PRECISION = 100;
+    uint32 constant MIN_AMPLIFICATION = 10 * AMPLIFICATION_PRECISION;
+    uint32 constant MAX_AMPLIFICATION = 1_000_000 * AMPLIFICATION_PRECISION;
+    uint32 constant MAX_AMPLIFICATION_CHANGE_FACTOR = 10;
+    uint32 constant MIN_AMPLIFICATION_RAMP_TIME = 1 days;
+    // the end of a ramp must fit into uint32
+    uint32 constant MAX_AMPLIFICATION_RAMP_TIME = 365 days;
+    // decimals of stable tokens: rate = 10^(max − decimals) × 10^max fits into uint128
+    uint8 constant STABLE_MAX_DECIMALS = 18;
+    // the larger side in the common scale is at most this many times the smaller one. Within it D and the swap output
+    // converge for A from 10 to 10^6; beyond it the Newton iteration loops and the pair could no longer quote swaps and
+    // deposits
+    uint128 constant STABLE_MAX_SKEW = 100;
+    // the first deposit into a stable pair: the two sides in the common scale differ by at most 1/this of the larger
+    uint128 constant STABLE_FIRST_DEPOSIT_MAX_SKEW = 100;
+    uint8 constant STABLE_COINS = 2;
+    // the most Newton iterations of a stable calculation
+    uint16 constant STABLE_MAX_ITERATIONS = 256;
+    // a stable calculation's result: done, refused, failed (out of range, division by zero, no convergence)
+    uint8 constant STABLE_RESULT_OK = 0;
+    uint8 constant STABLE_RESULT_REFUSED = 1;
+    uint8 constant STABLE_RESULT_FAILED = 2;
+
+    // ==========================================
+    // LP tokens, tokens of the factory, token lists
+    // ==========================================
+
+    uint8 constant LP_TOKEN_DECIMALS = 9;
+    // bits of an address left in a bounced token transfer: 256 − function id (32) − amount (128) (the curve tells its pool half apart)
+    uint9 constant LP_CLAIM_PREFIX_BITS = 96;
+    // a token's name and symbol (the factory and launches) and the factory's decimals and supply
+    uint16 constant TOKEN_NAME_MAX_BYTES = 64;
+    uint16 constant TOKEN_SYMBOL_MAX_BYTES = 16;
+    // a launch token's picture — ipfs://<CID> — and description, set once at the launch; both may be empty
+    uint16 constant TOKEN_IMAGE_MAX_BYTES = 128;
+    uint16 constant TOKEN_DESCRIPTION_MAX_BYTES = 512;
+    uint8 constant TOKEN_MAX_DECIMALS = 18;
+    // tokens of the exchange's owner (TokenFactory.createOwnerToken): up to 24 (NEAR has 24);
+    // regular pairs count in the smallest units and do not depend on decimals, stable pairs take up to STABLE_MAX_DECIMALS
+    uint8 constant OWNER_TOKEN_MAX_DECIMALS = 24;
+    // the most symbols one owner's call reserves or frees (DexRoot.setReservedSymbols)
+    uint256 constant MAX_RESERVED_SYMBOLS = 50;
+    uint128 constant TOKEN_MAX_SUPPLY = (uint128(1) << 120) - 1;
+    // the kinds of token list and the most tokens one page of a list gives
+    uint8 constant TOKEN_LIST_WHITE = 1;
+    uint8 constant TOKEN_LIST_BLACK = 2;
+    // the tokens of the exchange's owner (TokenFactory.createOwnerToken): the site shows them as the exchange's own
+    uint8 constant TOKEN_LIST_RESERVED = 3;
+    // the lists of pair addresses, apart from the token ones: white and black are labels, the
+    // reserved one names the pairs only the owner deploys (DexRoot.deployPair asks it; WEVER / EVER from the launch)
+    uint8 constant PAIR_LIST_WHITE = 4;
+    uint8 constant PAIR_LIST_BLACK = 5;
+    uint8 constant PAIR_LIST_RESERVED = 6;
+    uint16 constant TOKEN_LIST_MAX_PAGE = 100;
+
+    // ==========================================
+    // Launches: the curve's supply and reserves, the bounds of a launchpad's parameters and their defaults
+    // ==========================================
+
+    uint8 constant LAUNCH_TOKEN_DECIMALS = 6;
+    // a billion tokens; the virtual token reserve at the start, the tokens the curve sells and the end of the sale on that
+    // reserve; the rest goes to the pool
+    uint128 constant CURVE_TOTAL_SUPPLY = 1_000_000_000_000_000;
+    uint128 constant CURVE_START_VIRTUAL_TOKENS = 1_073_000_000_000_000;
+    uint128 constant CURVE_TOKENS_FOR_SALE = 793_100_000_000_000;
+    uint128 constant CURVE_END_VIRTUAL_TOKENS = CURVE_START_VIRTUAL_TOKENS - CURVE_TOKENS_FOR_SALE;
+    uint128 constant CURVE_POOL_TOKENS = CURVE_TOTAL_SUPPLY - CURVE_TOKENS_FOR_SALE;
+    // forwarding of the seeding's questions and answers (about 0.01 EVER) and of both halves (about 0.005 EVER): it does
+    // not follow the gas price, so it is kept in EVER apart from DexGas.CURVE_SEED
+    uint128 constant CURVE_SEED_FORWARD = 0.05 ever;
+    // after the pool's token half left, the next one goes not before this: the wallet's answers to two seedings in one
+    // block both see the whole balance, and the second half would take tokens the curve owes or surplus tokens.
+    // A half the exchange returned is back on the wallet long before
+    uint32 constant CURVE_POOL_TOKENS_RETRY_DELAY = 10 minutes;
+    // fees of launches: numerators of this denominator; both trade fees together at most 5%, the launch fee at most 1%
+    uint128 constant LAUNCH_FEE_DENOMINATOR = 10_000;
+    uint128 constant LAUNCH_MAX_TRADE_FEES = 500;
+    uint128 constant LAUNCH_MAX_CREATION_FEE = 100;
+    // the EVER a sale collects (the pool is cheaper than the curve's end price by the vault's and the pair's deploys, up to
+    // 8 EVER: at the lower bound under 1% of the price); a curve without buys closes after its term (a week to a year)
+    uint128 constant LAUNCH_MIN_THRESHOLD = 1_000 ever;
+    uint128 constant LAUNCH_MAX_THRESHOLD = 10_000_000 ever;
+    uint32 constant LAUNCH_MIN_EXPIRY = 7 days;
+    uint32 constant LAUNCH_MAX_EXPIRY = 365 days;
+    // the parameters a new launchpad starts with: 85 000 EVER, 0.30% to the creator, 0.95% to the
+    // platform, a launch costs 0.1% of the threshold (85 EVER), a curve without buys closes in 90 days
+    uint128 constant LAUNCH_DEFAULT_THRESHOLD = 85_000 ever;
+    uint128 constant LAUNCH_DEFAULT_CREATOR_FEE = 30;
+    uint128 constant LAUNCH_DEFAULT_PLATFORM_FEE = 95;
+    uint128 constant LAUNCH_DEFAULT_CREATION_FEE = 10;
+    uint32 constant LAUNCH_DEFAULT_EXPIRY = 90 days;
+    // a launch registration without the root's answer this long after the last one left is taken as lost: the
+    // launchpad's count of them no longer holds back new token codes
+    uint32 constant LAUNCH_REGISTER_TIMEOUT = 1 days;
+    // a seeding's chain without its last answer this long is taken as lost: seed() starts a new one
+    uint32 constant CURVE_SEED_TIMEOUT = 3 days;
+}

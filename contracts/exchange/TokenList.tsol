@@ -1,0 +1,133 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/Upgrade.tsol";
+
+/// Changes of a token list come only from the root: the owner calls DexRoot.updateTokenList
+interface ITokenList {
+    function update(address[] tokens, bool listed, string reason, address sendGasTo) external;
+    function checkListed(uint64 id, address item) external;
+}
+
+/// The list's answer to the root's question (checkListed): `id` is the root's
+interface IListCheckAnswer {
+    function onListChecked(uint64 id, bool listed) external;
+}
+
+/// @title TokenList - a list of token (or pair) addresses kept by the exchange's owner: one code, six instances. Of
+/// tokens: the white list (kind DexConstants.TOKEN_LIST_WHITE, "verified" on the site), the black list (kind
+/// DexConstants.TOKEN_LIST_BLACK, "dangerous", stronger than the white one) and the reserved one (kind
+/// DexConstants.TOKEN_LIST_RESERVED: the owner's tokens, USDT, BTC…). Of pairs, the same three apart: white (PAIR_LIST_WHITE), black (PAIR_LIST_BLACK) and reserved
+/// (PAIR_LIST_RESERVED) — the pairs only the owner deploys, the root asks it (checkListed) before a deploy. The site labels
+/// tokens and pairs by them; the exchange itself trades any token. Only the root changes a list, so the lists follow the
+/// root's ownership
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract TokenList is ITokenList {
+
+    address static root;
+    uint8 static kind;
+
+    mapping(address => bool) tokens;
+    uint32 count;
+    uint32 public version;
+
+    event TokenListed(address token, string reason);
+    event TokenUnlisted(address token, string reason);
+
+    /// @notice Deployed by an external message signed by the deploy key, with the root and the kind in its address
+    constructor() externalMsg {
+        require(tvm.pubkey() != 0 && msg.pubkey() == tvm.pubkey(), DexErrors.NOT_AUTHORIZED);
+        require(
+            kind >= DexConstants.TOKEN_LIST_WHITE && kind <= DexConstants.PAIR_LIST_RESERVED,
+            DexErrors.INVALID_AMOUNT
+        );
+        require(!root.isNone() && root.value != 0, DexErrors.NOT_AUTHORIZED);
+        tvm.accept();
+        version = 1;
+    }
+
+    /// @notice The root moves the list to the installed code (DexRoot.upgradeContract): only a newer version; the
+    /// address and the whole state stay (Upgrade.tsol). Anything else gives the gas back
+    function upgrade(uint8 kind_, TvmCell code, uint32 newVersion, address sendGasTo) external {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        // the code of another kind (a wrong target) is never taken
+        if (kind_ != DexConstants.CODE_KIND_TOKEN_LIST || newVersion <= version) {
+            sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        TvmCell state = abi.encode(root, kind, tokens, count);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(DexConstants.TOKEN_LIST_STATE_LAYOUT, version, newVersion, sendGasTo, state));
+    }
+
+    function onCodeUpgrade(TvmCell data) private {
+        (uint16 layout, , uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // the only layout so far; a code that changes the layout unpacks this one too
+        require(layout == DexConstants.TOKEN_LIST_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (root, kind, tokens, count) = abi.decode(state, (address, uint8, mapping(address => bool), uint32));
+        version = newVersion;
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Adds (`listed`) or removes `tokens`; `reason` goes to an event per token. Adding a listed token or removing
+    /// a missing one changes nothing and gives no event. The root checks the owner, the count and the reason; the gas
+    /// left goes to `sendGasTo`
+    function update(address[] list, bool listed, string reason, address sendGasTo) external override {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        tvm.rawReserve(math.max(varuint16(DexGas.MIN_CONTRACT_BALANCE), address(this).balance - msg.value), 0);
+        for (address token : list) {
+            if (listed && !tokens.exists(token)) {
+                tokens[token] = true;
+                count += 1;
+                emit TokenListed(token, reason);
+            } else if (!listed && tokens.exists(token)) {
+                delete tokens[token];
+                count -= 1;
+                emit TokenUnlisted(token, reason);
+            }
+        }
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The root asks whether `item` is listed (DexRoot.deployPair: the reserved pair list); the answer takes the
+    /// gas left back
+    function checkListed(uint64 id, address item) external view override {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        IListCheckAnswer(root).onListChecked{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(id, tokens.exists(item));
+    }
+
+    /// @notice Whether `token` is in the list
+    function isListed(address token) internalMsg externalMsg external view returns (bool) {
+        return tokens.exists(token);
+    }
+
+    /// @notice Up to `limit` (at most DexConstants.TOKEN_LIST_MAX_PAGE) listed addresses from `from` (none: from the
+    /// first), in address order; `next` is where the next page starts, none at the end
+    function getTokens(optional(address) from, uint16 limit) internalMsg externalMsg external view returns (
+        address[] page,
+        optional(address) next
+    ) {
+        uint16 size = limit > DexConstants.TOKEN_LIST_MAX_PAGE ? DexConstants.TOKEN_LIST_MAX_PAGE : limit;
+        optional(address, bool) item = from.hasValue() ? tokens.nextOrEq(from.get()) : tokens.min();
+        while (item.hasValue() && uint16(page.length) < size) {
+            (address token, ) = item.get();
+            page.push(token);
+            item = tokens.next(token);
+        }
+        if (item.hasValue()) {
+            (address token, ) = item.get();
+            next.set(token);
+        }
+    }
+
+    /// @notice The list's root, kind and entry count
+    function getDetails() internalMsg externalMsg external view returns (address _root, uint8 _kind, uint32 _count) {
+        return (root, kind, count);
+    }
+}

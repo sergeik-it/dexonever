@@ -1,0 +1,18 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title SID (TIP-6.1)
+ * @notice Standard interface detection: lets other contracts query whether
+ * a contract implements a given interface.
+ *
+ * Implemented by {TokenRoot} and {TokenWallet}.
+ */
+interface SID {
+    /**
+     * @notice Returns whether the contract implements `interfaceID`.
+     * @param interfaceID The interface identifier, as specified in TIP-6.1.
+     * @return `true` if the contract implements `interfaceID` and
+     * `interfaceID` is not 0xffffffff, `false` otherwise.
+    */
+    function supportsInterface(uint32 interfaceID) internalMsg externalMsg external view responsible returns (bool);
+}

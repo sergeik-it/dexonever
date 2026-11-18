@@ -1,0 +1,102 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/VaultOps.tsol";
+import "./EventBell.tsol";
+
+/// @title VaultJournal - the operation journal of a vault: every operation sent to a pair is recorded until the
+/// pair confirms it or the message bounces; a bounce returns the funds to the sender. What the funds are (TIP-3
+/// tokens on the vault's wallet or EVER on its own balance) is the vault's: it keeps its balance and refunds
+/// through the two hooks below
+abstract contract VaultJournal is EventBell {
+    /// An operation bounced from its pair: `amount` goes back to the sender
+    event OperationBounced(uint64 opId, address sender, uint128 amount);
+
+    // Journal of operations sent to pairs: an entry lives until the pair confirms it or the message bounces
+    uint64 nextOpId;
+    uint32 pendingCount;
+    mapping(uint64 => VaultOps.PendingOp) pendingOps;
+
+    /// @notice Keeps the vault's own funds out of the outgoing gas; called once per transaction
+    function _reserveOwnFunds() internal virtual;
+
+    /// @notice Returns `pending.amount` of a bounced operation to its sender with the gas left
+    function _refundBounced(VaultOps.PendingOp pending) internal virtual;
+
+    /// @notice A bounce of a message that is not an operation (the vault's own requests)
+    function _onOtherBounce(uint32 /* functionId */, TvmSlice /* body */) internal virtual {}
+
+    /// @notice Journals the operation and sends it to `pair` with all gas left; a bounce returns the funds
+    function _sendOperation(uint8 op, address sender, uint128 amount, address pair, TvmCell payload) internal {
+        uint64 opId = nextOpId++;
+        pendingOps[opId] = VaultOps.PendingOp(sender, amount, pair);
+        pendingCount++;
+
+        if (op == DexConstants.VAULT_OP_SWAP) {
+            IDexPairVaultOperation(pair).onVaultExchange{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(opId, sender, amount, payload);
+        } else if (op == DexConstants.VAULT_OP_DEPOSIT) {
+            IDexPairVaultOperation(pair).onVaultDeposit{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(opId, sender, amount, payload);
+        } else {
+            IDexPairVaultOperation(pair).onVaultLpDeposit{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(opId, sender, amount, payload);
+        }
+    }
+
+    /// @notice The pair took the operation: forget it. Only that pair may confirm, otherwise anyone could
+    /// erase an entry and leave a later bounce without a refund.
+    function confirmOperation(uint64 opId) external {
+        optional(VaultOps.PendingOp) found = pendingOps.fetch(opId);
+        require(found.hasValue() && found.get().pair == msg.sender, DexErrors.NOT_AUTHORIZED);
+        delete pendingOps[opId];
+        pendingCount--;
+        // the confirmation gas belongs to the operation's sender
+        _reserveOwnFunds();
+        found.get().sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice An operation bounced (no pair at that address, or the pair failed): return the funds.
+    /// The operation id is the first field of the message, so it is inside the 256 bits of a bounce.
+    onBounce(TvmSlice body) external {
+        uint32 functionId = body.load(uint32);
+        bool isOperation = functionId == abi.functionId(IDexPairVaultOperation.onVaultExchange) ||
+            functionId == abi.functionId(IDexPairVaultOperation.onVaultDeposit) ||
+            functionId == abi.functionId(IDexPairVaultOperation.onVaultLpDeposit);
+        if (!isOperation) {
+            _onOtherBounce(functionId, body);
+            return;
+        }
+        uint64 opId = body.load(uint64);
+        optional(VaultOps.PendingOp) found = pendingOps.fetch(opId);
+        // a bounce comes from the address the operation was sent to
+        if (!found.hasValue() || msg.sender != found.get().pair) {
+            return;
+        }
+        VaultOps.PendingOp pending = found.get();
+        delete pendingOps[opId];
+        pendingCount--;
+        // the event goes first: the refund takes all gas left
+        emit OperationBounced(opId, pending.sender, pending.amount);
+        _ring();
+        _refundBounced(pending);
+    }
+
+    /// @notice An operation still in the journal; anyone may call
+    function getPendingOperation(uint64 opId) internalMsg externalMsg external view returns (
+        bool exists,
+        address sender,
+        uint128 amount,
+        address pair
+    ) {
+        optional(VaultOps.PendingOp) found = pendingOps.fetch(opId);
+        if (found.hasValue()) {
+            VaultOps.PendingOp p = found.get();
+            return (true, p.sender, p.amount, p.pair);
+        }
+    }
+
+    /// @notice The number of operations in the journal and the next operation id; anyone may call
+    function getPendingCount() internalMsg externalMsg external view returns (uint32 count, uint64 nextId) {
+        return (pendingCount, nextOpId);
+    }
+}

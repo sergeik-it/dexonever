@@ -1,0 +1,48 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title BridgeConstants - every constant of the bridge's contracts in one place: a change is one edit here and a new
+/// code of the contracts (the usual upgrade). Gas amounts are in BridgeGas.tsol, error codes in BridgeErrors.tsol
+library BridgeConstants {
+    // a proposed code waits the root's codeDelay, given to its deploy: at most this; then it applies within the window
+    uint32 constant CODE_UPGRADE_DELAY = 2 days;
+    uint32 constant CODE_APPLY_WINDOW = 7 days;
+    // the longest hold of a queued mint
+    uint32 constant MAX_DELAY = 7 days;
+    // the most relays of a round
+    uint8 constant MAX_RELAYS = 16;
+    // the most queued mints cancelled by one call
+    uint32 constant MAX_CANCELS = 50;
+    // the layout of the root's state carried over a code upgrade: the delay of a proposed code, the renounce of upgrades, the
+    // processed and parked deposits, the announced changes and the token codes
+    uint16 constant STATE_LAYOUT = 3;
+    // the layout before it (no processed or parked deposits, announced changes, token codes): taken and converted
+    uint16 constant PREVIOUS_STATE_LAYOUT = 2;
+    // a sensitive change (a round, a new token, higher limits or fees, a shorter delay,
+    // a guardian removed, the fee recipient, the token codes) is announced first: it applies after the root's codeDelay, within
+    // this window
+    uint32 constant CHANGE_APPLY_WINDOW = 7 days;
+    // the kinds of announced changes (ChangeAnnounced)
+    uint8 constant KIND_ROUND = 1;
+    uint8 constant KIND_NEW_TOKEN = 2;
+    uint8 constant KIND_TOKEN_CONFIG = 3;
+    uint8 constant KIND_DELAY = 4;
+    uint8 constant KIND_GUARDIAN = 5;
+    uint8 constant KIND_FEE_RECIPIENT = 6;
+    uint8 constant KIND_TOKEN_CODES = 7;
+    // processed deposit ids are kept as bits, this many to a word
+    uint64 constant PROCESSED_WORD_BITS = 256;
+    // the payload of a burn for a withdrawal: the EVM recipient (160 bits) and the choice of the sender service (1 bit)
+    uint16 constant BURN_PAYLOAD_BITS = 161;
+    // a relay's signature of a withdrawal: r, s and v
+    uint16 constant SIGNATURE_LENGTH = 65;
+    // why a new token is refused (TokenRefused): its root is not the bridge's, its supply is not 0, its mint is disabled, it did
+    // not answer (no token root there), the owner cancelled it while it waited
+    uint8 constant REFUSED_OWNER = 1;
+    uint8 constant REFUSED_SUPPLY = 2;
+    uint8 constant REFUSED_MINT = 3;
+    uint8 constant REFUSED_NO_ANSWER = 4;
+    uint8 constant REFUSED_CANCELLED = 5;
+    // the buckets of the hourly and daily limits
+    uint32 constant HOUR = 1 hours;
+    uint32 constant DAY = 1 days;
+}

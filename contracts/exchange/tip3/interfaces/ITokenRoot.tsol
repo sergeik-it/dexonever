@@ -1,0 +1,69 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TIP3TokenRoot.tsol";
+import "./../additional/SID.tsol";
+
+/**
+ * @title TokenRoot interface
+ * @notice Minimal required TokenRoot functionality of TIP-3, plus interface
+ * detection by {SID} (TIP-6.1).
+ */
+interface ITokenRoot is TIP3TokenRoot, SID {
+
+    /**
+     * @notice Returns the current owner of the TokenRoot.
+    */
+    function rootOwner() internalMsg externalMsg external view responsible returns (address);
+
+    /**
+     * @notice Returns the token wallet address of `walletOwner`; does not deploy it.
+     * @param walletOwner The token wallet owner.
+     * @return The token wallet address.
+    */
+    function walletOf(address walletOwner) internalMsg externalMsg external view responsible returns (address);
+
+    /**
+     * @notice Mints `amount` tokens to `recipient`; only the root owner.
+     * @dev With `deployWalletValue` > 0 the root deploys the recipient's wallet first;
+     * with 0 the wallet must already exist, otherwise the mint bounces and the supply
+     * is decreased back.
+     *
+     * @param amount The amount of tokens to mint.
+     * @param recipient The owner of the receiving token wallet.
+     * @param deployWalletValue Value (nanoevers) attached to deploy the recipient's wallet;
+     *        0 means no deploy.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param notify If `true`, the recipient's wallet sends
+     *        {IAcceptTokensMintCallback-onAcceptTokensMint} to its owner.
+     * @param payload Data delivered to {IAcceptTokensMintCallback-onAcceptTokensMint}.
+     *
+     * Preconditions:
+     *
+     *  - minting is enabled;
+     *  - `amount` is greater than zero and `recipient` is not the zero address.
+     *
+     * Postconditions:
+     *
+     *  - `totalSupply_` increases by `amount`.
+    */
+    function mint(
+        uint128 amount,
+        address recipient,
+        uint128 deployWalletValue,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    ) external;
+
+    /**
+     * @notice Deploys a token wallet for `owner` and returns its address.
+     *
+     * @param owner The owner of the new token wallet (not the zero address).
+     * @param deployWalletValue Value (nanoevers) attached to the deploy; must cover it.
+     * @return The address of the token wallet.
+    */
+    function deployWallet(
+        address owner,
+        uint128 deployWalletValue
+    ) external responsible returns (address);
+}

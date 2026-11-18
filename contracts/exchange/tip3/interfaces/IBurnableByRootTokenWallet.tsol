@@ -1,0 +1,34 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Burn by root (TokenWallet side, TIP-3.2)
+ * @notice Lets the TokenRoot burn tokens held by the wallet.
+ *
+ * Chain of calls:
+ *
+ * rootOwner -> IBurnableByRootTokenRoot(root).burnTokens(...) ->
+ *              IBurnableByRootTokenWallet(wallet).burnByRoot(...) ->
+ *              ITokenRoot(root).burn_notification(...) ->
+ *              IAcceptTokensBurnCallback(callbackTo).onAcceptTokensBurn(...)
+*/
+interface IBurnableByRootTokenWallet {
+
+    /**
+     * @notice Burns `amount` tokens of the wallet; only the TokenRoot.
+     * @param amount The amount of tokens to burn.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param callbackTo The contract that receives {IAcceptTokensBurnCallback-onAcceptTokensBurn};
+     *        the zero address means no callback.
+     * @param payload Data delivered to {IAcceptTokensBurnCallback-onAcceptTokensBurn}.
+     *
+     * Postcondition:
+     *
+     *   - the wallet balance decreases by `amount`.
+    */
+    function burnByRoot(
+        uint128 amount,
+        address remainingGasTo,
+        address callbackTo,
+        TvmCell payload
+    ) external;
+}

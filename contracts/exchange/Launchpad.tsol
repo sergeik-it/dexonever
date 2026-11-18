@@ -1,0 +1,483 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/TokenSymbol.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/LaunchParams.tsol";
+import "./libraries/Upgrade.tsol";
+import "./DexPlatform.tsol";
+import "./LaunchCurve.tsol";
+
+interface IDexRootRegistry {
+    function registerLaunchToken(address tokenRoot, address curve, TvmCell payload) external;
+    function onSymbolsReserved(TvmCell factoryCall) external;
+}
+
+/// @title Launchpad - launches of tokens on bonding curves. Anyone creates a
+/// token with a curve of its own (LaunchCurve); the root registers the token first, so nobody gets its vault or a pair
+/// before the curve sells out. The root is its owner (the exchange's owner acts through it, as with the token lists): it
+/// sets the threshold and the fees of new curves, pauses new launches and collects the platform's fee. The root moves
+/// the launchpad and its curves to new codes in place: curves are deployed through DexPlatform, so their addresses do
+/// not depend on the curve's code
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract Launchpad {
+
+    address static dexRoot;
+    // the code of the curves' platform: with this launchpad and a number it makes a curve's address
+    TvmCell static platformCode;
+    // the code of new curves and of the moves of the deployed ones (setCurveCode), and its version
+    TvmCell static curveCode;
+    // the codes of new tokens and their version: the initial ones are in the address, newer ones come from the root
+    // (setTokenCode); a deployed token keeps its code
+    TvmCell static tokenRootCode;
+    TvmCell static tokenWalletCode;
+    uint32 public tokenCodeVersion;
+    uint32 public curveVersion;
+    uint32 public version;
+    // the upgrader's stop before a move to a new code: no new launch starts; the launchpad moves only while it stands.
+    // The move is meant to be sent only with no launch on its way (registering, launching); the contract does not
+    // insist on it: a lost answer would otherwise block the move for good
+    bool public upgrading;
+    // launches sent to the root and not answered yet (createLaunch → onLaunchRegistered)
+    uint32 public registering;
+    // when the last of them left: an answer lost on its way (its handler failed) would keep the count above zero and the
+    // token codes unchanged for good, so after DexConstants.LAUNCH_REGISTER_TIMEOUT the count is taken as lost (setTokenCode)
+    uint32 registeredAt;
+    // the first launch number sent with the current token codes: the root registered an earlier launch's token at the
+    // address of the codes before, so its answer is refused (onLaunchRegistered)
+    uint64 tokenCodeFrom;
+
+    // it starts paused: the exchange is deployed empty and closed, the owner fills it and opens it
+    bool paused;
+    // of new curves: the EVER a sale collects, the creator's and the platform's fees of DexConstants.LAUNCH_FEE_DENOMINATOR
+    uint128 threshold;
+    uint128 creatorFeeNumerator;
+    uint128 platformFeeNumerator;
+    // of new curves too: the launch's fee to the platform, of the threshold in DexConstants.LAUNCH_FEE_DENOMINATOR, and how long a
+    // curve lives without buys (LaunchCurve.expire)
+    uint128 launchFeeNumerator;
+    uint32 expiry;
+    // the nonce of the next curve: a part of its address
+    uint64 created;
+    // curve → its creator while the curve's deploy is on its way: a deploy that fails bounces here and the creator gets
+    // the value back; a deployed curve sends the rest of the value through onCurveDeployed, which deletes the entry
+    mapping(address => address) launching;
+    // symbols reserved for the exchange's owner (DexRoot.createOwnerToken, setReservedSymbols): the hash of the exact
+    // bytes: "USDT" is refused, "usdt" is not
+    mapping(uint256 => bool) reserved;
+
+    /// The root registered the token: the curve and the token are deployed now
+    event LaunchCreated(address tokenRoot, address curve, address creator);
+    /// The root refused the token (its vault or its pair with EVER exists already): the value went back to the creator
+    event LaunchRefused(address tokenRoot, address creator);
+    /// The curve's deploy failed and bounced: the value came back to the creator (the launch fee too); the nonce is spent,
+    /// its token never exists
+    event LaunchFailed(address curve, address creator);
+    event ParamsChanged(uint128 threshold, uint128 creatorFeeNumerator, uint128 platformFeeNumerator, uint128 launchFeeNumerator, uint32 expiry);
+    event PausedChanged(bool paused);
+    event UpgradeStatus(bool upgrading);
+    event SymbolReserved(string symbol, bool reserved);
+    /// New launches deploy their tokens with these codes (setTokenCode); a refused hand-over emits nothing
+    event TokenCodeChanged(uint32 version, uint256 rootCodeHash, uint256 walletCodeHash);
+
+    modifier onlyRoot() {
+        require(msg.sender == dexRoot, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice Deployed by the exchange's deploy key with the default parameters (DexConstants.LAUNCH_DEFAULT_*), paused
+    constructor() externalMsg {
+        require(tvm.pubkey() != 0 && msg.pubkey() == tvm.pubkey(), DexErrors.NOT_AUTHORIZED);
+        tvm.accept();
+        version = 1;
+        curveVersion = 1;
+        tokenCodeVersion = 1;
+        threshold = DexConstants.LAUNCH_DEFAULT_THRESHOLD;
+        creatorFeeNumerator = DexConstants.LAUNCH_DEFAULT_CREATOR_FEE;
+        platformFeeNumerator = DexConstants.LAUNCH_DEFAULT_PLATFORM_FEE;
+        launchFeeNumerator = DexConstants.LAUNCH_DEFAULT_CREATION_FEE;
+        expiry = DexConstants.LAUNCH_DEFAULT_EXPIRY;
+        paused = true;
+    }
+
+    /// @notice Creates a token on a curve of its own; the sender is its creator and gets the creator's fees. The value
+    /// pays the launch's fee (launchFee: it goes to the curve as the platform's part), the token, the curve and the gas
+    /// (launchValue and the check of the name, the symbol and the description, DexGas.tokenTextGas and descriptionGas); the rest comes back. The name and the
+    /// symbol follow TokenSymbol. The root first checks that the token has no vault and
+    /// no pair with EVER yet: if it has, nothing is deployed and the value comes back
+    function createLaunch(string name, string symbol, string image, string description) internalMsg external {
+        require(!paused && !upgrading, DexErrors.PAUSED);
+        require(TokenSymbol.validName(name), DexErrors.INVALID_AMOUNT);
+        require(TokenSymbol.valid(symbol), DexErrors.INVALID_AMOUNT);
+        require(!reserved.exists(tvm.hash(bytes(symbol))), DexErrors.RESERVED_SYMBOL);
+        require(LaunchParams.validMeta(image, description), DexErrors.INVALID_AMOUNT);
+        uint128 fee = launchFee();
+        // launchValue does not count the check of the name, the symbol (TokenSymbol) and the description (LaunchParams): it
+        // grows with their bytes
+        _reserveOwn(launchValue() + fee + DexGas.gasValue(DexGas.tokenTextGas(name, symbol) + DexGas.descriptionGas(description)));
+
+        uint64 nonce = created;
+        created += 1;
+        registering += 1;
+        registeredAt = uint32(block.timestamp);
+        address curve = _curveAddress(nonce);
+        TvmCell payload = abi.encode(
+            msg.sender, nonce, name, symbol, image, description, threshold, creatorFeeNumerator, platformFeeNumerator, fee, expiry
+        );
+        IDexRootRegistry(dexRoot).registerLaunchToken{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(
+            _tokenAddress(curve, name, symbol), curve, payload
+        );
+    }
+
+    /// @notice The root's answer: deploys the curve, which deploys the token, or returns the value to the creator
+    function onLaunchRegistered(bool registered, address vault, address pair, address nativeVault, TvmCell payload) external onlyRoot {
+        (
+            address creator,
+            uint64 nonce,
+            string name,
+            string symbol,
+            string image,
+            string description,
+            uint128 _threshold,
+            uint128 creatorFee,
+            uint128 platformFee,
+            uint128 fee,
+            uint32 _expiry
+        ) = abi.decode(payload, (address, uint64, string, string, string, string, uint128, uint128, uint128, uint128, uint32));
+        _reserveOwn(0);
+        // a launch sent before the token codes changed: its token would not be the one the root registered. Its count
+        // was dropped with the change
+        bool outdated = nonce < tokenCodeFrom;
+        // the root answers only the launchpad's own registrations; a count already at zero stays there
+        if (!outdated && registering > 0) {
+            registering -= 1;
+        }
+        address curve = _curveAddress(nonce);
+        address token = _tokenAddress(curve, name, symbol);
+        // the curve's deploy needs at least its reserves and the forwarding of the codes: an answer short of that (a
+        // dearer network) would fail the send in the action phase, and the value would stay here: the creator gets it
+        // back as on a refusal
+        if (outdated || !registered || msg.value < _curveDeployMin()) {
+            emit LaunchRefused(token, creator);
+            creator.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        emit LaunchCreated(token, curve, creator);
+        launching[curve] = creator;
+        TvmCell initData = abi.encode(
+            creator, name, symbol, image, description, dexRoot, vault, pair, nativeVault, _threshold, creatorFee, platformFee, fee, _expiry,
+            tokenRootCode, tokenWalletCode
+        );
+        new DexPlatform{ stateInit: _curveStateInit(nonce), value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(
+            curveCode, curveVersion, creator, initData
+        );
+    }
+
+    /// @notice A deployed curve sends the rest of its deploy's value: it goes to the creator, the entry is done
+    function onCurveDeployed() external {
+        optional(address) creator = launching.fetch(msg.sender);
+        require(creator.hasValue(), DexErrors.NOT_AUTHORIZED);
+        delete launching[msg.sender];
+        _reserveOwn(0);
+        creator.get().transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice A curve's deploy that failed (its constructor or its actions: too little value at the gas and forward
+    /// prices of the moment) comes back with what is left of the value, the launch fee in it: all of it to the creator.
+    /// Without the bounce the value would stay at an address nobody can deploy any more (the nonce is spent)
+    onBounce(TvmSlice body) external {
+        uint32 functionId = body.load(uint32);
+        optional(address) creator = launching.fetch(msg.sender);
+        if (functionId != abi.functionId(DexPlatform) || !creator.hasValue()) {
+            return;
+        }
+        delete launching[msg.sender];
+        emit LaunchFailed(msg.sender, creator.get());
+        _reserveOwn(0);
+        creator.get().transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The creator of `curve` while its deploy is on its way (neither confirmed by the curve nor bounced)
+    function getLaunching(address curve) internalMsg externalMsg external view returns (optional(address) creator) {
+        return launching.fetch(curve);
+    }
+
+    /// @notice The launch's fee to the platform now: launchFeeNumerator of the threshold
+    function launchFee() public view returns (uint128) {
+        return math.muldiv(threshold, launchFeeNumerator, DexConstants.LAUNCH_FEE_DENOMINATOR);
+    }
+
+    /// @notice What createLaunch needs besides launchFee: the token (its reserve, its wallet, its creation and mint), the curve's reserve,
+    /// forwarding the codes, the gas of the launchpad, the root and the curve, and the root's rounds of the deploy registry
+    /// (DexRoot.registerLaunchToken: the vault, the pair with EVER and the stable pair with EVER)
+    function launchValue() public pure returns (uint128) {
+        uint128 checks = DexConstants.LAUNCH_CHECK_STEPS;
+        return _curveDeployMin() + checks * DexGas.REGISTRY_HOP_FORWARD + DexGas.gasValue(
+            DexGas.LAUNCH_CREATE + DexGas.LAUNCH_DONE + DexGas.TOKEN_CREATE + DexGas.TOKEN_MINT + DexGas.WALLET_DEPLOY + checks * DexGas.REGISTRY_HOP
+        );
+    }
+
+    /// @notice What of launchValue does not follow the gas price: the token's, its wallet's and the curve's reserves and
+    /// the forwarding of the codes — the least the curve's deploy is sent with
+    function _curveDeployMin() private pure returns (uint128) {
+        return TokenGas.TARGET_ROOT_BALANCE + TokenGas.TARGET_WALLET_BALANCE + DexGas.MIN_CONTRACT_BALANCE +
+            DexGas.TOKEN_FORWARD + DexGas.LAUNCH_FORWARD;
+    }
+
+    /// @notice The launchpad keeps its storage reserve: when below it, the sender's value tops it up first. Refused if
+    /// the value does not cover `need` on top of that
+    function _reserveOwn(uint128 need) private pure {
+        uint128 balance = address(this).balance;
+        uint128 kept = balance > msg.value ? balance - msg.value : 0;
+        uint128 reserve = math.max(DexGas.MIN_CONTRACT_BALANCE, kept);
+        require(balance >= reserve + need, DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(reserve, 0);
+    }
+
+    function _curveStateInit(uint64 nonce) private view returns (TvmCell) {
+        TvmBuilder params;
+        params.store(nonce);
+        return abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: { root: address(this), type_id: DexConstants.PLATFORM_TYPE_LAUNCH_CURVE, params: params.toCell() },
+            pubkey: 0,
+            code: platformCode
+        });
+    }
+
+    function _curveAddress(uint64 nonce) private view returns (address) {
+        return address.makeAddrStd(address(this).wid, tvm.hash(_curveStateInit(nonce)));
+    }
+
+    /// @notice The token of `curve`, as the curve deploys it
+    function _tokenAddress(address curve, string name, string symbol) private view returns (address) {
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: TokenRoot,
+            varInit: {
+                randomNonce_: 0,
+                deployer_: curve,
+                name_: name,
+                symbol_: symbol,
+                decimals_: DexConstants.LAUNCH_TOKEN_DECIMALS,
+                rootOwner_: curve,
+                walletCode_: tokenWalletCode
+            },
+            pubkey: 0,
+            code: tokenRootCode
+        });
+        return address.makeAddrStd(address(this).wid, tvm.hash(stateInit));
+    }
+
+    // ==========================================
+    // The root's calls for the exchange's owner: they come without a bounce, with the gas the root checked, and take
+    // what the root checked (DexRoot.setLaunchParams and the others); the gas left goes back to `sendGasTo`
+    // ==========================================
+
+    /// @notice Threshold, fees, the launch's fee and the expiry of new curves; a curve keeps those it was created with
+    function setParams(
+        uint128 _threshold,
+        uint128 _creatorFeeNumerator,
+        uint128 _platformFeeNumerator,
+        uint128 _launchFeeNumerator,
+        uint32 _expiry,
+        address sendGasTo
+    ) external onlyRoot {
+        threshold = _threshold;
+        creatorFeeNumerator = _creatorFeeNumerator;
+        platformFeeNumerator = _platformFeeNumerator;
+        launchFeeNumerator = _launchFeeNumerator;
+        expiry = _expiry;
+        emit ParamsChanged(_threshold, _creatorFeeNumerator, _platformFeeNumerator, _launchFeeNumerator, _expiry);
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice A paused launchpad creates no curves; the curves it created trade on
+    function setPaused(bool _paused, address sendGasTo) external onlyRoot {
+        paused = _paused;
+        emit PausedChanged(_paused);
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice The platform's fee of the curve `nonce` goes to `recipient`
+    function collectPlatformFees(uint64 nonce, address recipient, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).collectPlatformFees{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            recipient, sendGasTo
+        );
+    }
+
+    /// @notice The owner's withdrawal of surplus tokens of the curve `nonce` (LaunchCurve): announce, cancel, run
+    function announceCurveSurplus(uint64 nonce, uint128 amount, address recipient, string reason, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).announceTokenSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            amount, recipient, reason, sendGasTo
+        );
+    }
+
+    /// @notice Cancels the announced withdrawal of the curve `nonce` (LaunchCurve.cancelTokenSurplus)
+    function cancelCurveSurplus(uint64 nonce, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).cancelTokenSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(sendGasTo);
+    }
+
+    /// @notice Runs the announced withdrawal of the curve `nonce` (LaunchCurve.withdrawTokenSurplus)
+    function withdrawCurveSurplus(uint64 nonce, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).withdrawTokenSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(sendGasTo);
+    }
+
+    /// @notice Stops or resumes buys and the migration of the curve `nonce`
+    function setCurveFrozen(uint64 nonce, bool frozen, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).setBuysFrozen{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(frozen, sendGasTo);
+    }
+
+    /// @notice The upgrader's stop of new launches for a move to a new code (the root checks who may)
+    function setUpgrading(bool _upgrading, address sendGasTo) external onlyRoot {
+        upgrading = _upgrading;
+        emit UpgradeStatus(_upgrading);
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice The installed curve code from the root (DexRoot.setLaunchCurveCode): new curves are deployed with it, the
+    /// deployed ones move to it (upgradeCurve). Only a newer version
+    function setCurveCode(TvmCell code, uint32 _version, address sendGasTo) external onlyRoot {
+        if (_version > curveVersion) {
+            curveCode = code;
+            curveVersion = _version;
+        }
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice The installed token codes from the root (DexRoot.setTokenCode): new launches deploy their tokens with them.
+    /// Only a newer version and only while the upgrader's stop stands with no launch registering: a launch on its way
+    /// was registered at the root with the token address of the old code, and its curve would deploy the token elsewhere.
+    /// Registrations unanswered for LAUNCH_REGISTER_TIMEOUT are taken as lost; an answer that still comes is refused
+    function setTokenCode(TvmCell rootCode, TvmCell walletCode, uint32 _version, address sendGasTo) external onlyRoot {
+        bool settled = registering == 0 || uint32(block.timestamp) >= registeredAt + DexConstants.LAUNCH_REGISTER_TIMEOUT;
+        if (_version > tokenCodeVersion && upgrading && settled) {
+            tokenRootCode = rootCode;
+            tokenWalletCode = walletCode;
+            tokenCodeVersion = _version;
+            registering = 0;
+            tokenCodeFrom = created;
+            emit TokenCodeChanged(_version, tvm.hash(rootCode), tvm.hash(walletCode));
+        }
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice Reserves (`isReserved`) or frees symbols for the exchange's owner (DexRoot.createOwnerToken,
+    /// setReservedSymbols): a launch of a reserved symbol is refused. A symbol already in that state gives no event. Then
+    /// the root goes on at the factory with `factoryCall`, with the gas left (a chain: the factory only after this)
+    function setReserved(string[] symbols, bool toReserve, TvmCell factoryCall) external onlyRoot {
+        _reserveOwn(0);
+        for (string symbol : symbols) {
+            uint256 key = tvm.hash(bytes(symbol));
+            if (reserved.exists(key) != toReserve) {
+                if (toReserve) {
+                    reserved[key] = true;
+                } else {
+                    delete reserved[key];
+                }
+                emit SymbolReserved(symbol, toReserve);
+            }
+        }
+        IDexRootRegistry(dexRoot).onSymbolsReserved{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(factoryCall);
+    }
+
+    /// @notice Whether `symbol` (exactly these bytes) is reserved for the exchange's owner
+    function isReserved(string symbol) internalMsg externalMsg external view returns (bool) {
+        return reserved.exists(tvm.hash(bytes(symbol)));
+    }
+
+    /// @notice Moves the curve `nonce` to the curve code of the launchpad (DexRoot.upgradeLaunches)
+    function upgradeCurve(uint64 nonce, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).upgrade{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(curveCode, curveVersion, sendGasTo);
+    }
+
+    /// @notice The upgrader's stop of the curve `nonce` for a move to a new code (the root checks who may)
+    function setCurveUpgrading(uint64 nonce, bool _upgrading, address sendGasTo) external view onlyRoot {
+        LaunchCurve(_curveAddress(nonce)).setUpgrading{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_upgrading, sendGasTo);
+    }
+
+    /// @notice The root moves the launchpad to the installed code (DexRoot.upgradeContract): only of its kind, only a
+    /// newer version, only while the upgrader's stop stands (the move is meant to wait for the launches on
+    /// their way). The address and
+    /// the whole state stay (Upgrade.tsol). Anything else gives the gas back
+    function upgrade(uint8 kind, TvmCell code, uint32 newVersion, address sendGasTo) external onlyRoot {
+        if (kind != DexConstants.CODE_KIND_LAUNCHPAD || newVersion <= version || !upgrading) {
+            _returnGas(sendGasTo);
+            return;
+        }
+        TvmCell codes = abi.encode(dexRoot, platformCode, curveCode, curveVersion, tokenRootCode, tokenWalletCode, tokenCodeVersion);
+        TvmCell params = abi.encode(threshold, creatorFeeNumerator, platformFeeNumerator, launchFeeNumerator, expiry);
+        TvmCell stage = abi.encode(paused, upgrading, created, registering, launching, reserved);
+        TvmCell registration = abi.encode(registeredAt, tokenCodeFrom);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(
+            DexConstants.LAUNCHPAD_STATE_LAYOUT, version, newVersion, sendGasTo, abi.encode(codes, params, stage, registration)
+        ));
+    }
+
+    function onCodeUpgrade(TvmCell data) private {
+        (uint16 layout, , uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // layout 1 has no registration times: the timeout counts from this move, every launch number keeps its answer
+        require(layout == DexConstants.LAUNCHPAD_STATE_LAYOUT || layout == DexConstants.LAUNCHPAD_STATE_LAYOUT_1, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        TvmCell codes;
+        TvmCell params;
+        TvmCell stage;
+        if (layout == DexConstants.LAUNCHPAD_STATE_LAYOUT) {
+            TvmCell registration;
+            (codes, params, stage, registration) = abi.decode(state, (TvmCell, TvmCell, TvmCell, TvmCell));
+            (registeredAt, tokenCodeFrom) = abi.decode(registration, (uint32, uint64));
+        } else {
+            (codes, params, stage) = abi.decode(state, (TvmCell, TvmCell, TvmCell));
+            registeredAt = uint32(block.timestamp);
+        }
+        (dexRoot, platformCode, curveCode, curveVersion, tokenRootCode, tokenWalletCode, tokenCodeVersion) =
+            abi.decode(codes, (address, TvmCell, TvmCell, uint32, TvmCell, TvmCell, uint32));
+        (threshold, creatorFeeNumerator, platformFeeNumerator, launchFeeNumerator, expiry) =
+            abi.decode(params, (uint128, uint128, uint128, uint128, uint32));
+        (paused, upgrading, created, registering, launching, reserved) =
+            abi.decode(stage, (bool, bool, uint64, uint32, mapping(address => address), mapping(uint256 => bool)));
+        version = newVersion;
+        _returnGas(sendGasTo);
+    }
+
+    function _returnGas(address sendGasTo) private pure {
+        _reserveOwn(0);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    // ==========================================
+    // Getters
+    // ==========================================
+
+    /// @notice The address of the curve `nonce`
+    function getCurveAddress(uint64 nonce) internalMsg externalMsg external view returns (address) {
+        return _curveAddress(nonce);
+    }
+
+    /// @notice The token the curve `nonce` deploys with this name and symbol (the address is known before the launch)
+    function getTokenAddress(uint64 nonce, string name, string symbol) internalMsg externalMsg external view returns (address) {
+        return _tokenAddress(_curveAddress(nonce), name, symbol);
+    }
+
+    /// @notice The launchpad's root, pause and the parameters of new curves, the number of curves created and the value
+    /// a launch takes
+    function getDetails() internalMsg externalMsg external view returns (
+        address _dexRoot,
+        bool _paused,
+        uint128 _threshold,
+        uint128 _creatorFeeNumerator,
+        uint128 _platformFeeNumerator,
+        uint64 _created,
+        uint128 _launchValue,
+        uint128 _launchFee,
+        uint128 _launchFeeNumerator,
+        uint32 _expiry
+    ) {
+        // _launchValue is what createLaunch takes in all: the gas and the launch's fee
+        return (dexRoot, paused, threshold, creatorFeeNumerator, platformFeeNumerator, created, launchValue() + launchFee(), launchFee(), launchFeeNumerator, expiry);
+    }
+}

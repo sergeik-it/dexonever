@@ -1,0 +1,38 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+/// @title Upgrade - the data a contract hands to its new code in onCodeUpgrade.
+/// The old code packs its whole state: after tvm.setcode the new code reads the storage with its own layout, so
+/// a version that adds a field would misread the old storage. onCodeUpgrade of a platform child also receives the
+/// platform data, which starts with the root address (addr_std: first bits 100), so an upgrade starts with a zero
+/// byte: the first byte of platform data is at least 0x80.
+/// The state layout is numbered apart from the code version: many code versions share a layout. A new code
+/// unpacks every layout it knows and refuses others by throwing, so the whole upgrade rolls back and the
+/// contract stays on its old code with its old state.
+library Upgrade {
+
+    function isUpgrade(TvmCell data) internal returns (bool) {
+        return data.toSlice().preloadUint(8) == DexConstants.UPGRADE_DATA_TAG;
+    }
+
+    /// @notice tag, the layout of the packed state, the old and the new version, who gets the gas left, and the
+    /// old state as a ref
+    function pack(uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) internal returns (TvmCell) {
+        TvmBuilder b;
+        b.store(DexConstants.UPGRADE_DATA_TAG, layout, oldVersion, newVersion, sendGasTo);
+        b.storeRef(state);
+        return b.toCell();
+    }
+
+    function unpack(TvmCell data) internal returns (
+        uint16 layout,
+        uint32 oldVersion,
+        uint32 newVersion,
+        address sendGasTo,
+        TvmCell state
+    ) {
+        TvmSlice s = data.toSlice();
+        (, layout, oldVersion, newVersion, sendGasTo) = s.load(uint8, uint16, uint32, uint32, address);
+        state = s.loadRef();
+    }
+}

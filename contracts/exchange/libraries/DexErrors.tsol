@@ -1,0 +1,28 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title DexErrors - the exit codes the exchange's contracts throw
+library DexErrors {
+    uint16 constant NOT_ENOUGH_GAS = 100;
+    uint16 constant NOT_AUTHORIZED = 101;
+    uint16 constant PAUSED = 102;
+    uint16 constant FROZEN = 103;
+    uint16 constant INVALID_AMOUNT = 104;
+    uint16 constant INVALID_TOKEN = 105;
+    uint16 constant TIMELOCK_ACTIVE = 110;
+    uint16 constant INTEGER_OVERFLOW = 111;
+    uint16 constant ALREADY_DEPLOYED = 112;
+    uint16 constant INVALID_DECIMALS = 113;
+    uint16 constant INVALID_AMPLIFICATION = 114;
+    uint16 constant NOT_STABLE = 115;
+    uint16 constant INVALID_CODE_KIND = 116;
+    uint16 constant NO_PENDING = 117; // nothing proposed: code or a fee increase
+    uint16 constant EXPIRED = 118;
+    uint16 constant UNKNOWN_STATE_LAYOUT = 119; // an upgrade from a state layout the new code does not know
+    uint16 constant UNKNOWN_OPERATION = 60; // a message no function takes (the compiler's own code for it)
+    uint16 constant ON_CURVE = 120; // the token is on a curve of the launchpad: only its curve deploys its vault and pair
+    uint16 constant CURVE_CLOSED = 121; // the curve does not trade: not started yet or sold out
+    uint16 constant SLIPPAGE = 122; // the price went past the limit the trader set
+    uint16 constant NOT_READY = 123; // the step waits for an earlier one (the curve's sale, the vault and the pair)
+    uint16 constant RESERVED_SYMBOL = 124; // the symbol is reserved for the exchange's owner (USDT, BTC…): the factory and the launchpad refuse it
+    uint16 constant ROOT_ACTIVE = 125; // the root's own code applies only on a closed root (setRootActive(false) first)
+}

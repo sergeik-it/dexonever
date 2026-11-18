@@ -1,0 +1,438 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+import "./PairMath.tsol";
+import "./StableMath.tsol";
+import "./DexErrors.tsol";
+import "../structures/IFeeParams.tsol";
+import "../structures/IExchangeResult.tsol";
+import "../structures/IDepositLiquidityResult.tsol";
+import "../structures/StableStructures.tsol";
+
+/// @title PairQuotes - what the pair does with an operation in its current state.
+/// Pair handlers and their expected-result getters use the same functions, so a getter never differs from the operation.
+/// An empty optional — the pair refuses the operation. A failed calculation (out of uint128/uint256, division by zero,
+/// no convergence) is a refusal too where noted; elsewhere the call fails. PairMath/StableMath report a failure
+/// instead of throwing (Quiet.tsol).
+library PairQuotes {
+
+    struct PairState {
+        uint128 leftReserve;
+        uint128 rightReserve;
+        uint128 lpSupply;
+    }
+
+    /// @notice Fee and, for a stable pair, StableSwap parameters at the time of the operation
+    struct PoolParams {
+        IFeeParams.FeeParams fee;
+        bool isStable;
+        StableStructures.StableRates rates;
+        StableStructures.Amplification a;
+    }
+
+    struct SpendQuote {
+        uint128 amountIn;
+        uint128 fee;
+    }
+
+    /// @notice A deposit: how much of each token the pair takes (the rest returns), the beneficiary part,
+    /// LP minted. Reserves change by deposit − beneficiaryFee: a stable pair takes the imbalance fee
+    /// from the side that was not deposited too, and that reserve decreases
+    struct DepositQuote {
+        uint128 leftDeposit;
+        uint128 rightDeposit;
+        uint128 leftBeneficiaryFee;
+        uint128 rightBeneficiaryFee;
+        uint128 lpReward;   // growth of lpSupply, the locked LP included
+        uint128 lpOut;      // LP to the depositor
+    }
+
+    struct WithdrawQuote {
+        uint128 leftOut;
+        uint128 rightOut;
+    }
+
+    /// @notice An amount that can be transferred as a token
+    function isCoins(uint128 amount) internal returns (bool) {
+        return amount > 0 && amount < DexConstants.MAX_TOKEN_AMOUNT;
+    }
+
+    /// @notice LP minted by the first deposit: base — the unscaled LP of the math (max of the amounts for a regular pair, D for a stable one)
+    function firstDepositLp(uint128 base) internal returns (uint128) {
+        return base * math.min(DexConstants.FIRST_DEPOSIT_LP_SCALE, DexConstants.MAX_FIRST_DEPOSIT_LP / base);
+    }
+
+    function isAmplificationInRange(uint32 value) internal returns (bool) {
+        return value >= DexConstants.MIN_AMPLIFICATION && value <= DexConstants.MAX_AMPLIFICATION;
+    }
+
+    /// @notice A change of A at most DexConstants.MAX_AMPLIFICATION_CHANGE_FACTOR times from the current A, within the limits of A
+    /// and not faster than a day
+    function isAllowedAmplificationChange(uint32 current, uint32 target, uint32 duration) internal returns (bool) {
+        return isAmplificationInRange(target) &&
+            uint64(target) <= uint64(current) * DexConstants.MAX_AMPLIFICATION_CHANGE_FACTOR &&
+            uint64(current) <= uint64(target) * DexConstants.MAX_AMPLIFICATION_CHANGE_FACTOR &&
+            duration >= DexConstants.MIN_AMPLIFICATION_RAMP_TIME &&
+            duration <= DexConstants.MAX_AMPLIFICATION_RAMP_TIME;
+    }
+
+    /// @notice A × DexConstants.AMPLIFICATION_PRECISION at `nowTime`: linear from aFrom at rampStart to aTo at rampEnd
+    function amplificationAt(StableStructures.StableConfig stable, uint32 nowTime) internal returns (uint32) {
+        if (nowTime >= stable.rampEnd) {
+            return stable.aTo;
+        }
+        if (nowTime <= stable.rampStart) {
+            return stable.aFrom;
+        }
+        uint64 elapsed = nowTime - stable.rampStart;
+        uint64 duration = stable.rampEnd - stable.rampStart;
+        // floor of the signed formula aFrom + (aTo − aFrom)·elapsed/duration
+        if (stable.aTo >= stable.aFrom) {
+            return stable.aFrom + uint32(math.muldiv(uint64(stable.aTo - stable.aFrom), elapsed, duration));
+        }
+        return stable.aFrom - uint32(math.muldivc(uint64(stable.aFrom - stable.aTo), elapsed, duration));
+    }
+
+    /// @notice Fee and StableSwap parameters of a pair for one operation: A(t) in it is one
+    function poolParams(
+        IFeeParams.FeeParams fee,
+        bool isStable,
+        StableStructures.StableConfig stable,
+        uint32 nowTime
+    ) internal returns (PoolParams pool) {
+        pool.fee = fee;
+        pool.isStable = isStable;
+        if (isStable) {
+            pool.rates = stable.rates;
+            pool.a = StableStructures.Amplification(amplificationAt(stable, nowTime), DexConstants.AMPLIFICATION_PRECISION);
+        }
+    }
+
+    function stableWithinLimits(uint256 leftReserve, uint256 rightReserve, StableStructures.StableRates rates) internal returns (bool) {
+        uint256 xpLeft = StableMath.xp(leftReserve, rates.rate0, rates.precision);
+        uint256 xpRight = StableMath.xp(rightReserve, rates.rate1, rates.precision);
+        return xpLeft > 0 && xpRight > 0 && math.max(xpLeft, xpRight) <= math.min(xpLeft, xpRight) * DexConstants.STABLE_MAX_SKEW;
+    }
+
+    /// @notice Swap of `amount`; spentLeft — the left token is given
+    function quoteExchange(
+        PairState state,
+        PoolParams pool,
+        bool spentLeft,
+        uint128 amount
+    ) internal returns (optional(IExchangeResult.ExchangeResult) result) {
+        uint128 spentReserve = spentLeft ? state.leftReserve : state.rightReserve;
+        uint128 receiveReserve = spentLeft ? state.rightReserve : state.leftReserve;
+        // the new reserve of the input token must stay below DexConstants.MAX_TOKEN_AMOUNT
+        if (spentReserve == 0 || receiveReserve == 0 || !isCoins(amount) || uint256(spentReserve) + amount >= DexConstants.MAX_TOKEN_AMOUNT) {
+            return result;
+        }
+        if (pool.isStable) {
+            return quoteStableExchange(state, pool, spentLeft, amount);
+        }
+        (bool ok, IExchangeResult.ExchangeResult r) = PairMath.calculateExpectedExchange(amount, spentReserve, receiveReserve, pool.fee);
+        require(ok, DexErrors.INTEGER_OVERFLOW);
+        if (
+            r.expectedAmount > receiveReserve ||
+            r.expectedAmount == 0 ||
+            (r.poolFee == 0 && pool.fee.pool_numerator > 0) ||
+            (r.beneficiaryFee == 0 && pool.fee.beneficiary_numerator > 0 && r.poolFee == 0)
+        ) {
+            return result;
+        }
+        result.set(r);
+    }
+
+    /// @notice Stable swap. The output is 1 less than calculated: rounding never decreases D
+    /// and the receiving reserve never becomes zero
+    function quoteStableExchange(
+        PairState state,
+        PoolParams pool,
+        bool spentLeft,
+        uint128 amount
+    ) internal returns (optional(IExchangeResult.ExchangeResult) result) {
+        if (pool.fee.referrer_numerator != 0) {
+            return result;
+        }
+        // before the calculation: the output only decreases the receiving reserve, so an input after which the
+        // given side is beyond the limit even against the full receiving reserve is refused without Newton
+        uint128 spentReserve = spentLeft ? state.leftReserve : state.rightReserve;
+        uint128 receiveReserve = spentLeft ? state.rightReserve : state.leftReserve;
+        uint256 xpSpentAfter = StableMath.xp(uint256(spentReserve) + amount, spentLeft ? pool.rates.rate0 : pool.rates.rate1, pool.rates.precision);
+        uint256 xpReceive = StableMath.xp(receiveReserve, spentLeft ? pool.rates.rate1 : pool.rates.rate0, pool.rates.precision);
+        if (xpSpentAfter > xpReceive * DexConstants.STABLE_MAX_SKEW) {
+            return result;
+        }
+        (uint8 status, StableStructures.StableExchangeResult r) = StableMath.stableExchange(
+            amount, spentLeft, state.leftReserve, state.rightReserve, pool.rates, pool.fee, pool.a
+        );
+        if (status != DexConstants.STABLE_RESULT_OK || r.amount <= 1) {
+            return result;
+        }
+        uint128 amountOut = r.amount - 1;
+        uint128 spentAfter = spentReserve + amount - r.beneficiaryFee;
+        uint128 receiveAfter = receiveReserve - amountOut;
+        if (stableWithinLimits(spentLeft ? spentAfter : receiveAfter, spentLeft ? receiveAfter : spentAfter, pool.rates)) {
+            result.set(IExchangeResult.ExchangeResult(amountOut, r.poolFee, r.beneficiaryFee, 0));
+        }
+    }
+
+    /// @notice How much to give to receive `receiveAmount`; receiveLeft — the left token is received.
+    /// The amount is checked by the swap itself: empty if the swap would refuse it or give less
+    function quoteSpendAmount(
+        PairState state,
+        PoolParams pool,
+        bool receiveLeft,
+        uint128 receiveAmount
+    ) internal returns (optional(SpendQuote) result) {
+        uint128 spentReserve = receiveLeft ? state.rightReserve : state.leftReserve;
+        uint128 receiveReserve = receiveLeft ? state.leftReserve : state.rightReserve;
+        if (spentReserve == 0 || receiveAmount == 0 || receiveAmount >= receiveReserve) {
+            return result;
+        }
+        optional(SpendQuote) spend = pool.isStable
+            ? calculateStableSpendAmount(state, pool, receiveLeft, receiveAmount)
+            : calculateSpendAmount(spentReserve, receiveReserve, pool.fee, receiveAmount);
+        if (!spend.hasValue()) {
+            return result;
+        }
+        optional(IExchangeResult.ExchangeResult) check = quoteExchange(state, pool, !receiveLeft, spend.get().amountIn);
+        if (!check.hasValue() || check.get().expectedAmount < receiveAmount) {
+            return result;
+        }
+        return spend;
+    }
+
+    function calculateSpendAmount(
+        uint128 spentReserve,
+        uint128 receiveReserve,
+        IFeeParams.FeeParams fee,
+        uint128 receiveAmount
+    ) internal returns (optional(SpendQuote) result) {
+        // the new reserve of the input token must stay below DexConstants.MAX_TOKEN_AMOUNT, otherwise the math leaves uint128
+        if (math.muldivc(uint256(spentReserve), receiveReserve, receiveReserve - receiveAmount) >= DexConstants.MAX_TOKEN_AMOUNT) {
+            return result;
+        }
+        (bool ok, uint128 amountIn, uint128 aFee) = PairMath.calculateExpectedSpendAmount(receiveAmount, spentReserve, receiveReserve, fee);
+        require(ok, DexErrors.INTEGER_OVERFLOW);
+        result.set(SpendQuote(amountIn, aFee));
+    }
+
+    /// @notice The stable input is calculated for receiveAmount + 1: the swap gives 1 less than calculated
+    function calculateStableSpendAmount(
+        PairState state,
+        PoolParams pool,
+        bool receiveLeft,
+        uint128 receiveAmount
+    ) internal returns (optional(SpendQuote) result) {
+        (uint8 status, StableStructures.StableExchangeResult r) = StableMath.stableSpendAmount(
+            receiveAmount + 1, receiveLeft, state.leftReserve, state.rightReserve, pool.rates, pool.fee, pool.a
+        );
+        if (status == DexConstants.STABLE_RESULT_OK) {
+            result.set(SpendQuote(r.amount, r.poolFee + r.beneficiaryFee));
+        }
+    }
+
+    /// @notice Deposit limits: LP to the depositor above zero, lpSupply and reserves stay below DexConstants.MAX_TOKEN_AMOUNT
+    function checkedDeposit(
+        PairState state,
+        uint128 leftDeposit,
+        uint128 rightDeposit,
+        uint128 leftBeneficiaryFee,
+        uint128 rightBeneficiaryFee,
+        uint256 lpReward
+    ) internal returns (optional(DepositQuote) result) {
+        uint128 locked = state.lpSupply == 0 ? DexConstants.POOL_MINIMUM_LIQUIDITY : 0;
+        if (
+            lpReward <= locked ||
+            uint256(state.lpSupply) + lpReward >= DexConstants.MAX_TOKEN_AMOUNT ||
+            uint256(state.leftReserve) + leftDeposit - leftBeneficiaryFee >= DexConstants.MAX_TOKEN_AMOUNT ||
+            uint256(state.rightReserve) + rightDeposit - rightBeneficiaryFee >= DexConstants.MAX_TOKEN_AMOUNT
+        ) {
+            return result;
+        }
+        result.set(DepositQuote(
+            leftDeposit,
+            rightDeposit,
+            leftBeneficiaryFee,
+            rightBeneficiaryFee,
+            uint128(lpReward),
+            uint128(lpReward) - locked
+        ));
+    }
+
+    /// @notice Two-sided deposit. A regular pair — step 1 of calculateExpectedDepositLiquidity: the part above
+    /// the proportion returns. A stable pair takes a deposit in any proportion with an imbalance fee
+    function quoteAddLiquidity(
+        PairState state,
+        PoolParams pool,
+        uint128 leftAmount,
+        uint128 rightAmount
+    ) internal returns (optional(DepositQuote) result) {
+        if (!isCoins(leftAmount) || !isCoins(rightAmount)) {
+            return result;
+        }
+        return pool.isStable
+            ? calculateStableDeposit(state, pool, leftAmount, rightAmount)
+            : calculateAddLiquidity(state, pool.fee, leftAmount, rightAmount);
+    }
+
+    function calculateAddLiquidity(
+        PairState state,
+        IFeeParams.FeeParams fee,
+        uint128 leftAmount,
+        uint128 rightAmount
+    ) internal returns (optional(DepositQuote) result) {
+        (bool ok, IDepositLiquidityResult.DepositLiquidityResult r, , , ) = PairMath.calculateExpectedDepositLiquidity(
+            leftAmount, rightAmount, false, state.leftReserve, state.rightReserve, state.lpSupply, fee
+        );
+        if (!ok) {
+            return result;
+        }
+        uint256 lpReward = state.lpSupply == 0 ? firstDepositLp(r.step1LpReward) : r.step1LpReward;
+        return checkedDeposit(state, r.step1LeftDeposit, r.step1RightDeposit, 0, 0, lpReward);
+    }
+
+    /// @notice Deposit into a stable pair, one or both sides. The first one —
+    /// both sides, 1:1 in the common scale within 1/DexConstants.STABLE_FIRST_DEPOSIT_MAX_SKEW
+    function calculateStableDeposit(
+        PairState state,
+        PoolParams pool,
+        uint128 leftAmount,
+        uint128 rightAmount
+    ) internal returns (optional(DepositQuote) result) {
+        bool isFirst = state.lpSupply == 0;
+        if (pool.fee.referrer_numerator != 0) {
+            return result;
+        }
+        uint256 newLeft = uint256(state.leftReserve) + leftAmount;
+        uint256 newRight = uint256(state.rightReserve) + rightAmount;
+        if (isFirst) {
+            uint256 xpLeft = StableMath.xp(leftAmount, pool.rates.rate0, pool.rates.precision);
+            uint256 xpRight = StableMath.xp(rightAmount, pool.rates.rate1, pool.rates.precision);
+            if (StableMath.absDiff(xpLeft, xpRight) * DexConstants.STABLE_FIRST_DEPOSIT_MAX_SKEW > math.max(xpLeft, xpRight)) {
+                return result;
+            }
+        } else if (!stableWithinLimits(newLeft, newRight, pool.rates)) {
+            // before the calculation: the reserves with the whole deposit are beyond the limit
+            return result;
+        }
+        (uint8 status, StableStructures.StableDepositResult r) = StableMath.stableDeposit(
+            leftAmount, rightAmount, state.leftReserve, state.rightReserve, state.lpSupply, pool.rates, pool.fee, pool.a
+        );
+        if (status != DexConstants.STABLE_RESULT_OK) {
+            return result;
+        }
+        if (!isFirst && !stableWithinLimits(newLeft - r.beneficiaryFee0, newRight - r.beneficiaryFee1, pool.rates)) {
+            return result;
+        }
+        uint256 lpReward = isFirst ? firstDepositLp(r.lpReward) : r.lpReward;
+        return checkedDeposit(state, leftAmount, rightAmount, r.beneficiaryFee0, r.beneficiaryFee1, lpReward);
+    }
+
+    /// @notice One-token deposit into a non-empty pair. A regular pair — with auto-change of the excess
+    /// (steps 2–3 of calculateExpectedDepositLiquidity), a stable pair — a one-sided deposit with an imbalance fee
+    function quoteAutoChangeDeposit(
+        PairState state,
+        PoolParams pool,
+        bool spentLeft,
+        uint128 amount
+    ) internal returns (optional(DepositQuote) result) {
+        if (state.lpSupply == 0 || !isCoins(amount)) {
+            return result;
+        }
+        return pool.isStable
+            ? calculateStableDeposit(state, pool, spentLeft ? amount : 0, spentLeft ? 0 : amount)
+            : calculateAutoChangeDeposit(state, pool.fee, spentLeft, amount);
+    }
+
+    function calculateAutoChangeDeposit(
+        PairState state,
+        IFeeParams.FeeParams fee,
+        bool spentLeft,
+        uint128 amount
+    ) internal returns (optional(DepositQuote) result) {
+        (
+            bool ok,
+            IDepositLiquidityResult.DepositLiquidityResult r,
+            uint128 poolFee,
+            uint128 beneficiaryFee,
+            uint128 referrerFee
+        ) = PairMath.calculateExpectedDepositLiquidity(
+            spentLeft ? amount : 0, spentLeft ? 0 : amount, true,
+            state.leftReserve, state.rightReserve, state.lpSupply, fee
+        );
+        if (!ok) {
+            return result;
+        }
+        uint128 receiveReserve = spentLeft ? state.rightReserve : state.leftReserve;
+        if (
+            r.step3LpReward == 0 ||
+            r.step2Received > receiveReserve ||
+            r.step2Received == 0 ||
+            (poolFee == 0 && fee.pool_numerator > 0) ||
+            (beneficiaryFee == 0 && fee.beneficiary_numerator > 0)
+        ) {
+            return result;
+        }
+        // the swap inside the deposit is nominal: the other side does not change, the given side gets the
+        // deposit minus the beneficiary and referrer fees
+        uint128 deposit = amount - referrerFee;
+        return checkedDeposit(
+            state,
+            spentLeft ? deposit : 0,
+            spentLeft ? 0 : deposit,
+            spentLeft ? beneficiaryFee : 0,
+            spentLeft ? 0 : beneficiaryFee,
+            uint256(r.step1LpReward) + r.step3LpReward
+        );
+    }
+
+    /// @notice Withdrawal of `lpAmount` LP: shares of both reserves, at least one above zero; a zero side
+    /// is not paid. A stable pair caps the share if the withdrawal would take the reserves beyond the limit
+    function quoteWithdraw(PairState state, PoolParams pool, uint128 lpAmount) internal returns (optional(WithdrawQuote) result) {
+        if (state.lpSupply == 0 || lpAmount == 0 || lpAmount > state.lpSupply) {
+            return result;
+        }
+        (bool ok, uint128 leftOut, uint128 rightOut) = PairMath.calculateExpectedWithdrawLiquidity(
+            lpAmount, state.leftReserve, state.rightReserve, state.lpSupply
+        );
+        require(ok, DexErrors.INTEGER_OVERFLOW);
+        if (pool.isStable) {
+            (leftOut, rightOut) = stableWithdrawWithinLimits(state, pool.rates, leftOut, rightOut);
+        }
+        if (leftOut == 0 && rightOut == 0) {
+            return result;
+        }
+        result.set(WithdrawQuote(leftOut, rightOut));
+    }
+
+    /// @notice The side whose remainder would end beyond the skew limit is capped to the remainder exactly
+    /// at the limit; the difference stays in the pool
+    function stableWithdrawWithinLimits(
+        PairState state,
+        StableStructures.StableRates rates,
+        uint128 leftOut,
+        uint128 rightOut
+    ) internal returns (uint128, uint128) {
+        uint256 xpLeft = StableMath.xp(state.leftReserve - leftOut, rates.rate0, rates.precision);
+        uint256 xpRight = StableMath.xp(state.rightReserve - rightOut, rates.rate1, rates.precision);
+        if (xpLeft > xpRight * DexConstants.STABLE_MAX_SKEW) {
+            uint256 minRight = math.muldivc(xpLeft, rates.precision, uint256(DexConstants.STABLE_MAX_SKEW) * rates.rate1);
+            return (leftOut, capOut(rightOut, state.rightReserve, minRight));
+        }
+        if (xpRight > xpLeft * DexConstants.STABLE_MAX_SKEW) {
+            uint256 minLeft = math.muldivc(xpRight, rates.precision, uint256(DexConstants.STABLE_MAX_SKEW) * rates.rate0);
+            return (capOut(leftOut, state.leftReserve, minLeft), rightOut);
+        }
+        return (leftOut, rightOut);
+    }
+
+    /// @notice max(0, min(out, reserve − minRemainder)) without leaving uint
+    function capOut(uint128 out, uint128 reserve, uint256 minRemainder) internal returns (uint128) {
+        if (minRemainder >= reserve) {
+            return 0;
+        }
+        return uint128(math.min(uint256(out), uint256(reserve) - minRemainder));
+    }
+}

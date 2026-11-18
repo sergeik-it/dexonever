@@ -1,0 +1,167 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/Upgrade.tsol";
+
+/// The root's side of its registry shards
+interface IDexRegistryAnswers {
+    function onRegistryClaim(uint8 status, address target, TvmCell call) external;
+    function onRegistryCheck(uint8 status, address target, TvmCell data) external;
+    function onRegistryDeployed(uint8 index, address sendGasTo) external;
+}
+
+/// @title DexRegistry - one shard of the registry of the vaults and pairs the root has deployed. Sharding keeps the
+/// root's state bounded and spreads deploys over several contracts. The shard of an address is its first byte
+/// (DexConstants.REGISTRY_SHARDS); the root computes a shard's address (a DexPlatform of type PLATFORM_TYPE_REGISTRY with
+/// the index), so a shard moves to a new code in place. An entry means: the address is deployed (no second deploy, no
+/// launch of a token with a vault or a pair) and who paid for it (a bounced deploy goes back to them). Only the root
+/// calls a shard; every answer goes back to the root
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DexRegistry {
+
+    address public root;
+    TvmCell public platformCode;
+    uint32 public version;
+    uint8 public index;
+    // the upgrader's stop for a move to a new code (as in pairs and vaults): claims and checks are answered busy
+    // meanwhile — the root refunds the deploy or refuses the launch
+    bool public upgrading;
+    // entries in this shard
+    uint32 public count;
+    // a deployed address → the payer of its deploy
+    mapping(address => address) payers;
+
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+    event UpgradeStatus(bool upgrading);
+
+    modifier onlyRoot() {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice The root is about to deploy `target` for `payer`: a free address is taken now and the answer lets the
+    /// deploy go; a taken one (deployed already) or a shard stopped for an upgrade lets nothing go. The answer carries
+    /// `call` (what to deploy) back with all the value
+    function claim(address target, address payer, TvmCell call) external onlyRoot {
+        _reserveOwn();
+        uint8 status = _statusOf(target);
+        if (status == DexConstants.REGISTRY_FREE) {
+            payers[target] = payer;
+            count += 1;
+        }
+        IDexRegistryAnswers(root).onRegistryClaim{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(status, target, call);
+    }
+
+    /// @notice The deploy of `target` bounced: the address is free again and the bounced value goes to its payer. An
+    /// address not here (it cannot be: the root releases only what it claimed) sends the value back to the root
+    function release(address target) external onlyRoot {
+        _reserveOwn();
+        optional(address) payer = payers.fetch(target);
+        if (!payer.hasValue()) {
+            root.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        delete payers[target];
+        count -= 1;
+        payer.get().transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Whether `target` is deployed, for a launch's registration: answered with `data` and all the value
+    function check(address target, TvmCell data) external onlyRoot {
+        _reserveOwn();
+        IDexRegistryAnswers(root).onRegistryCheck{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(_statusOf(target), target, data);
+    }
+
+    function _statusOf(address target) private view returns (uint8) {
+        if (upgrading) {
+            return DexConstants.REGISTRY_BUSY;
+        }
+        return payers.exists(target) ? DexConstants.REGISTRY_TAKEN : DexConstants.REGISTRY_FREE;
+    }
+
+    /// @notice The upgrader's stop for a move to a new code, from the root (it checks who may)
+    function setUpgrading(bool _upgrading, address sendGasTo) external onlyRoot {
+        if (upgrading != _upgrading) {
+            upgrading = _upgrading;
+            emit UpgradeStatus(_upgrading);
+        }
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice The root moves the shard to its installed code: only a newer version and only a stopped shard; the state goes over as a whole (Upgrade.tsol). Anything else gives the gas back
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external onlyRoot {
+        if (newVersion <= version || !upgrading) {
+            _returnGas(sendGasTo);
+            return;
+        }
+        TvmCell state = abi.encode(root, platformCode, index, upgrading, count, payers);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(DexConstants.REGISTRY_STATE_LAYOUT, version, newVersion, sendGasTo, state));
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // the only layout so far; a code that changes the layout unpacks this one too
+        require(layout == DexConstants.REGISTRY_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (root, platformCode, index, upgrading, count, payers) = abi.decode(
+            state, (address, TvmCell, uint8, bool, uint32, mapping(address => address))
+        );
+        version = newVersion;
+        emit CodeUpgraded(oldVersion, version);
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice Initialize from DexPlatform (the root deployed it: the params are the index), or take over the state of the
+    /// previous code. A fresh shard tells the root it is there with the gas of that (what the root does not use goes on to
+    /// send_gas_to), and the value left goes to whoever paid for its deploy (send_gas_to)
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        root = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        address sendGasTo = s.load(address);
+        platformCode = s.loadRef();
+        index = s.loadRef().toSlice().load(uint8);
+        tvm.rawReserve(varuint16(DexGas.REGISTRY_MIN_BALANCE), 0);
+        IDexRegistryAnswers(root).onRegistryDeployed{ value: varuint16(DexGas.gasValue(DexGas.REGISTRY_HOP)), flag: 0, bounce: false }(index, sendGasTo);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Keeps the shard's own balance (at least REGISTRY_MIN_BALANCE) out of the value going on
+    function _reserveOwn() private pure {
+        tvm.rawReserve(math.max(varuint16(DexGas.REGISTRY_MIN_BALANCE), address(this).balance - msg.value), 2);
+    }
+
+    /// @notice Sends the gas left (above the shard's own balance) to `to`
+    function _returnGas(address to) private pure {
+        _reserveOwn();
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Whether `target` is deployed (has an entry here)
+    function isRegistered(address target) internalMsg externalMsg external view returns (bool) {
+        return payers.exists(target);
+    }
+
+    /// @notice The shard's root, index, code version, upgrade stop and entry count
+    function getDetails() internalMsg externalMsg external view returns (
+        address _root,
+        uint8 _index,
+        uint32 _version,
+        bool _upgrading,
+        uint32 _count
+    ) {
+        return (root, index, version, upgrading, count);
+    }
+}

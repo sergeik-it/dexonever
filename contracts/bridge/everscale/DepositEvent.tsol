@@ -1,0 +1,140 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./BridgeStructs.tsol";
+import "./libraries/BridgeErrors.tsol";
+import "./libraries/BridgeGas.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/MsgFlag.tsol";
+
+/// @title One deposit of the EVM vault: the relays' votes for it
+/// @notice The root deploys it with the first relay's vote; its address follows from the root and the deposit's number,
+/// so a deposit has one event and is minted once. The other relays vote with their wallets right here. Votes are counted
+/// per variant of the data (its hash): the variant that reaches the threshold is minted, so one lying relay — even the
+/// first, whose data the event was deployed with — cannot block a deposit. A vote with data other than the first variant is shown (DataMismatch: the watcher's alarm). The root mints
+/// only for the votes of its current round; an event of an old round is refreshed by the root and voted anew
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DepositEvent is IBridgeEvent {
+    address static root;
+    uint64 static depositId;
+
+    // the confirmed variant; before it — the first one (the deploy's)
+    DepositData data;
+    // the hash of the first variant: a vote for another one is a DataMismatch
+    uint256 dataHash;
+    uint32 round;
+    mapping(address => bool) relays;
+    uint8 threshold;
+    // a relay → the hash of the variant it voted for in this round
+    mapping(address => uint256) voted;
+    // the variants voted for in this round and their votes: at most one variant per relay
+    mapping(uint256 => DepositData) variants;
+    mapping(uint256 => uint8) tally;
+    // the votes of the leading variant
+    uint8 votes;
+    bool confirmed;
+
+    event Voted(address relay, uint8 votes);
+    event DataMismatch(address relay, DepositData data);
+    event Confirmed(uint32 round);
+    event Refreshed(uint32 round);
+
+    /// @notice The root's deploy with the vote of `firstVoter` (the root checked it is a relay of `round_`)
+    constructor(DepositData data_, uint32 round_, mapping(address => bool) relays_, uint8 threshold_, address firstVoter) {
+        require(msg.sender == root, BridgeErrors.NOT_ROOT);
+        require(data_.depositId == depositId, BridgeErrors.NOT_EVENT);
+        tvm.rawReserve(BridgeGas.EVENT_KEEP, 0);
+        data = data_;
+        dataHash = tvm.hash(abi.encode(data_));
+        round = round_;
+        relays = relays_;
+        threshold = threshold_;
+        variants[dataHash] = data_;
+        _vote(firstVoter, dataHash);
+    }
+
+    /// @notice A relay's vote with the data it saw; the gas left goes back to it. At least BridgeGas.voteValue: the threshold
+    /// vote carries the root's confirmation, and with less gas the root would fail on it — the event confirmed, the deposit
+    /// never minted
+    function vote(DepositData data_) external {
+        require(relays.exists(msg.sender), BridgeErrors.NOT_RELAY);
+        require(msg.value >= BridgeGas.voteValue(DexGas.gasPrice()), BridgeErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(0, 4);
+        if (confirmed || voted.exists(msg.sender)) {
+            msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        // a variant of another deposit would be minted under this deposit's number
+        require(data_.depositId == depositId, BridgeErrors.NOT_EVENT);
+        uint256 hash = tvm.hash(abi.encode(data_));
+        if (hash != dataHash) {
+            emit DataMismatch(msg.sender, data_);
+        }
+        if (!variants.exists(hash)) {
+            variants[hash] = data_;
+        }
+        _vote(msg.sender, hash);
+    }
+
+    /// @notice Only from the root: its new round while the event waits for votes; the votes of the old one no longer count.
+    /// A confirmed event is never refreshed here — anyone may ask the root for a refresh, and a minted deposit voted anew
+    /// would be minted twice
+    function refresh(uint32 round_, mapping(address => bool) relays_, uint8 threshold_) external override {
+        require(msg.sender == root, BridgeErrors.NOT_ROOT);
+        tvm.rawReserve(0, 4);
+        if (!confirmed && round_ > round) {
+            _newRound(round_, relays_, threshold_);
+        }
+        root.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The root refused the confirmation: its votes were of an old round, nothing was minted. Only from
+    /// BridgeRoot.onDepositConfirmed, in answer to this event's own confirmation — so the event is confirmed here: from its
+    /// confirmation on, neither votes nor refresh change it
+    function reopen(uint32 round_, mapping(address => bool) relays_, uint8 threshold_) external {
+        require(msg.sender == root, BridgeErrors.NOT_ROOT);
+        tvm.rawReserve(0, 4);
+        if (round_ > round) {
+            _newRound(round_, relays_, threshold_);
+        }
+        root.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    function _newRound(uint32 round_, mapping(address => bool) relays_, uint8 threshold_) private {
+        round = round_;
+        relays = relays_;
+        threshold = threshold_;
+        delete voted;
+        delete variants;
+        delete tally;
+        votes = 0;
+        confirmed = false;
+        emit Refreshed(round_);
+    }
+
+    function _vote(address relay, uint256 hash) private {
+        voted[relay] = hash;
+        uint8 count = tally[hash] + 1;
+        tally[hash] = count;
+        if (count > votes) {
+            votes = count;
+        }
+        emit Voted(relay, count);
+        if (count < threshold) {
+            relay.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        data = variants[hash];
+        confirmed = true;
+        emit Confirmed(round);
+        IBridgeRootEvents(root).onDepositConfirmed{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(data, round);
+    }
+
+    /// @notice The event's state. _data — the confirmed variant (before it — the first); _votes — of the leading variant; _voted — a relay →
+    /// the hash of its variant; _variants and _tally — the variants of this round and their votes
+    function getDetails() internalMsg externalMsg external view responsible returns (
+        DepositData _data, uint32 _round, uint8 _threshold, uint8 _votes, bool _confirmed, mapping(address => uint256) _voted,
+        mapping(uint256 => DepositData) _variants, mapping(uint256 => uint8) _tally
+    ) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (data, round, threshold, votes, confirmed, voted, variants, tally);
+    }
+}

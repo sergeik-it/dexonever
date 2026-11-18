@@ -1,0 +1,21 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title TIP-3.1 TokenWallet
+ */
+interface TIP3TokenWallet {
+    /**
+     * @notice Returns the TokenRoot of the wallet.
+     */
+    function root() internalMsg externalMsg external view responsible returns (address);
+
+    /**
+     * @notice Returns the token balance of the wallet.
+     */
+    function balance() internalMsg externalMsg external view responsible returns (uint128);
+
+    /**
+     * @notice Returns the code of the wallet.
+     */
+    function walletCode() internalMsg externalMsg external view responsible returns (TvmCell);
+}

@@ -1,0 +1,23 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Ownership transfer callback
+ * @notice Callback the TokenRoot sends after its ownership is transferred.
+ */
+interface ITransferTokenRootOwnershipCallback {
+
+    /**
+     * @notice Called by the TokenRoot after the ownership transfer.
+     * @param oldOwner The previous owner.
+     * @param newOwner The new owner.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param payload Data passed in the callback parameters.
+     */
+    function onTransferTokenRootOwnership(
+        address oldOwner,
+        address newOwner,
+        address remainingGasTo,
+        TvmCell payload
+    ) external;
+
+}

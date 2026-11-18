@@ -1,0 +1,29 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenWalletBase.tsol";
+import "../interfaces/IBurnableByRootTokenWallet.tsol";
+
+/**
+ * @title Burning of wallet tokens by the TokenRoot ({IBurnableByRootTokenWallet})
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenWalletBurnableByRootBase is TokenWalletBase, IBurnableByRootTokenWallet {
+
+    /**
+     * @notice Burns `amount` tokens of the wallet; only the TokenRoot. See {TokenWalletBase-_burn}.
+    */
+    function burnByRoot(uint128 amount, address remainingGasTo, address callbackTo, TvmCell payload)
+        override
+        external
+        onlyRoot
+    {
+        _burn(
+            amount,
+            remainingGasTo,
+            callbackTo,
+            payload,
+            null
+        );
+    }
+
+}

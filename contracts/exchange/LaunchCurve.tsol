@@ -1,0 +1,1143 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/VaultOps.tsol";
+import "./libraries/LaunchParams.tsol";
+import "./libraries/Upgrade.tsol";
+import "./libraries/Hubs.tsol";
+import "./EventBell.tsol";
+import "./EverSurplus.tsol";
+import "./tip3/TokenRoot.tsol";
+import "./tip3/TokenWallet.tsol";
+import "./tip3/interfaces/ITokenWallet.tsol";
+import "./tip3/interfaces/IAcceptTokensTransferCallback.tsol";
+import "./tip3/interfaces/IBounceTokensTransferCallback.tsol";
+
+interface IDexRootLaunch {
+    function migrateLaunchToken(address tokenRoot, address creator, address payer) external;
+    function releaseLaunchToken(address tokenRoot) external;
+}
+
+interface ILaunchpadCurves {
+    function onCurveDeployed() external;
+}
+
+interface IDexVaultTokenWallet {
+    function tokenWalletOf() external view responsible returns (address);
+}
+
+interface IDexPairFirstDeposit {
+    function getFirstDeposit() external view responsible returns (address firstDepositor, uint128 lpSupply);
+}
+
+interface IDexNativeVaultLpDeposit {
+    function lpDepositNative(uint128 amount, TvmCell pairRef, TvmCell payload) external;
+}
+
+/// @title LaunchCurve - the bonding curve of one launch token: x·y = k on virtual reserves.
+/// The curve deploys its token, holds the whole supply and sells 793.1 million of the billion; once they are sold, the
+/// token's vault and its pair with EVER are deployed through the root and the pool gets the other 206.9 million with the
+/// EVER collected. The pool's LP stay on the curve for good: it has no way to send them.
+/// The launchpad deploys it through DexPlatform, so the address does not depend on the curve's code, which the upgrader
+/// changes through the root and the launchpad
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract LaunchCurve is EventBell, IAcceptTokensTransferCallback, IBounceTokensTransferCallback {
+
+    // the launchpad (the platform's root) and the curve's number there: with the platform's code they make its address
+    address launchpad;
+    uint64 nonce;
+    uint32 public version;
+    // the upgrader's stop before a move to a new code: no new chain of messages starts (buys, the migration, the
+    // seeding, a retried delivery, the expiry, a surplus withdrawal); answers already on their way are taken as usual,
+    // so the curve is moved once they are in. Sells go on: a sale is one step of the TIP-3 callback and the payout.
+    // The curve moves only while it stands. Independent of buysFrozen
+    bool public upgrading;
+    // when the stop was set: its lift moves the term without buys by the time it stood
+    uint32 upgradingSince;
+
+    address dexRoot;
+    // the event hub this curve rings (DexHub): the DEX root's platform for the curve's family and its address
+    address public hub;
+    address creator;
+    address tokenRoot;
+    address tokenWallet;
+    // the token's vault, its pair with EVER and the EVER vault, as the root computed them at the registration
+    address vault;
+    address pair;
+    address nativeVault;
+    // fixed at the curve's creation: a later change of the launchpad's parameters does not reach it
+    uint128 threshold;
+    uint128 creatorFeeNumerator;
+    uint128 platformFeeNumerator;
+    // a curve without buys for `expiry` closes (expire): its record at the root goes, so a launch nobody finishes does
+    // not keep its token off the exchange for good. Counted from the last buy (from the creation before any)
+    uint32 expiry;
+    uint32 lastBuyAt;
+
+    uint128 startVirtualEver;
+    uint128 virtualEver;
+    uint128 virtualTokens;
+    uint128 creatorFees;
+    uint128 platformFees;
+
+    // the whole supply came to the curve's wallet: trading is open
+    bool active;
+    // the last token of the sale is sold: trading is over, the pool waits
+    bool complete;
+    // the pair answered with this curve as its first depositor, the vault with its wallet: both exist and work
+    bool vaultDeployed;
+    bool pairDeployed;
+    // the release of the token at the root is sent (a bounced one is sent again by the next seeding)
+    bool released;
+    // the pool paid the deploys of the first migration: a repeated one is paid by its caller (a bounced first one is not
+    // counted). Otherwise a repeat sent during a seeding would take the deploy values out of the EVER half for a while
+    bool migrationPaid;
+    // closed after `expiry` without buys (expire): buys and the migration never come back, sells go on
+    bool expired;
+    // buys and the migration are stopped: the upgrader or the manager found a shortage; no new EVER come in. Sells go
+    // on while the sale does, so holders can leave; on a complete curve sells are over too and the holders wait for the
+    // lift: a migration with a shortage would seed the pool at a wrong price. Only the owner lifts it
+    // (DexRoot.setLaunchFrozen). The term without buys does not run out under it: expire waits, and the lift starts the
+    // term anew
+    bool buysFrozen;
+
+    // Bought tokens wait for the buyer's wallet's answer: the curve asks the wallet first and deploys it only if the
+    // question bounces (the wallet is missing), so a repeated buy does not pay a deploy that fails. By the wallet's
+    // address; several buys before the answer add up, `queries` counts the questions on their way, `askedAt` is when the
+    // last one went
+    struct PendingBuy {
+        address owner;
+        uint128 amount;
+        uint16 queries;
+        uint32 askedAt;
+    }
+    mapping(address => PendingBuy) pendingBuys;
+    // all the bought tokens still on the curve's wallet: the curve owes them
+    uint128 pendingTotal;
+    // to find a buyer's wallet
+    TvmCell walletCode;
+    // the pair answered with LP issued: the first deposit is in, the pool's tokens left the curve for good
+    bool poolSeeded;
+    // when the pool's token half last left (DexConstants.CURVE_POOL_TOKENS_RETRY_DELAY)
+    uint32 poolTokensSentAt;
+    // the seeding's chain in flight: 0 none, 1 the pair asked, 2 the vault asked, 3 the wallet's balance asked. One
+    // chain at a time: an answer of an older chain would take its balance for now and send the pool's tokens again out
+    // of the buyers' ones. It ends with its last answer or a bounce of its question; a chain whose answer failed at the
+    // curve (it is not sent again) is taken as lost after DexConstants.CURVE_SEED_TIMEOUT, so seed() is not blocked for good
+    uint8 seedPhase;
+    // tokens that left the curve's wallet after the balance question (phase 3): not off that balance yet
+    uint128 poolSentSinceQuery;
+    // when the seeding's chain in flight started
+    uint32 seedStartedAt;
+
+    // Tokens on the curve's wallet above what the curve owes came without a notification or with too little gas to go
+    // back: the exchange's owner withdraws them announced (OwnerWithdrawal), to a recipient of choice.
+    // The curve owes the tokens of the sale not sold yet and the pool's tokens until the pool has them
+    struct TokenSurplusRequest {
+        uint128 amount;
+        address recipient;
+        string reason;
+        uint32 readyAt;
+    }
+    optional(TokenSurplusRequest) surplusRequest;
+    // the wallet's balance was asked and the answer has not come yet; tokens the curve sent out since then are not off
+    // that balance yet (curve → wallet messages arrive in order) and are counted apart
+    bool surplusQuerying;
+    // when the balance was asked; the question waits for its own answer or bounce without a deadline (an answer delayed
+    // past a deadline would be taken for a new question's, with what was sent since it uncounted)
+    uint32 surplusQueriedAt;
+    uint128 sentSinceQuery;
+    address surplusGasTo;
+
+    event Activated();
+    /// A trade: `isBuy`, the tokens, the EVER of the curve (the cost or the gross proceeds), both fees and the virtual
+    /// reserves after it
+    event Trade(address trader, bool isBuy, uint128 tokens, uint128 evers, uint128 creatorFee, uint128 platformFee, uint128 virtualEver, uint128 virtualTokens);
+    event Completed(uint128 collected);
+    event BuysFrozen(bool frozen);
+    event UpgradeStatus(bool upgrading);
+    /// No buy for `expiry`: buys and the migration are closed, the token is released at the root
+    event Expired(uint32 lastBuyAt);
+    /// The pool got a half: the tokens and the EVER of this seeding (one of them may be zero)
+    event PoolSeeded(uint128 tokens, uint128 evers);
+    event CreatorFeesClaimed(uint128 amount);
+    event PlatformFeesCollected(uint128 amount, address recipient);
+    /// The EVER above what the seeded curve owes went with the platform's fee (collectPlatformFees)
+    event LeftoverCollected(uint128 amount, address recipient);
+    /// The wallet's answer came with too little gas for the transfer: the tokens wait for retryDelivery
+    event DeliveryKept(address owner, address wallet, uint128 amount);
+    /// A delivery or a returned sale bounced from `wallet` (its owner destroyed it after it answered): `amount` tokens are
+    /// back on the curve's wallet as its surplus
+    event TransferBounced(address wallet, uint128 amount);
+    // a command to the contract's own wallet that it refused (a failure of its own, for example too little gas after a rise
+    // of the network's prices) comes back: the tokens never left, and what was owed stays owed — not a surplus of the
+    // owner. Whom it was owed to the bounce does not tell (256 bits): the debt waits for a new code
+    event SendBounced(uint128 amount);
+    /// The owner announced a withdrawal of surplus tokens: it runs between readyAt and expiresAt
+    event TokenSurplusAnnounced(uint128 amount, address recipient, string reason, uint32 readyAt, uint32 expiresAt);
+    event TokenSurplusWithdrawn(uint128 amount, address recipient, string reason);
+    /// The withdrawal was asked for more than the surplus (`surplus` — what there was): no token left the curve
+    event TokenSurplusRefused(uint128 amount, uint128 surplus);
+    event TokenSurplusCancelled(uint128 amount, address recipient);
+
+    /// @notice Deployed by the launchpad through DexPlatform (its root is the launchpad, which the platform checked) after
+    /// the root registered the token, or moved to a new code (Upgrade.tsol). The address comes from the platform's code,
+    /// the launchpad and the number: a new curve code never changes it
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        launchpad = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        s.load(address); // send_gas_to: the rest goes through the launchpad (onCurveDeployed)
+        // the platform's code: the launchpad's curves and the DEX root's hubs are the same DexPlatform
+        TvmCell platform = s.loadRef();
+        nonce = s.loadRef().toSlice().load(uint64);
+        _init(s.loadRef(), platform);
+        hub = Hubs.addressOf(dexRoot, platform, DexConstants.HUB_FAMILY_CURVE, address(this));
+    }
+
+    /// @notice A bell at the curve's event hub in every transaction that emits an event (EventBell)
+    function _ring() internal override {
+        Hubs.ring(hub);
+    }
+
+    /// @notice Deploys the token: the whole supply to the curve's wallet, no mint and no burn by the root ever; the curve
+    /// owns it and never uses these rights. Its gas left comes back from the curve's wallet and opens trading (receive).
+    /// `launchFee` came with the value: the platform's part from the start, collected as its fees are
+    function _init(TvmCell initData, TvmCell platform) internal virtual {
+        (
+            address _creator,
+            string name,
+            string symbol,
+            string image,
+            string description,
+            address _dexRoot,
+            address _vault,
+            address _pair,
+            address _nativeVault,
+            uint128 _threshold,
+            uint128 _creatorFeeNumerator,
+            uint128 _platformFeeNumerator,
+            uint128 launchFee,
+            uint32 _expiry,
+            TvmCell rootCode,
+            TvmCell _walletCode
+        ) = abi.decode(
+            initData,
+            (address, string, string, string, string, address, address, address, address, uint128, uint128, uint128, uint128, uint32, TvmCell, TvmCell)
+        );
+        platformFees = launchFee;
+        expiry = _expiry;
+        lastBuyAt = uint32(block.timestamp);
+        creator = _creator;
+        dexRoot = _dexRoot;
+        vault = _vault;
+        pair = _pair;
+        nativeVault = _nativeVault;
+        threshold = _threshold;
+        creatorFeeNumerator = _creatorFeeNumerator;
+        platformFeeNumerator = _platformFeeNumerator;
+        // the price at the end of the sale (V + threshold) / END equals the pool's first price threshold / POOL
+        startVirtualEver = math.muldiv(_threshold, DexConstants.CURVE_END_VIRTUAL_TOKENS, DexConstants.CURVE_TOKENS_FOR_SALE);
+        virtualEver = startVirtualEver;
+        virtualTokens = DexConstants.CURVE_START_VIRTUAL_TOKENS;
+
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: TokenRoot,
+            varInit: {
+                randomNonce_: 0,
+                deployer_: address(this),
+                name_: name,
+                symbol_: symbol,
+                decimals_: DexConstants.LAUNCH_TOKEN_DECIMALS,
+                rootOwner_: address(this),
+                walletCode_: _walletCode
+            },
+            pubkey: 0,
+            code: rootCode
+        });
+        tokenRoot = address.makeAddrStd(address(this).wid, tvm.hash(stateInit));
+        walletCode = _walletCode;
+        tokenWallet = _walletOf(address(this));
+
+        uint128 price = DexGas.gasPrice();
+        uint128 deployWalletValue = TokenGas.TARGET_WALLET_BALANCE + DexGas.valueAt(price, DexGas.WALLET_DEPLOY);
+        tvm.rawReserve(DexGas.MIN_CONTRACT_BALANCE + launchFee, 0);
+        new TokenRoot{
+            stateInit: stateInit,
+            value: varuint16(TokenGas.TARGET_ROOT_BALANCE + deployWalletValue + DexGas.TOKEN_FORWARD +
+                DexGas.valueAt(price, DexGas.TOKEN_CREATE + DexGas.TOKEN_MINT)),
+            flag: 0,
+            bounce: false
+        }(address(this), DexConstants.CURVE_TOTAL_SUPPLY, deployWalletValue, true, true, false, address(this), image, description,
+            Hubs.addressOf(_dexRoot, platform, DexConstants.HUB_FAMILY_TOKEN, tokenRoot));
+        // the rest goes to the creator through the launchpad: it closes the entry of this deploy (Launchpad.launching)
+        ILaunchpadCurves(launchpad).onCurveDeployed{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false }();
+    }
+
+    /// @notice Moves the curve to the installed curve code; only the launchpad calls it (DexRoot.upgradeLaunches).
+    /// Only a newer version, and only while the curve is stopped (setUpgrading): the upgrader stops it, waits for the
+    /// answers on their way and moves it, so none of them meets a code that talks otherwise. The address and the whole
+    /// state stay (Upgrade.tsol). Anything else gives the gas back
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        if (newVersion <= version || !upgrading) {
+            _returnGas(sendGasTo);
+            return;
+        }
+        TvmCell identity = abi.encode(launchpad, nonce, dexRoot, creator, tokenRoot, tokenWallet, vault, pair, nativeVault, walletCode, hub);
+        TvmCell terms = abi.encode(threshold, creatorFeeNumerator, platformFeeNumerator, expiry, lastBuyAt, startVirtualEver);
+        TvmCell trade = abi.encode(virtualEver, virtualTokens, creatorFees, platformFees, pendingBuys, pendingTotal);
+        TvmCell stage = abi.encode(
+            active, complete, vaultDeployed, pairDeployed, released, migrationPaid, expired, buysFrozen, upgrading, upgradingSince,
+            poolSeeded, poolTokensSentAt, seedPhase, poolSentSinceQuery
+        );
+        TvmCell surplus = abi.encode(surplusRequest, surplusQuerying, surplusQueriedAt, sentSinceQuery, surplusGasTo);
+        TvmCell seeding = abi.encode(seedStartedAt);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(
+            DexConstants.LAUNCH_CURVE_STATE_LAYOUT, version, newVersion, sendGasTo, abi.encode(identity, terms, trade, stage, surplus, seeding)
+        ));
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, , uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // layout 5 has no start of the seeding's chain: a chain in flight counts its timeout from this move
+        require(layout == DexConstants.LAUNCH_CURVE_STATE_LAYOUT || layout == DexConstants.LAUNCH_CURVE_STATE_LAYOUT_5, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        TvmCell identity;
+        TvmCell terms;
+        TvmCell trade;
+        TvmCell stage;
+        TvmCell surplus;
+        if (layout == DexConstants.LAUNCH_CURVE_STATE_LAYOUT) {
+            TvmCell seeding;
+            (identity, terms, trade, stage, surplus, seeding) = abi.decode(state, (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell, TvmCell));
+            seedStartedAt = abi.decode(seeding, uint32);
+        } else {
+            (identity, terms, trade, stage, surplus) = abi.decode(state, (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell));
+            seedStartedAt = uint32(block.timestamp);
+        }
+        (launchpad, nonce, dexRoot, creator, tokenRoot, tokenWallet, vault, pair, nativeVault, walletCode, hub) =
+            abi.decode(identity, (address, uint64, address, address, address, address, address, address, address, TvmCell, address));
+        (threshold, creatorFeeNumerator, platformFeeNumerator, expiry, lastBuyAt, startVirtualEver) =
+            abi.decode(terms, (uint128, uint128, uint128, uint32, uint32, uint128));
+        (virtualEver, virtualTokens, creatorFees, platformFees, pendingBuys, pendingTotal) =
+            abi.decode(trade, (uint128, uint128, uint128, uint128, mapping(address => PendingBuy), uint128));
+        (
+            active, complete, vaultDeployed, pairDeployed, released, migrationPaid, expired, buysFrozen, upgrading, upgradingSince,
+            poolSeeded, poolTokensSentAt, seedPhase, poolSentSinceQuery
+        ) = abi.decode(stage, (bool, bool, bool, bool, bool, bool, bool, bool, bool, uint32, bool, uint32, uint8, uint128));
+        (surplusRequest, surplusQuerying, surplusQueriedAt, sentSinceQuery, surplusGasTo) =
+            abi.decode(surplus, (optional(TokenSurplusRequest), bool, uint32, uint128, address));
+        version = newVersion;
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice Sets or lifts the upgrader's stop before a move to a new code; only the launchpad calls it (the root checks
+    /// who may). No new chain starts, answers on their way are taken. The lift moves the term without buys by the time
+    /// the stop stood: nobody could buy then, and a stop set and lifted again and again adds no more than that
+    function setUpgrading(bool _upgrading, address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        uint32 nowTime = uint32(block.timestamp);
+        if (!upgrading && _upgrading) {
+            upgradingSince = nowTime;
+        } else if (upgrading && !_upgrading && !expired) {
+            lastBuyAt += nowTime - upgradingSince;
+        }
+        upgrading = _upgrading;
+        emit UpgradeStatus(_upgrading);
+        _ring();
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice A plain transfer from the curve's wallet before trading is the gas left of the token's mint: the supply is
+    /// there, trading opens (nobody else holds the token before). It always comes: the token root and the wallet get more
+    /// gas for the mint than they use (TOKEN_CREATE, TOKEN_MINT, WALLET_DEPLOY). Any other plain transfer adds to the
+    /// curve's EVER: until the pool is seeded they go to the pool (on an abandoned curve — with collectPlatformFees),
+    /// after it the curve takes none — the transfer bounces back (one without a bounce stays and leaves with
+    /// collectPlatformFees)
+    receive() external {
+        require(!poolSeeded, DexErrors.CURVE_CLOSED);
+        if (msg.sender == tokenWallet && !active) {
+            active = true;
+            emit Activated();
+            _ring();
+        }
+    }
+
+    // ==========================================
+    // Trading
+    // ==========================================
+
+    /// @notice Anyone buys `amount` tokens (no more than are left: the last buy takes the rest) for at most `maxCost`
+    /// EVER, fees included. The value pays the cost, the fees and the gas of the transfer with a new wallet; the rest
+    /// comes back with the tokens. A refusal throws: the value bounces back. The price is fixed here; the tokens go after
+    /// the buyer's wallet answers (onBuyerWallet: without a wallet deploy, its value comes back) or the question bounces
+    /// (onBounce: with the deploy)
+    function buy(uint128 amount, uint128 maxCost) external {
+        require(active && !complete, DexErrors.CURVE_CLOSED);
+        require(!_expiredNow(), DexErrors.EXPIRED);
+        require(!buysFrozen && !upgrading, DexErrors.FROZEN);
+        (uint128 bought, uint128 cost, uint128 creatorFee, uint128 platformFee) = _buyQuote(amount);
+        require(bought > 0, DexErrors.INVALID_AMOUNT);
+        uint128 total = cost + creatorFee + platformFee;
+        require(total <= maxCost, DexErrors.SLIPPAGE);
+        uint128 price = DexGas.gasPrice();
+        uint128 deployWalletValue = TokenGas.TARGET_WALLET_BALANCE + DexGas.valueAt(price, DexGas.WALLET_DEPLOY);
+        require(
+            msg.value >= total + deployWalletValue + DexGas.WALLET_FORWARD + DexGas.valueAt(price, DexGas.CURVE_BUY),
+            DexErrors.NOT_ENOUGH_GAS
+        );
+
+        uint128 kept = _keptBefore();
+        lastBuyAt = uint32(block.timestamp);
+        virtualEver += cost;
+        virtualTokens -= bought;
+        creatorFees += creatorFee;
+        platformFees += platformFee;
+        emit Trade(msg.sender, true, bought, cost, creatorFee, platformFee, virtualEver, virtualTokens);
+        if (virtualTokens == DexConstants.CURVE_END_VIRTUAL_TOKENS) {
+            complete = true;
+            emit Completed(virtualEver - startVirtualEver);
+        }
+        _reserve(kept + total);
+        _ring();
+        _queueDelivery(msg.sender, bought);
+    }
+
+    /// @notice Records `amount` tokens owed to `owner` and asks its wallet, with all the value not reserved
+    function _queueDelivery(address owner, uint128 amount) internal {
+        address wallet = _walletOf(owner);
+        PendingBuy pending = pendingBuys.fetch(wallet).getOr(PendingBuy(owner, 0, 0, 0));
+        pending.amount += amount;
+        pending.queries += 1;
+        pending.askedAt = uint32(block.timestamp);
+        pendingBuys[wallet] = pending;
+        pendingTotal += amount;
+        _askBuyerWallet(wallet);
+    }
+
+    function _askBuyerWallet(address wallet) private pure {
+        ITokenWallet(wallet).balance{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: LaunchCurve.onBuyerWallet }();
+    }
+
+    /// @notice The buyer's wallet answered: it exists, the tokens go without a deploy. Only a wallet the curve asked can
+    /// answer here: an answer of a responsible function goes to the caller, and the entry is found by its address (it
+    /// stays while a question is on its way)
+    function onBuyerWallet(uint128 /* balance */) external {
+        require(pendingBuys.exists(msg.sender), DexErrors.NOT_AUTHORIZED);
+        _deliver(msg.sender, 0);
+    }
+
+    /// @notice Anyone gives the gas of the delivery of tokens that wait for `wallet` (an answer came with too little);
+    /// the tokens go only to their buyer. Only when no question is on its way: its answer delivers them anyway. A question
+    /// without an answer for DexConstants.DELIVERY_ANSWER_TIMEOUT is taken as lost: the retry asks anew and counts only
+    /// its own question
+    function retryDelivery(address wallet) external {
+        optional(PendingBuy) found = pendingBuys.fetch(wallet);
+        require(found.hasValue() && found.get().amount > 0, DexErrors.INVALID_AMOUNT);
+        PendingBuy pending = found.get();
+        bool lost = uint32(block.timestamp) >= pending.askedAt + DexConstants.DELIVERY_ANSWER_TIMEOUT;
+        require(pending.queries == 0 || lost, DexErrors.INVALID_AMOUNT);
+        require(!upgrading, DexErrors.FROZEN);
+        require(msg.value >= _deliveryValue(true) + DexGas.gasValue(DexGas.CURVE_TRADE), DexErrors.NOT_ENOUGH_GAS);
+        pending.queries = 1;
+        pending.askedAt = uint32(block.timestamp);
+        pendingBuys[wallet] = pending;
+        _reserve(_keptBefore());
+        _askBuyerWallet(wallet);
+    }
+
+    /// @notice The tokens waiting for `wallet` go to their buyer with the gas of this answer, with a wallet deploy when it
+    /// was missing. An answer without gas for it delivers nothing: the tokens wait for retryDelivery, the gas goes back to
+    /// the buyer. Another answer for the same wallet (buys before the first answer) finds nothing left and returns its gas
+    function _deliver(address wallet, uint128 deployWalletValue) internal {
+        optional(PendingBuy) found = pendingBuys.fetch(wallet);
+        if (!found.hasValue()) {
+            return;
+        }
+        PendingBuy pending = found.get();
+        _reserve(_keptBefore());
+        if (pending.amount > 0 && msg.value < _deliveryValue(deployWalletValue > 0)) {
+            pending.queries -= 1;
+            pendingBuys[wallet] = pending;
+            emit DeliveryKept(pending.owner, wallet, pending.amount);
+            _ring();
+            pending.owner.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        uint128 amount = pending.amount;
+        pending.amount = 0;
+        pending.queries -= 1;
+        if (pending.queries == 0) {
+            delete pendingBuys[wallet];
+        } else {
+            pendingBuys[wallet] = pending;
+        }
+        if (amount == 0) {
+            pending.owner.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        pendingTotal -= amount;
+        _countSent(amount);
+        TvmCell empty;
+        ITokenWallet(tokenWallet).transfer{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(
+            amount, pending.owner, deployWalletValue, pending.owner, false, empty
+        );
+    }
+
+    /// @notice The pool's tokens are on the curve's wallet of `balance`: the bought tokens waiting for delivery lie there
+    /// too and are not the pool's
+    function _poolTokensThere(uint128 balance) internal view returns (bool) {
+        return balance >= DexConstants.CURVE_POOL_TOKENS + pendingTotal;
+    }
+
+    /// @notice The gas of a delivery: the transfer of the curve's wallet, and with a deploy the new wallet and its code
+    function _deliveryValue(bool deploy) private pure returns (uint128) {
+        uint128 price = DexGas.gasPrice();
+        uint128 gas = DexGas.valueAt(price, DexGas.CURVE_DELIVERY);
+        return deploy ? gas + TokenGas.TARGET_WALLET_BALANCE + DexGas.WALLET_FORWARD + DexGas.valueAt(price, DexGas.WALLET_DEPLOY) : gas;
+    }
+
+    /// @notice The address of the token wallet of `owner`
+    function _walletOf(address owner) internal view returns (address) {
+        return address.makeAddrStd(address(this).wid, tvm.hash(abi.encodeStateInit({
+            contr: TokenWallet,
+            varInit: { root_: tokenRoot, owner_: owner },
+            pubkey: 0,
+            code: walletCode
+        })));
+    }
+
+    /// @notice Sells tokens sent to the curve's wallet with a notification; only the curve's wallet calls it. payload:
+    /// exactly uint128 minOut, the least EVER after the fees. A wallet notification does not bounce: after the sender
+    /// check every refusal returns the tokens
+    function onAcceptTokensTransfer(
+        address /* tokenRoot */,
+        uint128 amount,
+        address sender,
+        address /* senderWallet */,
+        address remainingGasTo,
+        TvmCell payload
+    ) external override {
+        require(msg.sender == tokenWallet, DexErrors.NOT_AUTHORIZED);
+        uint128 kept = _keptBefore();
+        TvmSlice s = VaultOps.payloadSlice(payload);
+        bool open = active && !complete && s.bits() == DexConstants.SELL_PAYLOAD_BITS && s.refs() == 0;
+        // the gas of a sale, and of a refusal: the return forwards a transfer, which does not follow the gas price
+        if (!open || msg.value < DexGas.TRANSFER_FORWARD + DexGas.gasValue(DexGas.CURVE_TRADE)) {
+            _returnTokens(kept, amount, sender, remainingGasTo);
+            return;
+        }
+        uint128 minOut = s.load(uint128);
+        (uint128 proceeds, uint128 creatorFee, uint128 platformFee) = _sellQuote(amount);
+        uint128 fees = creatorFee + platformFee;
+        if (proceeds <= fees || proceeds - fees < minOut) {
+            _returnTokens(kept, amount, sender, remainingGasTo);
+            return;
+        }
+        virtualEver -= proceeds;
+        virtualTokens += amount;
+        creatorFees += creatorFee;
+        platformFees += platformFee;
+        emit Trade(sender, false, amount, proceeds, creatorFee, platformFee, virtualEver, virtualTokens);
+        uint128 paid = proceeds - fees;
+        _reserve(kept > paid ? kept - paid : 0);
+        _ring();
+        sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false });
+    }
+
+    /// @notice A transfer from the curve's wallet bounced (only the curve's wallet calls it): the tokens are back there.
+    /// A bounced half of the seeding is sent again by the next seeding (onBounce). A delivery or a returned sale goes to
+    /// the wallet that has just answered or sent, so only its owner's destroy bounces it: those tokens stay as the curve's
+    /// surplus
+    function onBounceTokensTransfer(address /* tokenRoot */, uint128 amount, address revertedFrom) external override {
+        require(msg.sender == tokenWallet, DexErrors.NOT_AUTHORIZED);
+        if (revertedFrom == _walletOf(vault)) {
+            return;
+        }
+        emit TransferBounced(revertedFrom, amount);
+        _ring();
+    }
+
+    function _returnTokens(uint128 kept, uint128 amount, address sender, address remainingGasTo) private {
+        _reserve(kept);
+        _countSent(amount);
+        TvmCell empty;
+        // not owed: refused by the curve's own wallet they stay on it as a surplus, so no bounce
+        ITokenWallet(tokenWallet).transfer{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(
+            amount, sender, 0, remainingGasTo, false, empty
+        );
+    }
+
+    /// @notice A buy of `amount`: the tokens it gets, its cost (the growth of the virtual EVER reserve that keeps the
+    /// product of the reserves from falling, rounded up) and both fees, each rounded up
+    function _buyQuote(uint128 amount) private view returns (uint128 bought, uint128 cost, uint128 creatorFee, uint128 platformFee) {
+        bought = math.min(amount, virtualTokens - DexConstants.CURVE_END_VIRTUAL_TOKENS);
+        if (bought == 0) {
+            return (0, 0, 0, 0);
+        }
+        cost = math.muldivc(virtualEver, virtualTokens, virtualTokens - bought) - virtualEver;
+        (creatorFee, platformFee) = _fees(cost);
+    }
+
+    /// @notice A sale of `amount`: the gross proceeds (the fall of the virtual EVER reserve, rounded down) and both fees
+    function _sellQuote(uint128 amount) private view returns (uint128 proceeds, uint128 creatorFee, uint128 platformFee) {
+        proceeds = virtualEver - math.muldivc(virtualEver, virtualTokens, virtualTokens + amount);
+        (creatorFee, platformFee) = _fees(proceeds);
+    }
+
+    function _fees(uint128 evers) private view returns (uint128 creatorFee, uint128 platformFee) {
+        creatorFee = math.muldivc(evers, creatorFeeNumerator, DexConstants.LAUNCH_FEE_DENOMINATOR);
+        platformFee = math.muldivc(evers, platformFeeNumerator, DexConstants.LAUNCH_FEE_DENOMINATOR);
+    }
+
+    // ==========================================
+    // Expiry
+    // ==========================================
+
+    /// @notice No buy came for `expiry` (or the curve has closed): buys are refused. A sale that is over never expires:
+    /// buy and expire check `complete` themselves
+    function _expiredNow() private view returns (bool) {
+        return expired || uint32(block.timestamp) > lastBuyAt + expiry;
+    }
+
+    /// @notice Anyone, once no buy came for `expiry` and the sale is not over: the curve closes for good — buys and the
+    /// migration never come back, sells go on, so every holder can still take their EVER — and asks the root to release
+    /// its token (DexRoot.releaseLaunchToken): the root drops its record, the token is an ordinary one. The caller pays the
+    /// release; the rest comes back. A bounced release (the root out of gas) is sent again by the next expire
+    function expire() external {
+        require(!complete && !released && _expiredNow(), DexErrors.NOT_READY);
+        // a frozen curve cannot be bought from: inactivity does not count while frozen or upgrading
+        require(!buysFrozen && !upgrading, DexErrors.FROZEN);
+        require(msg.value >= DexGas.gasValue(DexGas.CURVE_EXPIRE + DexGas.LAUNCH_RELEASE), DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(_keptBefore(), 0);
+        if (!expired) {
+            expired = true;
+            emit Expired(lastBuyAt);
+            _ring();
+        }
+        released = true;
+        IDexRootLaunch(dexRoot).releaseLaunchToken{ value: varuint16(DexGas.gasValue(DexGas.LAUNCH_RELEASE)), flag: 0, bounce: true }(tokenRoot);
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    // ==========================================
+    // Migration to the exchange
+    // ==========================================
+
+    /// @notice Anyone, once the sale is over: the root deploys the token's vault and the pair with EVER. The first time
+    /// the deploys are paid from the pool's EVER (what the root does not use comes back), the curve's and the root's own gas
+    /// by the caller. Repeated until the seeding has seen both (the root skips what is deployed, so a bounced deploy is sent
+    /// again): a repeat is paid by its caller whole, deploys included, and what the root does not use goes back to the caller
+    function migrate() external {
+        require(complete, DexErrors.NOT_READY);
+        require(!buysFrozen && !upgrading, DexErrors.FROZEN);
+        require(!(vaultDeployed && pairDeployed), DexErrors.ALREADY_DEPLOYED);
+        uint128 deploys = DexGas.deployVaultValue() + DexGas.deployPairValue();
+        uint128 gas = DexGas.gasValue(DexGas.CURVE_MIGRATE + DexGas.LAUNCH_MIGRATE);
+        require(msg.value >= (migrationPaid ? deploys + gas : gas), DexErrors.NOT_ENOUGH_GAS);
+        // the pool's EVER (the threshold, at least DexConstants.LAUNCH_MIN_THRESHOLD) pay the first deploys, a few EVER
+        tvm.rawReserve(migrationPaid ? _keptBefore() : _keptBefore() - deploys, 0);
+        // the deploys' payer gets what they do not use and what a bounced one returns
+        address payer = migrationPaid ? msg.sender : address(this);
+        migrationPaid = true;
+        IDexRootLaunch(dexRoot).migrateLaunchToken{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(tokenRoot, creator, payer);
+    }
+
+    /// @notice Anyone, once the sale is over: sends the pool what the curve holds of it — the pool's tokens if they are on
+    /// its wallet, the EVER above the fees and the reserve — as the two halves of a deposit. The curve asks first, and
+    /// learns from the answers alone: the pair whether it exists with this curve as its first depositor, the vault whether
+    /// it knows its wallet (tokens before that would stay on the vault unaccounted), its own wallet the balance (a half
+    /// the exchange returned is sent again, one in flight is not). With the pair and the vault seen the token is released
+    /// at the root. The caller pays the questions and may add to the gas of the halves; what is left stays with the pool's
+    /// EVER. No lock between the questions and the answers: a failed answer leaves nothing half done, and the EVER half is
+    /// decided by the curve's balance at the answer. One seeding at a time (seedPhase): another one while it runs is refused
+    /// (NOT_READY) until DexConstants.CURVE_SEED_TIMEOUT after its start: then it is taken as lost. The token half goes out
+    /// at most once per DexConstants.CURVE_POOL_TOKENS_RETRY_DELAY
+    function seed() external {
+        require(complete, DexErrors.NOT_READY);
+        // frozen buys stop the move to the exchange as a whole: the migration and the seeding, until the shortfall is
+        // sorted out
+        require(!buysFrozen && !upgrading, DexErrors.FROZEN);
+        uint32 nowTime = uint32(block.timestamp);
+        require(seedPhase == 0 || nowTime >= seedStartedAt + DexConstants.CURVE_SEED_TIMEOUT, DexErrors.NOT_READY);
+        require(msg.value >= DexConstants.CURVE_SEED_FORWARD + DexGas.gasValue(DexGas.CURVE_SEED), DexErrors.NOT_ENOUGH_GAS);
+        seedPhase = 1;
+        seedStartedAt = nowTime;
+        IDexPairFirstDeposit(pair).getFirstDeposit{
+            value: 0,
+            flag: MsgFlag.REMAINING_GAS,
+            bounce: true,
+            callback: LaunchCurve.onPairFirstDeposit
+        }();
+    }
+
+    /// @notice The pair's answer (only the pair calls it): it exists, and it waits for this curve's first deposit — only
+    /// the curve deploys it (DexRoot.migrateLaunchToken), with itself as the first depositor. LP issued mean the first
+    /// deposit is in: both halves went into the pool, the seeding sends nothing any more. The pair names this curve its
+    /// first depositor: the root deploys it so, the check only stands guard
+    function onPairFirstDeposit(address firstDepositor, uint128 lpSupply) external {
+        require(msg.sender == pair && firstDepositor == address(this), DexErrors.NOT_AUTHORIZED);
+        require(seedPhase == 1, DexErrors.NOT_READY);
+        seedPhase = 2;
+        pairDeployed = true;
+        if (lpSupply > 0) {
+            poolSeeded = true;
+        }
+        IDexVaultTokenWallet(vault).tokenWalletOf{
+            value: 0,
+            flag: MsgFlag.REMAINING_GAS,
+            bounce: true,
+            callback: LaunchCurve.onVaultWallet
+        }();
+    }
+
+    /// @notice The vault's answer after the pair's (only the vault calls it): without its wallet yet the seeding stops
+    /// here, the gas stays. With it, the token is released at the root (once; a bounced release is sent again by the next
+    /// seeding)
+    function onVaultWallet(address wallet) external {
+        require(msg.sender == vault, DexErrors.NOT_AUTHORIZED);
+        require(seedPhase == 2, DexErrors.NOT_READY);
+        if (wallet.isNone()) {
+            seedPhase = 0;
+            return;
+        }
+        vaultDeployed = true;
+        // the caller's gas pays the release too: the curve keeps what it had
+        tvm.rawReserve(_keptBefore(), 0);
+        if (!released) {
+            released = true;
+            IDexRootLaunch(dexRoot).releaseLaunchToken{ value: varuint16(DexGas.gasValue(DexGas.LAUNCH_RELEASE)), flag: 0, bounce: true }(tokenRoot);
+        }
+        if (poolSeeded || buysFrozen || upgrading) {
+            seedPhase = 0;
+            return;
+        }
+        seedPhase = 3;
+        poolSentSinceQuery = 0;
+        ITokenWallet(tokenWallet).balance{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: LaunchCurve.onPoolTokens }();
+    }
+
+    /// @notice The curve's wallet's answer (only that wallet calls it): the halves go out. Its balance lacks what left
+    /// after the question (counted apart); a pool seeded, a freeze or a stop meanwhile — nothing goes
+    function onPoolTokens(uint128 balance) external {
+        require(msg.sender == tokenWallet, DexErrors.NOT_AUTHORIZED);
+        require(seedPhase == 3, DexErrors.NOT_READY);
+        seedPhase = 0;
+        balance = balance > poolSentSinceQuery ? balance - poolSentSinceQuery : 0;
+        poolSentSinceQuery = 0;
+        if (poolSeeded || buysFrozen || upgrading) {
+            return;
+        }
+        uint128 price = DexGas.gasPrice();
+        uint128 operation = DexGas.vaultOperationMinValue();
+        // the vault's wallet exists: the token root deployed it before answering the vault. Were it not there yet, the
+        // transfer would bounce back to the curve's wallet and the tokens would wait for the next seeding
+        uint128 tokenHalf = operation + DexGas.TRANSFER_FORWARD + DexGas.valueAt(price, DexGas.CURVE_TOKEN_TRANSFER);
+
+        // the caller's gas left in the answer counts: a caller may add to a half the pool's EVER no longer cover. Kept
+        // apart: the answer's own gas and the forwarding of the halves
+        uint128 balanceNow = address(this).balance;
+        uint128 margin = DexConstants.CURVE_SEED_FORWARD + DexGas.valueAt(price, DexGas.CURVE_SEED);
+        uint128 owed = _everOwed() + margin;
+        uint128 available = balanceNow > owed ? balanceNow - owed : 0;
+        bool tokensDue = uint32(block.timestamp) >= poolTokensSentAt + DexConstants.CURVE_POOL_TOKENS_RETRY_DELAY;
+        uint128 tokens = tokensDue && _poolTokensThere(balance) && available >= tokenHalf ? DexConstants.CURVE_POOL_TOKENS : 0;
+        uint128 spent = tokens > 0 ? tokenHalf : 0;
+        uint128 evers = available > spent + operation ? available - spent - operation : 0;
+        if (evers > 0) {
+            spent += evers + operation;
+        }
+        if (spent == 0) {
+            return;
+        }
+        emit PoolSeeded(tokens, evers);
+        // the halves leave; the margin pays this answer and their forwarding (its rest stays); the fees and the reserve stay
+        tvm.rawReserve(balanceNow - spent - margin, 0);
+        _ring();
+
+        TvmCell pairRef = _poolRef();
+        TvmCell minLpOut = abi.encode(uint128(0));
+        if (tokens > 0) {
+            TvmBuilder b;
+            b.store(DexConstants.VAULT_OP_LP_DEPOSIT);
+            b.storeRef(pairRef);
+            b.storeRef(minLpOut);
+            _countSent(tokens);
+            poolTokensSentAt = uint32(block.timestamp);
+            ITokenWallet(tokenWallet).transfer{ value: varuint16(tokenHalf), flag: MsgFlag.SENDER_PAYS_FEES, bounce: true }(
+                tokens, vault, 0, address(this), true, b.toCell()
+            );
+        }
+        if (evers > 0) {
+            IDexNativeVaultLpDeposit(nativeVault).lpDepositNative{ value: varuint16(evers + operation), flag: MsgFlag.SENDER_PAYS_FEES, bounce: true }(
+                evers, pairRef, minLpOut
+            );
+        }
+    }
+
+    /// @notice A half of the seeding or a question bounced: its value is back on the curve (the tokens of a bounced half
+    /// are back on its wallet), the next seeding sends them again. A bounced release (the root out of gas) is sent again
+    onBounce(TvmSlice body) external {
+        uint32 functionId = body.load(uint32);
+        if (functionId == abi.functionId(IDexPairFirstDeposit.getFirstDeposit) || functionId == abi.functionId(IDexVaultTokenWallet.tokenWalletOf)) {
+            // a question of the seeding's chain bounced: the chain is over
+            seedPhase = 0;
+        } else if ((functionId == abi.functionId(ITokenWallet.transfer) || functionId == abi.functionId(ITokenWallet.transferToWallet)) &&
+            msg.sender == tokenWallet) {
+            _sendBounced(body);
+        } else if (functionId == abi.functionId(IDexRootLaunch.releaseLaunchToken)) {
+            released = false;
+        } else if (functionId == abi.functionId(IDexRootLaunch.migrateLaunchToken)) {
+            // the root refused (paused): nothing was deployed, the pool pays the next migration again
+            migrationPaid = false;
+        } else if (functionId == abi.functionId(TIP3TokenWallet.balance)) {
+            // the questions to wallets differ by their answer id
+            uint32 answerId = body.load(uint32);
+            if (answerId == abi.functionId(LaunchCurve.onBuyerWallet)) {
+                // the buyer has no wallet yet: the tokens go with its deploy
+                _deliver(msg.sender, DexGas.deployWalletValue());
+            } else if (answerId == abi.functionId(LaunchCurve.onPoolTokens)) {
+                seedPhase = 0;
+                poolSentSinceQuery = 0;
+            } else if (answerId == abi.functionId(LaunchCurve.onSurplusBalance) && surplusQuerying) {
+                // the surplus question bounced: the withdrawal can be run again
+                surplusQuerying = false;
+                _reserve(_keptBefore());
+                surplusGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            }
+        }
+    }
+
+    // ==========================================
+    // Token surplus
+    // ==========================================
+
+    /// @notice The exchange's owner (through the root and the launchpad) announces a withdrawal of `amount` tokens above
+    /// what the curve owes to `recipient`, not before DexConstants.OWNER_WITHDRAWAL_DELAY and not after APPLY_WINDOW past that. A new
+    /// announcement replaces the previous one. A zero amount, a recipient outside the basechain or the curve itself, a
+    /// reason over MAX_REASON_BYTES or an announcement while the balance is being asked are refused; the gas goes back
+    function announceTokenSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        if (amount == 0 || !OwnerWithdrawal.validTarget(recipient, reason) || surplusQuerying) {
+            _returnGas(sendGasTo);
+            return;
+        }
+        _cancelTokenSurplus();
+        uint32 readyAt = uint32(block.timestamp) + DexConstants.OWNER_WITHDRAWAL_DELAY;
+        surplusRequest = TokenSurplusRequest(amount, recipient, reason, readyAt);
+        emit TokenSurplusAnnounced(amount, recipient, reason, readyAt, readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW);
+        _ring();
+        _returnGas(sendGasTo);
+    }
+
+    /// @notice The exchange's owner (through the root and the launchpad) cancels the announced withdrawal; ignored while
+    /// the balance is being asked. The gas goes back
+    function cancelTokenSurplus(address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        if (!surplusQuerying) {
+            _cancelTokenSurplus();
+        }
+        _returnGas(sendGasTo);
+    }
+
+    function _cancelTokenSurplus() private {
+        if (surplusRequest.hasValue()) {
+            emit TokenSurplusCancelled(surplusRequest.get().amount, surplusRequest.get().recipient);
+            _ring();
+            delete surplusRequest;
+        }
+    }
+
+    /// @notice The exchange's owner (through the root and the launchpad) runs the announced withdrawal: asks the wallet for
+    /// its balance, the answer decides (onSurplusBalance). Refused outside the window, while an answer is awaited or with
+    /// less than surplusWithdrawMinValue; the gas goes back. The pool's tokens stay owed until the pool has them: returned
+    /// to the wallet (a vault on pause) they are no surplus
+    function withdrawTokenSurplus(address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        uint32 nowTime = uint32(block.timestamp);
+        bool ready = surplusRequest.hasValue() && nowTime >= surplusRequest.get().readyAt &&
+            nowTime <= surplusRequest.get().readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW;
+        if (!ready || surplusQuerying || upgrading || msg.value < DexGas.surplusWithdrawMinValue()) {
+            _returnGas(sendGasTo);
+            return;
+        }
+        surplusQueriedAt = nowTime;
+        surplusQuerying = true;
+        sentSinceQuery = 0;
+        surplusGasTo = sendGasTo;
+        _reserve(_keptBefore());
+        ITokenWallet(tokenWallet).balance{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: LaunchCurve.onSurplusBalance }();
+    }
+
+    /// @notice The wallet's balance for the announced withdrawal (only the curve's wallet calls it). The surplus is the
+    /// balance less what the curve owes (the sale's tokens not sold yet and the pool's tokens until the pool has them) and
+    /// less what it sent out after the question (not off this balance yet): the withdrawal leaves only within it
+    function onSurplusBalance(uint128 balance) external {
+        require(msg.sender == tokenWallet && surplusQuerying, DexErrors.NOT_AUTHORIZED);
+        surplusQuerying = false;
+        address gasTo = surplusGasTo;
+        uint128 owed = _tokensOwed() + sentSinceQuery;
+        uint128 surplus = balance > owed ? balance - owed : 0;
+        _reserve(_keptBefore());
+        TokenSurplusRequest request = surplusRequest.get();
+        // too little gas for the transfer with a wallet deploy: refused, so the answer itself never fails
+        if (request.amount > surplus || msg.value < DexGas.surplusAnswerMinValue()) {
+            emit TokenSurplusRefused(request.amount, surplus);
+            _ring();
+            gasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        delete surplusRequest;
+        emit TokenSurplusWithdrawn(request.amount, request.recipient, request.reason);
+        _ring();
+        _countSent(request.amount);
+        TvmCell empty;
+        // not owed: refused by the curve's own wallet they stay a surplus, so no bounce
+        ITokenWallet(tokenWallet).transfer{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(
+            request.amount, request.recipient, DexGas.deployWalletValue(), gasTo, false, empty
+        );
+    }
+
+    /// @notice The curve's own wallet refused a transfer: a buyer's tokens (a delivery or a bounced claim) are owed again.
+    /// The pool's half to the vault is told apart by the first bits of its recipient that the bounce keeps: its tokens are
+    /// owed to the pool while it is not seeded anyway
+    function _sendBounced(TvmSlice body) private {
+        uint128 amount = body.load(uint128);
+        TvmBuilder b;
+        b.store(vault);
+        if (body.bits() >= DexConstants.LP_CLAIM_PREFIX_BITS &&
+            body.loadUint(DexConstants.LP_CLAIM_PREFIX_BITS) == b.toSlice().loadUint(DexConstants.LP_CLAIM_PREFIX_BITS)) {
+            return;
+        }
+        pendingTotal += amount;
+        emit SendBounced(amount);
+        _ring();
+    }
+
+    /// @notice Tokens the curve owes: the sale's not sold yet, those bought and not delivered yet and the pool's until the
+    /// pool has them
+    function _tokensOwed() private view returns (uint128) {
+        uint128 forSale = virtualTokens - DexConstants.CURVE_END_VIRTUAL_TOKENS + pendingTotal;
+        return poolSeeded ? forSale : forSale + DexConstants.CURVE_POOL_TOKENS;
+    }
+
+    /// @notice Tokens leave the curve's wallet: while the balance is being asked (a surplus or the seeding) they are counted apart
+    function _countSent(uint128 amount) private {
+        if (seedPhase == 3) {
+            poolSentSinceQuery += amount;
+        }
+        if (surplusQuerying) {
+            sentSinceQuery += amount;
+        }
+    }
+
+    /// @notice Stops or resumes buys, the migration and the seeding; only the launchpad calls it (the root checks who
+    /// may). The lift of a freeze starts the term without buys anew: nobody could buy while it stood
+    function setBuysFrozen(bool frozen, address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        if (buysFrozen && !frozen && !expired) {
+            lastBuyAt = uint32(block.timestamp);
+        }
+        buysFrozen = frozen;
+        emit BuysFrozen(frozen);
+        _ring();
+        _returnGas(sendGasTo);
+    }
+
+    function _returnGas(address to) private view {
+        _reserve(_keptBefore());
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The pool: this token and EVER, not stable
+    function _poolRef() private view returns (TvmCell) {
+        TvmBuilder b;
+        b.store(tokenRoot, address(0), false);
+        return b.toCell();
+    }
+
+    // ==========================================
+    // Fees
+    // ==========================================
+
+    /// @notice The creator takes the creator's part of the fees; only the creator calls it. The gas of the call comes
+    /// back with it
+    function claimCreatorFees() external {
+        require(msg.sender == creator, DexErrors.NOT_AUTHORIZED);
+        uint128 amount = creatorFees;
+        require(amount > 0, DexErrors.INVALID_AMOUNT);
+        uint128 kept = _keptBefore();
+        creatorFees = 0;
+        emit CreatorFeesClaimed(amount);
+        _reserve(kept > amount ? kept - amount : 0);
+        _ring();
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false });
+    }
+
+    /// @notice The exchange's owner (through the root and the launchpad) takes the platform's part to `recipient`; the gas
+    /// left goes to `sendGasTo`. Once the pool is seeded, the EVER above what the curve owes (the creator's fees and the
+    /// reserve) go with it: the gas left by the migration and the seeding, transfers that did not bounce — the pool takes
+    /// nothing any more, and they would stay on the curve for good. So on an abandoned curve (expired before the sale was
+    /// over): there will be no pool, and above what it owes — with the EVER the sale collected, the holders sell back for
+    /// them — the gas left and transfers belong to nobody
+    function collectPlatformFees(address recipient, address sendGasTo) external {
+        require(msg.sender == launchpad, DexErrors.NOT_AUTHORIZED);
+        uint128 kept = _keptBefore();
+        uint128 owed = _everOwed();
+        bool abandoned = expired && !complete;
+        uint128 leftover = (poolSeeded || abandoned) && kept > owed ? kept - owed : 0;
+        uint128 fees = platformFees;
+        uint128 amount = fees + leftover;
+        platformFees = 0;
+        _reserve(kept > amount ? kept - amount : 0);
+        if (fees > 0) {
+            emit PlatformFeesCollected(fees, recipient);
+        }
+        if (leftover > 0) {
+            emit LeftoverCollected(leftover, recipient);
+        }
+        if (fees > 0 || leftover > 0) {
+            _ring();
+        }
+        if (amount > 0) {
+            // without IGNORE_ERRORS: a transfer that fails takes the zeroing back with the whole transaction
+            recipient.transfer({ value: varuint16(amount), flag: MsgFlag.SENDER_PAYS_FEES, bounce: false });
+        }
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    // ==========================================
+    // Balance
+    // ==========================================
+
+    /// @notice What the curve had before this message
+    function _keptBefore() private pure returns (uint128) {
+        uint128 balance = address(this).balance;
+        return balance > msg.value ? balance - msg.value : 0;
+    }
+
+    /// @notice EVER the curve owes: both fees, its reserve and, until the sale is over, what the sale collected (after
+    /// it the collected EVER are the pool's, kept by the reserves of every message and sent by the seeding)
+    function _everOwed() private view returns (uint128) {
+        uint128 collected = complete ? 0 : virtualEver - startVirtualEver;
+        return collected + creatorFees + platformFees + DexGas.MIN_CONTRACT_BALANCE;
+    }
+
+    /// @notice Keeps `keep`, never less than what the curve owes: a balance worn down by storage fees is topped up from
+    /// the incoming value. Mode 2: at most what the curve has
+    function _reserve(uint128 keep) private view {
+        tvm.rawReserve(math.max(keep, _everOwed()), 2);
+    }
+
+    // ==========================================
+    // Getters
+    // ==========================================
+
+    /// @notice A buy of `amount` now, as buy() counts it: the tokens it gets (the rest of the sale at most), the cost and
+    /// both fees; the buyer pays their sum
+    function getBuyQuote(uint128 amount) internalMsg externalMsg external view returns (
+        uint128 bought,
+        uint128 cost,
+        uint128 creatorFee,
+        uint128 platformFee
+    ) {
+        return _buyQuote(amount);
+    }
+
+    /// @notice A sale of `amount` now: the gross proceeds and both fees; the seller gets proceeds less the fees
+    function getSellQuote(uint128 amount) internalMsg externalMsg external view returns (
+        uint128 proceeds,
+        uint128 creatorFee,
+        uint128 platformFee
+    ) {
+        return _sellQuote(amount);
+    }
+
+    /// @notice Who and what the curve is: fixed at its creation
+    function getDetails() internalMsg externalMsg external view returns (
+        address _launchpad,
+        address _dexRoot,
+        address _creator,
+        address _tokenRoot,
+        address _tokenWallet,
+        address _vault,
+        address _pair,
+        address _nativeVault,
+        uint128 _threshold,
+        uint128 _creatorFeeNumerator,
+        uint128 _platformFeeNumerator,
+        uint128 _startVirtualEver
+    ) {
+        return (
+            launchpad, dexRoot, creator, tokenRoot, tokenWallet, vault, pair, nativeVault,
+            threshold, creatorFeeNumerator, platformFeeNumerator, startVirtualEver
+        );
+    }
+
+    /// @notice The virtual reserves, the fees not taken yet and the curve's stage
+    function getState() internalMsg externalMsg external view returns (
+        uint128 _virtualEver,
+        uint128 _virtualTokens,
+        uint128 _creatorFees,
+        uint128 _platformFees,
+        bool _active,
+        bool _complete,
+        bool _vaultDeployed,
+        bool _pairDeployed,
+        bool _released,
+        bool _poolSeeded,
+        bool _buysFrozen,
+        bool _expired,
+        uint32 _expiresAt
+    ) {
+        // _expiresAt: when buys close without a buy before; meaningless once the sale is over
+        return (
+            virtualEver, virtualTokens, creatorFees, platformFees, active, complete, vaultDeployed, pairDeployed, released,
+            poolSeeded, buysFrozen, expired, lastBuyAt + expiry
+        );
+    }
+
+
+    /// @notice Tokens bought and waiting for the wallet `wallet`: its buyer, the amount and the questions on their way
+    function getPendingBuy(address wallet) internalMsg externalMsg external view returns (address owner, uint128 amount, uint16 queries) {
+        PendingBuy p = pendingBuys.fetch(wallet).getOr(PendingBuy(address(0), 0, 0, 0));
+        return (p.owner, p.amount, p.queries);
+    }
+
+    /// @notice Tokens the curve owes and the announced withdrawal of surplus tokens
+    function getTokenSurplus() internalMsg externalMsg external view returns (
+        uint128 _owed,
+        bool _announced,
+        uint128 _amount,
+        address _recipient,
+        string _reason,
+        uint32 _readyAt,
+        uint32 _expiresAt,
+        bool _querying
+    ) {
+        _owed = _tokensOwed();
+        _querying = surplusQuerying;
+        if (surplusRequest.hasValue()) {
+            TokenSurplusRequest r = surplusRequest.get();
+            return (_owed, true, r.amount, r.recipient, r.reason, r.readyAt, r.readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW, surplusQuerying);
+        }
+    }
+
+    /// @notice Tokens left for sale and EVER the sale collected so far
+    function getProgress() internalMsg externalMsg external view returns (uint128 tokensLeft, uint128 collected) {
+        return (virtualTokens - DexConstants.CURVE_END_VIRTUAL_TOKENS, virtualEver - startVirtualEver);
+    }
+}

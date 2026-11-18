@@ -1,0 +1,22 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Mint callback
+ * @notice Callback a token wallet sends to its owner when it receives minted tokens.
+*/
+interface IAcceptTokensMintCallback {
+
+    /**
+     * @notice Called by the token wallet after it has accepted minted tokens.
+     * @param tokenRoot The TokenRoot that minted the tokens.
+     * @param amount The amount of tokens received.
+     * @param remainingGasTo The address that should receive the remaining gas.
+     * @param payload Additional data attached to the mint.
+     */
+    function onAcceptTokensMint(
+        address tokenRoot,
+        uint128 amount,
+        address remainingGasTo,
+        TvmCell payload
+    ) external;
+}

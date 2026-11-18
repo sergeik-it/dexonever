@@ -1,0 +1,71 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../../../../dexonever/everscale/contracts/contracts/libraries/DexGas.tsol";
+
+/// @title BridgeGas - what the bridge's messages carry: computation in gas units, turned into EVER at the workchain gas
+/// price of the network config (param 21) when it is checked or sent — a dearer gas raises every value by itself. What
+/// stays on a contract for its storage and the forwarding of code are kept in EVER: they follow the storage and forward
+/// prices, not the gas price. The gas units are measured with a margin; they change only with the code (an upgrade)
+library BridgeGas {
+    // Storage, EVER
+    // what an event or a withdrawal keeps for its storage
+    uint128 constant EVENT_KEEP = 0.1 ever;
+    // what the root keeps of its own: below it a mint waits (the owner tops the root up)
+    uint128 constant ROOT_KEEP = 1 ever;
+
+    // Forwarding of code, EVER: an event's deploy carries its code (about 0.007 EVER), twice that and more
+    uint128 constant EVENT_FORWARD = 0.05 ever;
+
+    // Gas units (the "about" figures: the measured use)
+    // the root's deployDepositEvent (about 20 000) and the event's constructor with the first vote (about 18 000)
+    uint128 constant EVENT_DEPLOY = 300_000;
+    // a vote at an event (about 20 000); the threshold vote also carries the root's confirmation (about 30 000) and its
+    // reopen or queue
+    uint128 constant VOTE = 300_000;
+    // the root's call of the token root's mint (about 36 000 with the forwarding of the wallet's code) and the
+    // recipient's wallet taking the tokens (about 13 000); the wallet's deploy is DexGas.deployWalletValue
+    uint128 constant MINT = 150_000;
+    // a withdrawal's burn: the root's handling and the event's deploy (about 40 000), or the refund — the root, the token
+    // root's mint and the wallet (about 50 000)
+    uint128 constant WITHDRAWAL = 150_000;
+    // the withdrawal event's constructor (about 9 000)
+    uint128 constant WITHDRAWAL_DEPLOY = 50_000;
+    // a token root's sendSurplusGas (about 7 000)
+    uint128 constant TOKEN_ROOT_CALL = 100_000;
+
+    /// @notice The first vote of a deposit: the event's storage, its code and the deploy with the vote
+    function eventDeployValue(uint128 price) internal returns (uint128) {
+        return EVENT_KEEP + EVENT_FORWARD + DexGas.valueAt(price, EVENT_DEPLOY);
+    }
+
+    /// @notice Any other vote, a refresh, a signature
+    function voteValue(uint128 price) internal returns (uint128) {
+        return DexGas.valueAt(price, VOTE);
+    }
+
+    /// @notice What the root spends of its own on one mint: the deploy of the recipient's wallet (its balance and gas) and
+    /// the mint itself
+    function mintValue(uint128 price) internal returns (uint128) {
+        return deployWalletValue(price) + DexGas.WALLET_FORWARD + DexGas.valueAt(price, MINT);
+    }
+
+    /// @notice The deployWalletValue of a mint: the new wallet's target balance and its deploy
+    function deployWalletValue(uint128 price) internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + DexGas.valueAt(price, DexGas.WALLET_DEPLOY);
+    }
+
+    /// @notice The least gas of a withdrawal's burn: below it the burn is refused and minted back
+    function withdrawalMinValue(uint128 price) internal returns (uint128) {
+        return withdrawalDeployValue(price) + DexGas.valueAt(price, WITHDRAWAL);
+    }
+
+    /// @notice What the withdrawal's event is deployed with: its storage, its code and its deploy; it gives the rest back
+    function withdrawalDeployValue(uint128 price) internal returns (uint128) {
+        return EVENT_KEEP + EVENT_FORWARD + DexGas.valueAt(price, WITHDRAWAL_DEPLOY);
+    }
+
+    /// @notice A call of a bridged token's root by its owner (the root): sendSurplusGas
+    function tokenRootCallValue(uint128 price) internal returns (uint128) {
+        return DexGas.valueAt(price, TOKEN_ROOT_CALL);
+    }
+}

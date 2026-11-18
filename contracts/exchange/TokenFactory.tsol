@@ -1,0 +1,244 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/Hubs.tsol";
+import "./libraries/TokenSymbol.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/LaunchParams.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/Upgrade.tsol";
+import "./tip3/TokenRoot.tsol";
+
+/// @title TokenFactory - simple token creation: anyone creates a standard TIP-3 token and becomes its owner. The token
+/// root is not upgradeable. The factory has no owner; the exchange's root moves it to a new code, its address stays.
+/// The token codes it deploys: the initial ones are in its address, newer ones come from the root (setTokenCode);
+/// tokens already created never change. The factory gives no label
+
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract TokenFactory {
+
+    // the exchange's root: the only source of a new code of the factory (DexRoot.upgradeContract)
+    address static root;
+    TvmCell static rootCode;
+    TvmCell static walletCode;
+    // the exchange's platform code: with the root it gives the event hub of every new token (DexHub)
+    TvmCell static platformCode;
+    uint32 public tokenCodeVersion;
+    // symbols reserved for the exchange's owner (createOwnerToken, setReserved): the hash of the exact bytes
+    mapping(uint256 => bool) reserved;
+
+    // the nonce of the next token: a part of its address, so two tokens never meet at one address
+    uint64 created;
+    uint32 public version;
+    // a paused factory creates no tokens for users (the owner's go on). It starts paused: the exchange is deployed empty
+    // and closed, the owner fills it (reserved symbols, the owner's tokens) and opens it
+    bool public paused;
+
+    event TokenCreated(address tokenRoot, address creator);
+    event SymbolReserved(string symbol, bool reserved);
+    event PausedChanged(bool paused);
+    /// New tokens are deployed with these codes (setTokenCode); a refused hand-over emits nothing
+    event TokenCodeChanged(uint32 version, uint256 rootCodeHash, uint256 walletCodeHash);
+
+    /// @notice Deployed by the exchange's deploy key with the codes in its address
+    constructor() externalMsg {
+        require(tvm.pubkey() != 0 && msg.pubkey() == tvm.pubkey(), DexErrors.NOT_AUTHORIZED);
+        require(!root.isNone() && root.value != 0, DexErrors.NOT_AUTHORIZED);
+        tvm.accept();
+        version = 1;
+        tokenCodeVersion = 1;
+        paused = true;
+    }
+
+    /// @notice The root pauses (the owner or the manager) or resumes (the owner) the creation of users' tokens
+    /// (DexRoot.setFactoryPaused)
+    function setPaused(bool _paused, address sendGasTo) external {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        paused = _paused;
+        emit PausedChanged(_paused);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The installed token codes, only from the root (DexRoot.setTokenCode): new tokens are deployed with them. Only a
+    /// newer version; anything else gives the gas back
+    function setTokenCode(TvmCell _rootCode, TvmCell _walletCode, uint32 _version, address sendGasTo) external {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        if (_version > tokenCodeVersion) {
+            rootCode = _rootCode;
+            walletCode = _walletCode;
+            tokenCodeVersion = _version;
+            emit TokenCodeChanged(_version, tvm.hash(_rootCode), tvm.hash(_walletCode));
+        }
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Only the root moves the factory to the installed code (DexRoot.upgradeContract): only a newer version; the
+    /// address, the token codes and the nonce stay (Upgrade.tsol). Anything else gives the gas back
+    function upgrade(uint8 kind_, TvmCell code, uint32 newVersion, address sendGasTo) external {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        // the code of another kind (a wrong target) is never taken
+        if (kind_ != DexConstants.CODE_KIND_TOKEN_FACTORY || newVersion <= version) {
+            sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        TvmCell state = abi.encode(root, rootCode, walletCode, platformCode, tokenCodeVersion, created, reserved, paused);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(DexConstants.TOKEN_FACTORY_STATE_LAYOUT, version, newVersion, sendGasTo, state));
+    }
+
+    function onCodeUpgrade(TvmCell data) private {
+        (uint16 layout, , uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // only the current state layout is accepted
+        require(layout == DexConstants.TOKEN_FACTORY_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (root, rootCode, walletCode, platformCode, tokenCodeVersion, created, reserved, paused) =
+            abi.decode(state, (address, TvmCell, TvmCell, TvmCell, uint32, uint64, mapping(uint256 => bool), bool));
+        version = newVersion;
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Anyone creates a token owned by the sender. A non-zero `initialSupply` is minted to a new wallet of
+    /// `initialSupplyTo`. `mintDisabled`, `burnByRootDisabled` are set forever, `burnPaused` the owner may change later.
+    /// Every input the token's constructor depends on is checked here: a failed deploy would keep the EVER at the
+    /// token's address. The name and the symbol follow TokenSymbol; their check and the description's are paid by the byte (DexGas.tokenTextGas, descriptionGas).
+    /// A paused factory refuses. A symbol reserved for the exchange's owner (exactly these bytes, case included) is refused. The
+    /// gas left (after the token's and its wallet's balances, TokenGas.TARGET_ROOT_BALANCE and TARGET_WALLET_BALANCE)
+    /// comes back to the sender. The picture and the description go to the token for good, as a launch's
+    /// (LaunchParams.validMeta): the picture is empty or ipfs://<CID>
+    function createToken(
+        string name,
+        string symbol,
+        uint8 decimals,
+        address initialSupplyTo,
+        uint128 initialSupply,
+        bool mintDisabled,
+        bool burnByRootDisabled,
+        bool burnPaused,
+        string image,
+        string description
+    ) internalMsg external {
+        require(!paused, DexErrors.PAUSED);
+        _checkNameAndSymbol(name, symbol);
+        require(LaunchParams.validMeta(image, description), DexErrors.INVALID_AMOUNT);
+        require(!reserved.exists(_symbolKey(symbol)), DexErrors.RESERVED_SYMBOL);
+        require(decimals <= DexConstants.TOKEN_MAX_DECIMALS, DexErrors.INVALID_DECIMALS);
+        require(initialSupply <= DexConstants.TOKEN_MAX_SUPPLY, DexErrors.INVALID_AMOUNT);
+        bool mint = initialSupply > 0;
+        require(!mint || initialSupplyTo.isStdAddrWithoutAnyCast() && !initialSupplyTo.isStdZero(), DexErrors.INVALID_AMOUNT);
+        _deploy(name, symbol, decimals, msg.sender, mint ? initialSupplyTo : address(0), initialSupply, mintDisabled, burnByRootDisabled, burnPaused, msg.sender, image, description);
+    }
+
+    /// @notice A token of the exchange's owner, only from the root (DexRoot.createOwnerToken): the standard tokens of
+    /// the world (USDT, BTC, ETH…) that only the owner issues and a bridge mints later. Owned by `tokenOwner` (the
+    /// owner's multisig), nothing minted, minting open (the owner and later the bridge mint), burning on others' wallets
+    /// closed for good. Up to DexConstants.OWNER_TOKEN_MAX_DECIMALS decimals, as the original (NEAR has 24). Its symbol
+    /// is reserved at once: nobody else creates it here. A symbol reserved already is refused (one token a symbol)
+    function createOwnerToken(string name, string symbol, uint8 decimals, address tokenOwner, address sendGasTo) external {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        _checkNameAndSymbol(name, symbol);
+        uint256 key = _symbolKey(symbol);
+        require(!reserved.exists(key), DexErrors.RESERVED_SYMBOL);
+        require(decimals <= DexConstants.OWNER_TOKEN_MAX_DECIMALS, DexErrors.INVALID_DECIMALS);
+        require(tokenOwner.isStdAddrWithoutAnyCast() && !tokenOwner.isStdZero(), DexErrors.INVALID_AMOUNT);
+        reserved[key] = true;
+        emit SymbolReserved(symbol, true);
+        _deploy(name, symbol, decimals, tokenOwner, address(0), 0, false, true, false, sendGasTo, "", "");
+    }
+
+    /// @notice Only the root reserves (`isReserved`) or frees symbols for the owner without a token (TON next to GRAM)
+    /// (DexRoot.setReservedSymbols). A symbol already in that state gives no event
+    function setReserved(string[] symbols, bool toReserve, address sendGasTo) external {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        tvm.rawReserve(math.max(varuint16(DexGas.MIN_CONTRACT_BALANCE), address(this).balance - msg.value), 0);
+        for (string symbol : symbols) {
+            uint256 key = _symbolKey(symbol);
+            if (reserved.exists(key) != toReserve) {
+                if (toReserve) {
+                    reserved[key] = true;
+                } else {
+                    delete reserved[key];
+                }
+                emit SymbolReserved(symbol, toReserve);
+            }
+        }
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Whether `symbol` (exactly these bytes) is reserved for the exchange's owner
+    function isReserved(string symbol) internalMsg externalMsg external view returns (bool) {
+        return reserved.exists(_symbolKey(symbol));
+    }
+
+    function _checkNameAndSymbol(string name, string symbol) private pure {
+        require(TokenSymbol.validName(name), DexErrors.INVALID_AMOUNT);
+        require(TokenSymbol.valid(symbol), DexErrors.INVALID_AMOUNT);
+    }
+
+    /// the key of a reserved symbol: the hash of its bytes, so «USDT» and «usdt» are different symbols
+    function _symbolKey(string symbol) private pure returns (uint256) {
+        return tvm.hash(bytes(symbol));
+    }
+
+    function _deploy(
+        string name,
+        string symbol,
+        uint8 decimals,
+        address tokenOwner,
+        address initialSupplyTo,
+        uint128 initialSupply,
+        bool mintDisabled,
+        bool burnByRootDisabled,
+        bool burnPaused,
+        address remainingGasTo,
+        string image,
+        string description
+    ) private {
+        bool mint = initialSupply > 0;
+        uint128 price = DexGas.gasPrice();
+        uint128 deployWalletValue = mint ? TokenGas.TARGET_WALLET_BALANCE + DexGas.valueAt(price, DexGas.WALLET_DEPLOY) : 0;
+        // the check of the name, the symbol (TokenSymbol) and the description (LaunchParams) grows with their bytes
+        uint128 need = TokenGas.TARGET_ROOT_BALANCE + deployWalletValue + DexGas.TOKEN_FORWARD +
+            DexGas.valueAt(price, DexGas.TOKEN_CREATE + DexGas.tokenTextGas(name, symbol) + DexGas.descriptionGas(description) + (mint ? DexGas.TOKEN_MINT : 0));
+        // the factory keeps its storage reserve: when it is below it, the sender's value tops it up first. A
+        // non-bouncing message may leave less than its value (the storage is paid after the credit)
+        uint128 balance = address(this).balance;
+        uint128 kept = balance > msg.value ? balance - msg.value : 0;
+        uint128 reserve = math.max(DexGas.MIN_CONTRACT_BALANCE, kept);
+        require(balance >= reserve + need, DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(reserve, 0);
+
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: TokenRoot,
+            varInit: {
+                randomNonce_: created,
+                deployer_: address(this),
+                name_: name,
+                symbol_: symbol,
+                decimals_: decimals,
+                rootOwner_: tokenOwner,
+                walletCode_: walletCode
+            },
+            pubkey: 0,
+            code: rootCode
+        });
+        created += 1;
+        // the event goes first: a message carrying all that is not reserved must be the last action
+        address token = address.makeAddrStd(address(this).wid, tvm.hash(stateInit));
+        emit TokenCreated(token, tokenOwner);
+        new TokenRoot{
+            stateInit: stateInit,
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: false
+        }(initialSupplyTo, initialSupply, deployWalletValue, mintDisabled, burnByRootDisabled, burnPaused, remainingGasTo, image, description,
+            Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_TOKEN, token));
+    }
+
+    /// @notice The token codes new tokens are deployed with and the number of tokens created
+    function getDetails() internalMsg externalMsg external view returns (TvmCell _rootCode, TvmCell _walletCode, uint64 _created) {
+        return (rootCode, walletCode, created);
+    }
+}

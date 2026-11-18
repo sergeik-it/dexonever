@@ -1,0 +1,596 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title Jetton (TEP-74) message encoding and decoding for the TIP-3 token contracts
+library JettonUtils {
+    // Meta keys
+    uint256 constant IMAGE_KEY = 0x6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d;
+    uint256 constant DECIMALS_KEY = 0xee80fd2f1e03480e2282363596ee752d7bb27f50776b95086a0279189675923e;
+    uint256 constant SYMBOL_KEY = 0xb76a7ca153c24671658335bbd08946350ffc621fa1c516e7123095d4ffd5c581;
+    uint256 constant NAME_KEY = 0x82a3537ff0dbce7eec35d69edc3a189ee6f17d82f353a553f9aa96cb0be3ce89;
+    // sha256("description"), as the other keys (TEP-64)
+    uint256 constant DESCRIPTION_KEY = 0xc9046f7a37ad0ea7cee73355984fa5428982f8b37c8f7bcec91f7ac71a7cd104;
+    // the snake format of a value (TEP-64): the first cell holds the prefix byte and 126 bytes, each next one 127
+    uint32 constant SNAKE_HEAD_BYTES = 126;
+    uint32 constant SNAKE_CHUNK_BYTES = 127;
+
+    // Jetton Wallet
+    uint32 constant TRANSFER_FUNCTION_ID = 0xf8a7ea5;
+    uint32 constant INTERNAL_TRANSFER_FUNCTION_ID = 0x178d4519;
+    uint32 constant BURN_FUNCTION_ID = 0x595f07bc;
+
+    // Jetton Minter
+    uint32 constant PROVIDE_WALLET_ADDRESS_FUNCTION_ID = 0x2c76b973;
+    uint32 constant MINT_FUNCTION_ID = 0x00000015;
+    uint32 constant SET_ADMIN_FUNCTION_ID = 0x00000003;
+    uint32 constant SET_META_FUNCTION_ID = 0x00000004;
+    uint32 constant BURN_NOTIFICATION_FUNCTION_ID = 0x7bdd97de;
+
+    // Callbacks
+    uint32 constant TAKE_WALLET_ADDRESS_FUNCTION_ID = 0xd1735400;
+    uint32 constant TRANSFER_NOTIFICATION_FUNCTION_ID = 0x7362d09c;
+    uint32 constant EXCESSES_FUNCTION_ID = 0xd53276db;
+
+    /// @notice Sends provide_wallet_address to a jetton minter
+    function walletOf(
+        address _minter,
+        uint64 _callId,
+        address _walletOwner,
+        bool _addWalletOwnerToCallback,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(PROVIDE_WALLET_ADDRESS_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_walletOwner);
+        body.store(_addWalletOwnerToCallback);
+
+        _minter.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends a jetton mint message to a minter, with an internal_transfer for the recipient
+    function mint(
+        address _minter,
+        uint64 _callId,
+        address _recipient,
+        varuint16 _amount,
+        varuint16 _deployWalletValue,
+        varuint16 _callbackValue,
+        optional(TvmCell) _payload,
+        address _remainingGasTo,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder payload;
+
+        payload.store(INTERNAL_TRANSFER_FUNCTION_ID);
+        payload.store(_callId);
+        payload.store(_amount);
+        payload.store(address(this)); // token sender
+        payload.store(_remainingGasTo);
+        payload.store(_callbackValue);
+        payload.store(_payload);
+
+        TvmBuilder body;
+
+        body.store(MINT_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_recipient);
+        body.store(_deployWalletValue);
+        body.store(payload.toCell());
+
+        _minter.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends a jetton transfer message to a wallet
+    function transferJettons(
+        address _wallet,
+        uint64 _callId,
+        address _recipient,
+        varuint16 _amount,
+        varuint16 _callbackValue,
+        optional(TvmCell) _payload,
+        address _remainingGasTo,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+        optional(TvmCell) nullCell;
+
+        body.store(TRANSFER_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_amount);
+        body.store(_recipient);
+        body.store(_remainingGasTo);
+        body.store(nullCell);
+        body.store(_callbackValue);
+        body.store(_payload);
+
+        _wallet.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends internal_transfer to a token wallet (mint by the root or transfer between wallets)
+    function internalTransferJettons(
+        address _wallet,
+        uint64 _callId,
+        varuint16 _amount,
+        address _walletOwner,
+        varuint16 _callbackValue,
+        optional(TvmCell) _payload,
+        address _remainingGasTo,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(INTERNAL_TRANSFER_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_amount);
+        body.store(_walletOwner);
+        body.store(_remainingGasTo);
+        body.store(_callbackValue);
+        body.store(_payload);
+
+        _wallet.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends a jetton burn message to a wallet
+    function burn(
+        address _wallet,
+        uint64 _callId,
+        varuint16 _amount,
+        address _remainingGasTo,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(BURN_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_amount);
+        body.store(_remainingGasTo);
+
+        _wallet.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends burn_notification from a wallet to its root
+    function burnNotification(
+        address _root,
+        uint64 _callId,
+        varuint16 _amount,
+        address _walletOwner,
+        address _remainingGasTo,
+        optional(TvmCell) _payload,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(BURN_NOTIFICATION_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_amount);
+        body.store(_walletOwner);
+        body.store(_remainingGasTo);
+        body.store(_payload);
+
+        _root.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends change_admin to a jetton minter
+    function setAdmin(
+        address _minter,
+        uint64 _callId,
+        address _newAdmin,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(SET_ADMIN_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_newAdmin);
+
+        _minter.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends a metadata change message to a jetton minter
+    function setMeta(
+        address _minter,
+        uint64 _callId,
+        TvmCell _newMeta,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(SET_META_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_newMeta);
+
+        _minter.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Answers provide_wallet_address with take_wallet_address
+    function sendTakeWalletAddressCallback(
+        address _recipient,
+        uint64 _callId,
+        address _wallet,
+        optional(TvmCell) _walletOwner,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(TAKE_WALLET_ADDRESS_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_wallet);
+        body.store(_walletOwner);
+
+        _recipient.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends transfer_notification to the owner of the receiving wallet
+    function sendTransferNotificationCallback(
+        address _recipient,
+        uint64 _callId,
+        varuint16 _amount,
+        address _tokenSender,
+        optional(TvmCell) _payload,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(TRANSFER_NOTIFICATION_FUNCTION_ID);
+        body.store(_callId);
+        body.store(_amount);
+        body.store(_tokenSender);
+        body.store(_payload);
+
+        _recipient.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    /// @notice Sends excesses: the remaining gas of a jetton operation
+    function sendExcessesCallback(
+        address _recipient,
+        uint64 _callId,
+        varuint16 _value,
+        uint16 _flag,
+        bool _bounce
+    ) public {
+        TvmBuilder body;
+
+        body.store(EXCESSES_FUNCTION_ID);
+        body.store(_callId);
+
+        _recipient.transfer({
+            body: body.toCell(),
+            value: _value,
+            flag: _flag,
+            bounce: _bounce
+        });
+    }
+
+    struct MintParams {
+        uint64 callId;
+        address recipient;
+        varuint16 deployWalletValue;
+        varuint16 amount;
+        address remainingGasTo;
+        varuint16 callbackValue;
+        optional(TvmCell) payload;
+    }
+
+    /// @notice Decodes a jetton mint message from msg.body
+    function decodeMintMsgParams() public returns (MintParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            address recipient,
+            varuint16 deployWalletValue,
+            TvmCell masterMsg
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            address,
+            varuint16,
+            TvmCell
+        );
+
+        (
+            uint32 intFId,
+            uint64 intCallId,
+            varuint16 amount,
+            address sender,
+            address remainingGasTo,
+            varuint16 callbackValue,
+            optional(TvmCell) payload
+        ) = masterMsg.toSlice().load(
+            uint32,
+            uint64,
+            varuint16,
+            address,
+            address,
+            varuint16,
+            optional(TvmCell)
+        );
+
+        fId; intFId; intCallId; sender;
+
+        return MintParams({
+            callId: callId,
+            recipient: recipient,
+            deployWalletValue: deployWalletValue,
+            amount: amount,
+            remainingGasTo: remainingGasTo,
+            callbackValue: callbackValue,
+            payload: payload
+        });
+    }
+
+    struct SetAdminParams {
+        uint64 callId;
+        address newOwner;
+    }
+
+    /// @notice Decodes a change_admin message from msg.body
+    function decodeSetAdminMsgParams() public returns (SetAdminParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            address newOwner
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            address
+        );
+
+        fId;
+
+        return SetAdminParams(callId, newOwner);
+    }
+
+    struct ProvideWalletAddressParams {
+        uint64 callId;
+        address walletOwner;
+        bool addWalletOwnerToCallback;
+    }
+
+    /// @notice Decodes a provide_wallet_address message from msg.body
+    function decodeProvideWalletAddressMsgParams() public returns (ProvideWalletAddressParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            address walletOwner,
+            bool addWalletOwnerToCallback
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            address,
+            bool
+        );
+
+        fId;
+
+        return ProvideWalletAddressParams({
+            callId: callId,
+            walletOwner: walletOwner,
+            addWalletOwnerToCallback: addWalletOwnerToCallback
+        });
+    }
+
+    struct TransferParams {
+        uint64 callId;
+        varuint16 amount;
+        address recipient;
+        address remainingGasTo;
+        varuint16 callbackValue;
+        optional(TvmCell) payload;
+    }
+
+    /// @notice Decodes a jetton transfer message from msg.body
+    function decodeTransferMsgParams() public returns (TransferParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            varuint16 amount,
+            address recipient,
+            address remainingGasTo,
+            optional(TvmCell) extraPayload,
+            varuint16 callbackValue,
+            optional(TvmCell) payload
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            varuint16,
+            address,
+            address,
+            optional(TvmCell),
+            varuint16,
+            optional(TvmCell)
+        );
+
+        fId; extraPayload;
+
+        return TransferParams({
+            callId: callId,
+            amount: amount,
+            recipient: recipient,
+            remainingGasTo: remainingGasTo,
+            callbackValue: callbackValue,
+            payload: payload
+        });
+    }
+
+    struct InternalTransferParams {
+        uint64 callId;
+        varuint16 amount;
+        address walletOwner;
+        address remainingGasTo;
+        varuint16 callbackValue;
+        optional(TvmCell) payload;
+    }
+
+    /// @notice Decodes an internal_transfer message from msg.body
+    function decodeInternalTransferMsgParams() public returns (InternalTransferParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            varuint16 amount,
+            address sender,
+            address remainingGasTo,
+            varuint16 callbackValue,
+            optional(TvmCell) payload
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            varuint16,
+            address,
+            address,
+            varuint16,
+            optional(TvmCell)
+        );
+
+        fId;
+
+        return InternalTransferParams({
+            callId: callId,
+            amount: amount,
+            walletOwner: sender,
+            remainingGasTo: remainingGasTo,
+            callbackValue: callbackValue,
+            payload: payload
+        });
+    }
+
+    struct BurnNotificationParams {
+        uint64 callId;
+        varuint16 amount;
+        address walletOwner;
+        address remainingGasTo;
+        optional(TvmCell) payload;
+    }
+
+    /// @notice Decodes a burn_notification message from msg.body
+    function decodeBurnNotificationMsgParams() public returns (BurnNotificationParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            varuint16 amount,
+            address walletOwner,
+            address remainingGasTo,
+            optional(TvmCell) payload
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            varuint16,
+            address,
+            address,
+            optional(TvmCell)
+        );
+
+        fId;
+
+        return BurnNotificationParams({
+            callId: callId,
+            amount: amount,
+            walletOwner: walletOwner,
+            remainingGasTo: remainingGasTo,
+            payload: payload
+        });
+    }
+
+    struct BurnParams {
+        uint64 callId;
+        varuint16 amount;
+        address callbackTo;
+        optional(TvmCell) payload;
+    }
+
+    /// @notice Decodes a jetton burn message from msg.body
+    function decodeBurnMsgParams() public returns (BurnParams) {
+        (
+            uint32 fId,
+            uint64 callId,
+            varuint16 amount,
+            address callbackTo
+        ) = msg.body.load(
+            uint32,
+            uint64,
+            varuint16,
+            address
+        );
+
+        optional(TvmCell) payload = msg.body.loadQ(TvmCell);
+
+        fId;
+
+        return BurnParams({
+            callId: callId,
+            amount: amount,
+            callbackTo: callbackTo,
+            payload: payload
+        });
+    }
+}

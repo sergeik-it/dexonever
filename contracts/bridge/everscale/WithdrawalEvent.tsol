@@ -1,0 +1,76 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./BridgeStructs.tsol";
+import "./libraries/BridgeErrors.tsol";
+import "./libraries/BridgeConstants.tsol";
+import "./libraries/BridgeGas.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/MsgFlag.tsol";
+
+/// @title One withdrawal to the EVM network: its data and the relays' signatures
+/// @notice The root deploys it when tokens are burned; its address is the withdrawal's id in the EVM vault (everEventId).
+/// Relays of the round put here their EIP-712 signatures of the withdrawal; the sender service and the site take them for
+/// BridgeVault.withdraw. The signatures are checked by the vault, not here: TVM has no secp256k1 recovery. A new round of
+/// the EVM signers (evmRound) drops the old signatures: the vault takes only the current round's
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract WithdrawalEvent is IBridgeEvent {
+    address static root;
+    uint64 static withdrawalId;
+
+    WithdrawalData data;
+    uint32 evmRound;
+    mapping(address => bool) relays;
+    uint8 threshold;
+    mapping(address => bytes) signatures;
+    uint8 count;
+
+    event Signed(address relay, uint8 count);
+    event Refreshed(uint32 evmRound);
+
+    constructor(WithdrawalData data_, uint32 evmRound_, mapping(address => bool) relays_, uint8 threshold_) {
+        require(msg.sender == root, BridgeErrors.NOT_ROOT);
+        tvm.rawReserve(BridgeGas.EVENT_KEEP, 0);
+        data = data_;
+        evmRound = evmRound_;
+        relays = relays_;
+        threshold = threshold_;
+        root.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice A relay's signature of this withdrawal for `evmRound_`; a signature of another round is not taken. A relay
+    /// may replace its own signature; the gas left goes back to it
+    function sign(uint32 evmRound_, bytes signature) external {
+        require(relays.exists(msg.sender), BridgeErrors.NOT_RELAY);
+        require(evmRound_ == evmRound, BridgeErrors.BAD_ROUND);
+        require(signature.length == BridgeConstants.SIGNATURE_LENGTH, BridgeErrors.BAD_AMOUNT);
+        tvm.rawReserve(0, 4);
+        if (!signatures.exists(msg.sender)) {
+            count += 1;
+        }
+        signatures[msg.sender] = signature;
+        emit Signed(msg.sender, count);
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Only from the root: its new round of the signers; the old signatures are dropped
+    function refresh(uint32 evmRound_, mapping(address => bool) relays_, uint8 threshold_) external override {
+        require(msg.sender == root, BridgeErrors.NOT_ROOT);
+        tvm.rawReserve(0, 4);
+        if (evmRound_ > evmRound) {
+            evmRound = evmRound_;
+            relays = relays_;
+            threshold = threshold_;
+            delete signatures;
+            count = 0;
+            emit Refreshed(evmRound_);
+        }
+        root.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The withdrawal's data, its EVM round, threshold and the signatures taken
+    function getDetails() internalMsg externalMsg external view responsible returns (
+        WithdrawalData _data, uint32 _evmRound, uint8 _threshold, uint8 _count, mapping(address => bytes) _signatures
+    ) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (data, evmRound, threshold, count, signatures);
+    }
+}

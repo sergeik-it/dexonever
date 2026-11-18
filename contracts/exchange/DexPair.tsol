@@ -1,0 +1,866 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/StableMath.tsol";
+import "./libraries/PairQuotes.tsol";
+import "./libraries/SwapRoutes.tsol";
+import "./libraries/Upgrade.tsol";
+import "./libraries/Hubs.tsol";
+import "./structures/IFeeParams.tsol";
+import "./structures/IExchangeResult.tsol";
+import "./structures/StableStructures.tsol";
+import "./structures/IDexPairEvents.tsol";
+import "./DexPlatform.tsol";
+import "./DexPairGovernance.tsol";
+import "./EverSurplus.tsol";
+import "./tip3/interfaces/ITokenWallet.tsol";
+import "./tip3/interfaces/IAcceptTokensTransferCallback.tsol";
+
+interface IDexVaultPayout {
+    function payout(uint64 opId, address recipient, uint128 amount, address tokenA, address tokenB, bool _isStable) external;
+}
+
+interface IDexVaultConfirm {
+    function confirmOperation(uint64 opId) external;
+}
+
+interface ILpAccountDeposit {
+    function depositSide(bool isLeft, uint128 amount, uint128 minLpOut) external;
+    function onPairTook(uint64 opId) external;
+}
+
+/// @title DexPair - Unified AMM Pair supporting Constant-Product and StableSwap.
+/// Every operation is calculated by PairQuotes, the same functions the expected-result getters use.
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDexPairPayoutTaken, IAcceptTokensTransferCallback {
+
+    address public leftRoot;
+    address public rightRoot;
+    address public leftVault;
+    address public rightVault;
+    TvmCell public platformCode;
+    uint32 public version;
+    // the event hub this pair rings (DexHub): from the root, the platform code and the pair's own address, so it is not
+    // in the state the pair packs for a new code — the new code computes it again
+    address public hub;
+
+    uint128 public leftReserve;
+    uint128 public rightReserve;
+    uint128 public lpSupply;
+
+    // Escrow of two-sided deposits, deployed by the pair per depositor
+    TvmCell lpAccountCode;
+    uint32 lpAccountVersion;
+
+    // Who gets the beneficiary part of the fee, and what it accrued and was not paid out yet
+    address public beneficiary;
+    uint128 public beneficiaryLeft;
+    uint128 public beneficiaryRight;
+
+    // The pair of a launch token and EVER (DexRoot.migrateLaunchToken): while it is empty, only this depositor (the
+    // token's curve) may make the first deposit, so nobody sets the pool's first price ahead of the curve. Zero for
+    // every other pair
+    address firstDepositor;
+
+    // Payouts ordered from a vault and not taken over yet: the reserves already gave the amount,
+    // so a payout the vault refused must not vanish. The vault answers onPayoutTaken; a bounce keeps the amount for its
+    // recipient in `unpaid`, ordered again by claimUnpaid. A bounce keeps 256 bits, so the order carries its id first
+    struct PendingPayout {
+        bool isLeft;
+        address recipient;
+        uint128 amount;
+    }
+    struct Unpaid {
+        uint128 left;
+        uint128 right;
+    }
+    uint64 nextPayoutId;
+    mapping(uint64 => PendingPayout) payouts;
+    mapping(address => Unpaid) unpaid;
+
+    modifier onlyVault() {
+        require(msg.sender == leftVault || msg.sender == rightVault, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice The root moves the pair to its installed code: only a newer version; the state goes over as a
+    /// whole (Upgrade.tsol), in groups. Only a stopped pair moves (DexRoot.setPairsUpgrading), so no
+    /// step begun on the old code meets the new one. An older or equal version or a pair not stopped is refused, the gas goes back.
+    /// Only the root
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external onlyRoot {
+        if (newVersion <= version || !upgrading) {
+            _returnExcess(sendGasTo);
+            return;
+        }
+        TvmCell identity = abi.encode(root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor);
+        TvmCell pool = abi.encode(
+            leftReserve, rightReserve, lpSupply, fee, beneficiary, beneficiaryLeft, beneficiaryRight,
+            pendingPoolNumerator, pendingBeneficiaryNumerator, pendingFeeAvailableAt
+        );
+        TvmCell stableState = abi.encode(isStable, stable, pendingA, paused, frozen, upgrading, everSurplusRequest, withdrawalsAllowed);
+        TvmCell lp = abi.encode(lpRoot, lpWallet, lpWalletCode, pendingMints, lpToBurn);
+        TvmCell payoutJournal = abi.encode(nextPayoutId, payouts, unpaid);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(_stateLayout(), version, newVersion, sendGasTo, abi.encode(identity, pool, stableState, lp, payoutJournal)));
+    }
+
+    /// @notice Layout of the state this code packs for its next code (Upgrade.tsol)
+    function _stateLayout() internal pure virtual returns (uint16) {
+        return DexConstants.PAIR_STATE_LAYOUT;
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        require(layout == DexConstants.PAIR_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (TvmCell identity, TvmCell pool, TvmCell stableState, TvmCell lp, TvmCell payoutJournal) =
+            abi.decode(state, (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell));
+        (nextPayoutId, payouts, unpaid) = abi.decode(payoutJournal, (uint64, mapping(uint64 => PendingPayout), mapping(address => Unpaid)));
+        (root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor) = abi.decode(
+            identity,
+            (address, address, address, address, address, TvmCell, TvmCell, uint32, address)
+        );
+        hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_PAIR, address(this));
+        (
+            leftReserve, rightReserve, lpSupply, fee, beneficiary, beneficiaryLeft, beneficiaryRight,
+            pendingPoolNumerator, pendingBeneficiaryNumerator, pendingFeeAvailableAt
+        ) = abi.decode(pool, (uint128, uint128, uint128, IFeeParams.FeeParams, address, uint128, uint128, uint128, uint128, uint32));
+        (isStable, stable, pendingA, paused, frozen, upgrading, everSurplusRequest, withdrawalsAllowed) = abi.decode(
+            stableState,
+            (bool, StableStructures.StableConfig, optional(StableStructures.PendingAmplification), bool, bool, bool, optional(EverSurplusRequest), bool)
+        );
+        (lpRoot, lpWallet, lpWalletCode, pendingMints, lpToBurn) =
+            abi.decode(lp, (address, address, TvmCell, mapping(address => PendingMint), uint128));
+        version = newVersion;
+        emit CodeUpgraded(oldVersion, version);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice A bell at the pair's event hub in every transaction that emits an event (EventBell)
+    function _ring() internal override {
+        Hubs.ring(hub);
+    }
+
+    /// @notice Initialize from DexPlatform, or take over the state of the previous code (upgrade)
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        root = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        address sendGasTo = s.load(address);
+        platformCode = s.loadRef();
+        hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_PAIR, address(this));
+
+        TvmSlice params = s.loadRef().toSlice();
+        (leftRoot, rightRoot, isStable) = params.load(address, address, bool);
+        leftVault = _expectedVault(leftRoot);
+        rightVault = _expectedVault(rightRoot);
+
+        TvmSlice init = s.loadRef().toSlice();
+        TvmCell lpRootCode = init.loadRef();
+        TvmCell lpWalletCode_ = init.loadRef();
+        lpAccountCode = init.loadRef();
+        lpAccountVersion = init.load(uint32);
+        _loadPoolParams(init);
+        _deployLpToken(lpRootCode, lpWalletCode_);
+
+        tvm.rawReserve(varuint16(DexGas.PAIR_MIN_BALANCE), 0);
+        sendGasTo.transfer({
+            value: varuint16(0),
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /// @notice Fees (the root's current ones at the time of the deploy), beneficiary, of a stable pair decimals and A,
+    /// already checked by the root, and the first depositor of a launch token's pair
+    function _loadPoolParams(TvmSlice init) private {
+        fee.denominator = DexConstants.PAIR_FEE_DENOMINATOR;
+        fee.pool_numerator = init.load(uint128);
+        fee.beneficiary_numerator = init.load(uint128);
+        fee.referrer_numerator = 0;
+        beneficiary = init.load(address);
+
+        (uint8 decimalsLeft, uint8 decimalsRight, uint32 amplification) = init.load(uint8, uint8, uint32);
+        if (isStable) {
+            stable = StableStructures.StableConfig(
+                decimalsLeft,
+                decimalsRight,
+                StableMath.stableRates(decimalsLeft, decimalsRight),
+                amplification,
+                amplification,
+                0,
+                0
+            );
+        }
+        firstDepositor = init.load(address);
+    }
+
+    function _isLaunchPair() internal view override returns (bool) {
+        return !firstDepositor.isStdZero();
+    }
+
+    /// @notice Address of the vault of `token` (the native vault for address 0), as DexRoot computes it
+    function _expectedVault(address token) private view returns (address) {
+        TvmBuilder b;
+        b.store(token);
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: {
+                root: root,
+                type_id: token == address(0) ? DexConstants.PLATFORM_TYPE_NATIVE_VAULT : DexConstants.PLATFORM_TYPE_TOKEN_VAULT,
+                params: b.toCell()
+            },
+            code: platformCode
+        });
+        return address(tvm.hash(stateInit));
+    }
+
+    /// @notice StateInit of the LpAccount of `owner` in this pair
+    function _lpAccountStateInit(address owner) private view returns (TvmCell) {
+        TvmBuilder b;
+        b.store(address(this));
+        b.store(owner);
+        return abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: {
+                root: root,
+                type_id: DexConstants.PLATFORM_TYPE_LP_ACCOUNT,
+                params: b.toCell()
+            },
+            code: platformCode
+        });
+    }
+
+    /// @notice Address of the LpAccount of `owner` in this pair
+    function _expectedLpAccount(address owner) private view returns (address) {
+        return address(tvm.hash(_lpAccountStateInit(owner)));
+    }
+
+    function _state() private view returns (PairQuotes.PairState) {
+        return PairQuotes.PairState(leftReserve, rightReserve, lpSupply);
+    }
+
+    function _pool() private view returns (PairQuotes.PoolParams) {
+        return PairQuotes.poolParams(_quotedFee(), isStable, stable, uint32(block.timestamp));
+    }
+
+    /// @notice The fee the quotes use: without a beneficiary its part is the pool's — nobody could claim it and a
+    /// later beneficiary would take it, so it stays in the reserves as the providers' income. Quotes, their limits,
+    /// the getters and the events then see exactly what goes into the reserves
+    function _quotedFee() private view returns (IFeeParams.FeeParams) {
+        if (_hasBeneficiary()) {
+            return fee;
+        }
+        return IFeeParams.FeeParams(fee.denominator, fee.pool_numerator + fee.beneficiary_numerator, 0, fee.referrer_numerator);
+    }
+
+    /// @notice minLpOut of a deposit: exactly one uint128, anything else is refused
+    function _parseMinLpOut(TvmCell payload) private pure returns (bool ok, uint128 minLpOut) {
+        TvmSlice s = payload.toSlice();
+        if (s.bits() != DexConstants.DEPOSIT_PAYLOAD_BITS || s.refs() != 0) {
+            return (false, 0);
+        }
+        return (true, s.load(uint128));
+    }
+
+    /// @notice One half of a two-sided deposit: the vault got the tokens, the pair hands the amount to the
+    /// depositor's LpAccount. The LpAccount is (re)deployed every time without bounce: on an existing
+    /// account the deploy fails (code 60) and its value stays there, to go back to the owner with the
+    /// next forward; the following depositSide reaches the account either way.
+    /// payload: uint128 minLpOut — the least LP the whole deposit must give; the last half's value counts. Only the pair's vaults
+    function onVaultLpDeposit(
+        uint64 opId,
+        address sender,
+        uint128 amountIn,
+        TvmCell payload
+    ) external override onlyVault {
+        bool isLeft = (msg.sender == leftVault);
+        _reserveOwnBalance();
+        _confirmOperation(opId);
+        (bool ok, uint128 minLpOut) = _parseMinLpOut(payload);
+        if (paused || _stopped() || !ok) {
+            _refund(msg.sender, sender, amountIn);
+            return;
+        }
+
+        TvmCell empty;
+        address lpAccount = new DexPlatform{
+            stateInit: _lpAccountStateInit(sender),
+            value: varuint16(DexGas.deployLpAccountValue()),
+            flag: 0,
+            bounce: false
+        }(lpAccountCode, lpAccountVersion, sender, empty);
+
+        ILpAccountDeposit(lpAccount).depositSide{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: false
+        }(isLeft, amountIn, minLpOut);
+    }
+
+    /// @notice Swap through this pair. payload: address recipient, uint128 minOut, optionally uint32 expireAt (after it the
+    /// swap is refused whole) and, as a ref, the first branch of the route after this pair (SwapRoutes). The gas must
+    /// cover the whole subtree of this pair; the route is not atomic: a later step that refuses returns its own input to
+    /// the sender. Only the pair's vaults
+    function onVaultExchange(
+        uint64 opId,
+        address sender,
+        uint128 amountIn,
+        TvmCell routePayload
+    ) external override onlyVault {
+        bool spentLeft = (msg.sender == leftVault);
+        _reserveOwnBalance();
+        _confirmOperation(opId);
+
+        (bool payloadOk, address recipient, uint128 minOut, uint32 expireAt, bool hasNext, TvmCell next) = SwapRoutes.parseRoute(routePayload);
+        // a recipient that is this pair, its vault or its LP wallet would lock the output there for good
+        bool selfRecipient = recipient == address(this) || recipient == leftVault || recipient == rightVault || recipient == lpWallet;
+        bool expired = expireAt != 0 && uint32(block.timestamp) > expireAt;
+        if (paused || _stopped() || !payloadOk || selfRecipient || expired) {
+            _refund(msg.sender, sender, amountIn);
+            return;
+        }
+        (bool routeOk, SwapRoutes.RouteSize size) = SwapRoutes.treeAfterFirstPair(hasNext, next);
+        // the gas price is read once for the whole route: the check here and every branch of continueRoute
+        uint128 price = DexGas.gasPrice();
+        uint128 treeValue = SwapRoutes.treeValue(price, 1 + size.pairs, (isStable ? 1 : 0) + size.stablePairs, size.leaves);
+        optional(IExchangeResult.ExchangeResult) quote = PairQuotes.quoteExchange(_state(), _pool(), spentLeft, amountIn);
+        if (!routeOk || msg.value < treeValue || !quote.hasValue() || quote.get().expectedAmount < minOut) {
+            _refund(msg.sender, sender, amountIn);
+            return;
+        }
+        IExchangeResult.ExchangeResult res = quote.get();
+        _applyExchange(sender, spentLeft, amountIn, res);
+
+        if (!hasNext) {
+            _payout(spentLeft ? rightVault : leftVault, recipient, res.expectedAmount, 0, MsgFlag.ALL_NOT_RESERVED);
+            return;
+        }
+        SwapRoutes.continueRoute(
+            spentLeft ? rightVault : leftVault,
+            spentLeft ? leftRoot : rightRoot,
+            spentLeft ? rightRoot : leftRoot,
+            isStable,
+            sender,
+            recipient,
+            res.expectedAmount,
+            next,
+            price
+        );
+    }
+
+    /// @notice The swap goes into the reserves: amountIn without the beneficiary fee in, the output out
+    function _applyExchange(address sender, bool spentLeft, uint128 amountIn, IExchangeResult.ExchangeResult res) private {
+        if (spentLeft) {
+            leftReserve += amountIn - res.beneficiaryFee;
+            rightReserve -= res.expectedAmount;
+            beneficiaryLeft += res.beneficiaryFee;
+        } else {
+            rightReserve += amountIn - res.beneficiaryFee;
+            leftReserve -= res.expectedAmount;
+            beneficiaryRight += res.beneficiaryFee;
+        }
+        emit Exchange(sender, spentLeft, amountIn, res.expectedAmount, res.poolFee, res.beneficiaryFee, _reserves());
+        _ring();
+    }
+
+    /// @notice One-token deposit into a non-empty pair: auto-change of a regular pair, imbalance fee of a stable one.
+    /// payload: uint128 minLpOut. Only the pair's vaults
+    function onVaultDeposit(
+        uint64 opId,
+        address sender,
+        uint128 amountIn,
+        TvmCell payload
+    ) external override onlyVault {
+        bool isLeft = (msg.sender == leftVault);
+        _reserveOwnBalance();
+        _confirmOperation(opId);
+        (bool ok, uint128 minLpOut) = _parseMinLpOut(payload);
+        optional(PairQuotes.DepositQuote) quote = PairQuotes.quoteAutoChangeDeposit(_state(), _pool(), isLeft, amountIn);
+        if (paused || _stopped() || !ok || !quote.hasValue() || quote.get().lpOut < minLpOut) {
+            _refund(msg.sender, sender, amountIn);
+            return;
+        }
+        // the pair has no referrer part, so a one-sided deposit takes the whole amount and nothing returns
+        _applyDeposit(sender, quote.get());
+        _mintLp(quote.get().lpOut, sender);
+    }
+
+    /// @notice Two-sided deposit from the depositor's LpAccount. Only that LpAccount
+    function addLiquidity(
+        uint64 opId,
+        address owner,
+        uint128 leftAmount,
+        uint128 rightAmount,
+        uint128 minLpOut
+    ) external {
+        require(msg.sender == _expectedLpAccount(owner), DexErrors.NOT_AUTHORIZED);
+        _reserveOwnBalance();
+        _answerLpAccount(opId);
+        optional(PairQuotes.DepositQuote) quote = PairQuotes.quoteAddLiquidity(_state(), _pool(), leftAmount, rightAmount);
+
+        // The LpAccount has already zeroed both halves: a refusal returns them, it must not throw
+        bool waitsForFirst = lpSupply == 0 && !firstDepositor.isStdZero() && owner != firstDepositor;
+        if (paused || _stopped() || waitsForFirst || !quote.hasValue() || quote.get().lpOut < minLpOut) {
+            _refundHalves(owner, leftAmount, rightAmount);
+            return;
+        }
+        PairQuotes.DepositQuote q = quote.get();
+        _applyDeposit(owner, q);
+
+        // The part above the proportion of a regular pair returns to the owner
+        uint128 payoutGas = DexGas.payoutGas();
+        if (leftAmount > q.leftDeposit) {
+            _payout(leftVault, owner, leftAmount - q.leftDeposit, payoutGas, 0);
+        }
+        if (rightAmount > q.rightDeposit) {
+            _payout(rightVault, owner, rightAmount - q.rightDeposit, payoutGas, 0);
+        }
+
+        _mintLp(q.lpOut, owner);
+    }
+
+    /// @notice Reserves grow by the deposit minus the beneficiary part; lpSupply by the whole reward, so the
+    /// LP locked by the first deposit (lpReward − lpOut) belong to nobody
+    function _applyDeposit(address owner, PairQuotes.DepositQuote q) private {
+        leftReserve = leftReserve + q.leftDeposit - q.leftBeneficiaryFee;
+        rightReserve = rightReserve + q.rightDeposit - q.rightBeneficiaryFee;
+        beneficiaryLeft += q.leftBeneficiaryFee;
+        beneficiaryRight += q.rightBeneficiaryFee;
+        lpSupply += q.lpReward;
+        emit Deposit(owner, q.leftDeposit, q.rightDeposit, q.lpOut, _reserves());
+        _ring();
+    }
+
+    function _reserves() private view returns (Reserves) {
+        return Reserves(leftReserve, rightReserve, lpSupply, beneficiaryLeft, beneficiaryRight);
+    }
+
+    /// @notice Both halves of a two-sided deposit go back to the owner (non-zero ones), the gas left too
+    function _refundHalves(address owner, uint128 leftAmount, uint128 rightAmount) private {
+        uint128 payoutGas = DexGas.payoutGas();
+        if (leftAmount > 0) {
+            _payout(leftVault, owner, leftAmount, payoutGas, 0);
+            emit OperationRefunded(owner, leftRoot, leftAmount);
+        }
+        if (rightAmount > 0) {
+            _payout(rightVault, owner, rightAmount, payoutGas, 0);
+            emit OperationRefunded(owner, rightRoot, rightAmount);
+        }
+        if (leftAmount > 0 || rightAmount > 0) {
+            _ring();
+        }
+        owner.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner cancels a half-filled two-sided deposit: its LpAccount sends the halves here. Only that LpAccount
+    function refundLpAccount(uint64 opId, address owner, uint128 leftAmount, uint128 rightAmount) external {
+        require(msg.sender == _expectedLpAccount(owner), DexErrors.NOT_AUTHORIZED);
+        _reserveOwnBalance();
+        _answerLpAccount(opId);
+        _refundHalves(owner, leftAmount, rightAmount);
+    }
+
+    /// @notice The halves of the LpAccount's call `opId` are the pair's now: the account forgets
+    /// them. Sent first, with a fixed value: what follows takes all the rest
+    function _answerLpAccount(uint64 opId) private view {
+        ILpAccountDeposit(msg.sender).onPairTook{ value: varuint16(DexGas.lpAccountAnswerValue()), flag: 0, bounce: false }(opId);
+    }
+
+    /// @notice Tells the vault (the sender) that the operation arrived, so it drops the journal entry
+    function _confirmOperation(uint64 opId) private view {
+        IDexVaultConfirm(msg.sender).confirmOperation{
+            value: varuint16(DexGas.confirmValue()),
+            flag: 0,
+            bounce: false
+        }(opId);
+    }
+
+    /// @notice Orders `vault` to pay `amount` to `recipient`; the vault checks that the order comes from this pair.
+    /// The order is journalled until the vault takes it over (onPayoutTaken) or refuses it (bounce, _onOtherBounce)
+    function _payout(address vault, address recipient, uint128 amount, uint128 value, uint8 flag) internal {
+        uint64 opId = nextPayoutId;
+        nextPayoutId += 1;
+        payouts[opId] = PendingPayout(vault == leftVault, recipient, amount);
+        IDexVaultPayout(vault).payout{
+            value: varuint16(value),
+            flag: flag,
+            bounce: true
+        }(opId, recipient, amount, leftRoot, rightRoot, isStable);
+    }
+
+    /// @notice The vault took the payout `opId` over: it pays it, or keeps it as its own unclaimed while frozen. Only the vault of that payout
+    function onPayoutTaken(uint64 opId) external override {
+        optional(PendingPayout) found = payouts.fetch(opId);
+        require(found.hasValue() && msg.sender == _vaultOf(found.get().isLeft), DexErrors.NOT_AUTHORIZED);
+        delete payouts[opId];
+    }
+
+    /// @notice A payout the vault refused: its amount is kept for the recipient. The bounce
+    /// keeps the function id and the order id; only the vault of the order counts
+    function _onOtherBounce(uint32 functionId, TvmSlice body) internal override {
+        if (functionId != abi.functionId(IDexVaultPayout.payout)) {
+            return;
+        }
+        uint64 opId = body.load(uint64);
+        optional(PendingPayout) found = payouts.fetch(opId);
+        if (!found.hasValue() || msg.sender != _vaultOf(found.get().isLeft)) {
+            return;
+        }
+        delete payouts[opId];
+        PendingPayout p = found.get();
+        Unpaid u = unpaid.fetch(p.recipient).getOr(Unpaid(0, 0));
+        if (p.isLeft) {
+            u.left += p.amount;
+        } else {
+            u.right += p.amount;
+        }
+        unpaid[p.recipient] = u;
+        emit PayoutBounced(p.recipient, p.isLeft ? leftRoot : rightRoot, p.amount);
+        _ring();
+    }
+
+    function _vaultOf(bool isLeft) private view returns (address) {
+        return isLeft ? leftVault : rightVault;
+    }
+
+    /// @notice Orders again the payouts kept for `recipient` after a vault refused them. Anyone may call it and pays
+    /// the gas; the tokens can only go to `recipient`. A frozen pair orders nothing, as the vaults, unless the
+    /// owner let users' withdrawals out (withdrawalsAllowed)
+    function claimUnpaid(address recipient) external {
+        require(!_withdrawalsBlocked(), DexErrors.FROZEN);
+        optional(Unpaid) found = unpaid.fetch(recipient);
+        require(found.hasValue(), DexErrors.INVALID_AMOUNT);
+        require(msg.value >= DexGas.claimUnpaidMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        Unpaid u = found.get();
+        delete unpaid[recipient];
+        emit UnpaidClaimed(recipient, u.left, u.right);
+        _reserveOwnBalance();
+        _ring();
+        uint128 payoutGas = DexGas.payoutGas();
+        if (u.left > 0) {
+            _payout(leftVault, recipient, u.left, payoutGas, 0);
+        }
+        if (u.right > 0) {
+            _payout(rightVault, recipient, u.right, payoutGas, 0);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Payouts kept for `recipient` after a vault refused them. Anyone (getter)
+    function getUnpaid(address recipient) internalMsg externalMsg external view returns (uint128 left, uint128 right) {
+        Unpaid u = unpaid.fetch(recipient).getOr(Unpaid(0, 0));
+        return (u.left, u.right);
+    }
+
+    /// @notice A refused operation: the tokens go back from the vault they came to, with all gas left
+    function _refund(address vault, address sender, uint128 amount) private {
+        // the event goes first: the payout takes all gas left
+        emit OperationRefunded(sender, vault == leftVault ? leftRoot : rightRoot, amount);
+        _ring();
+        _payout(vault, sender, amount, 0, MsgFlag.ALL_NOT_RESERVED);
+    }
+
+    /// @notice Withdraw liquidity: LP sent to the pair's LP wallet with notify. Shares go to the LP sender.
+    /// payload: uint128 minLeftOut, uint128 minRightOut. After authentication nothing throws: on any refusal
+    /// the LP go back, since a wallet notification does not bounce. Only the pair's LP wallet
+    function onAcceptTokensTransfer(
+        address /* tokenRoot */,
+        uint128 lpAmount,
+        address sender,
+        address /* senderWallet */,
+        address remainingGasTo,
+        TvmCell payload
+    ) external override {
+        require(msg.sender == lpWallet, DexErrors.NOT_AUTHORIZED);
+        _reserveOwnBalance();
+
+        TvmSlice ps = VaultOps.payloadSlice(payload);
+        optional(PairQuotes.WithdrawQuote) quote = PairQuotes.quoteWithdraw(_state(), _pool(), lpAmount);
+        if (_withdrawalsBlocked() || msg.value < DexGas.withdrawMinValue() || ps.bits() != DexConstants.WITHDRAW_PAYLOAD_BITS || ps.refs() != 0 || !quote.hasValue()) {
+            _returnLp(lpAmount, sender, remainingGasTo);
+            return;
+        }
+        (uint128 minLeftOut, uint128 minRightOut) = ps.load(uint128, uint128);
+        PairQuotes.WithdrawQuote q = quote.get();
+        if (q.leftOut < minLeftOut || q.rightOut < minRightOut) {
+            _returnLp(lpAmount, sender, remainingGasTo);
+            return;
+        }
+        _withdraw(lpAmount, sender, remainingGasTo, q);
+    }
+
+    /// @notice The withdrawal goes out of the reserves: the LP are burnt (with LP whose earlier burn came back),
+    /// the shares go to the LP sender
+    function _withdraw(uint128 lpAmount, address sender, address remainingGasTo, PairQuotes.WithdrawQuote q) private {
+        leftReserve -= q.leftOut;
+        rightReserve -= q.rightOut;
+        lpSupply -= lpAmount;
+        emit Withdraw(sender, lpAmount, q.leftOut, q.rightOut, _reserves());
+        _ring();
+
+        // one read of the gas price for the burn and both payouts
+        uint128 price = DexGas.gasPrice();
+        _burnLp(lpAmount, remainingGasTo, DexGas.valueAt(price, DexGas.LP_BURN), 0);
+
+        uint128 payoutGas = DexGas.valueAt(price, DexGas.PAYOUT + DexGas.CONFIRM);
+        if (q.leftOut > 0) {
+            _payout(leftVault, sender, q.leftOut, payoutGas, 0);
+        }
+        if (q.rightOut > 0) {
+            _payout(rightVault, sender, q.rightOut, payoutGas, 0);
+        }
+
+        remainingGasTo.transfer({
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /// @notice Sends LP back from the pair's LP wallet with all gas left after the pair's reserve
+    function _returnLp(uint128 lpAmount, address recipient, address remainingGasTo) private {
+        emit OperationRefunded(recipient, lpRoot, lpAmount);
+        _ring();
+        TvmCell empty;
+        ITokenWallet(lpWallet).transfer{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: false
+        }(lpAmount, recipient, 0, remainingGasTo, false, empty);
+    }
+
+    /// @notice The root hands the installed LpAccount code (DexRoot.setPairsLpAccountCode): the pair carries it to its
+    /// depositors' accounts with their next deposit. Only a newer version is taken, the gas goes back either way. Only the root
+    function setLpAccountCode(TvmCell code, uint32 codeVersion, address sendGasTo) external onlyRoot {
+        if (codeVersion > lpAccountVersion) {
+            lpAccountCode = code;
+            lpAccountVersion = codeVersion;
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice EVER settled on the LP root (a wallet deploy to an existing wallet in a rare race) come to the pair: they
+    /// do not leave the exchange, the owner withdraws them as the pair's EVER surplus. The LP root keeps its own target
+    /// balance. Only the root
+    function collectLpRootSurplus(address sendGasTo) external onlyRoot {
+        _reserveOwnBalance();
+        TokenRoot(lpRoot).sendSurplusGas{
+            value: varuint16(DexGas.lpRootCallValue()),
+            flag: 0,
+            bounce: false
+        }(address(this));
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice EVER of the pair above PAIR_MIN_BALANCE belong to nobody (the pair holds no EVER of users): the
+    /// owner withdraws them announced (EverSurplus). Announces such a withdrawal. Only the root
+    function announceEverSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external onlyRoot {
+        _announceEverSurplus(amount, recipient, reason, sendGasTo);
+    }
+
+    /// @notice Cancels the announced EVER surplus withdrawal. Only the root
+    function cancelEverSurplus(address sendGasTo) external onlyRoot {
+        _cancelEverSurplus(sendGasTo);
+    }
+
+    /// @notice Runs the announced EVER surplus withdrawal (EverSurplus). Only the root
+    function withdrawEverSurplus(address sendGasTo) external onlyRoot {
+        _withdrawEverSurplus(sendGasTo);
+    }
+
+    function _everKept() internal view override returns (uint128) {
+        return DexGas.PAIR_MIN_BALANCE;
+    }
+
+    function _everSurplusFrozen() internal view override returns (bool) {
+        return _stopped();
+    }
+
+    /// @notice Pays the accrued beneficiary fees to the beneficiary; refused while stopped or without a beneficiary.
+    /// Anyone may call it and pays the gas
+    function claimBeneficiaryFees() external {
+        require(_hasBeneficiary(), DexErrors.NOT_AUTHORIZED);
+        // a frozen pair pays nothing out, as claimUnpaid: the freeze may be about these very accruals
+        require(!_stopped(), DexErrors.FROZEN);
+        _reserveOwnBalance();
+        _payBeneficiaryFees(beneficiary);
+        msg.sender.transfer({
+            value: varuint16(0),
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    function _hasBeneficiary() private view returns (bool) {
+        return !beneficiary.isNone() && !beneficiary.isStdZero();
+    }
+
+    /// @notice Pays the accrued beneficiary fees of both sides to `to` and zeroes them
+    function _payBeneficiaryFees(address to) private {
+        uint128 cl = beneficiaryLeft;
+        uint128 cr = beneficiaryRight;
+        beneficiaryLeft = 0;
+        beneficiaryRight = 0;
+        uint128 payoutGas = DexGas.payoutGas();
+        if (cl > 0) {
+            _payout(leftVault, to, cl, payoutGas, 0);
+        }
+        if (cr > 0) {
+            _payout(rightVault, to, cr, payoutGas, 0);
+        }
+        if (cl > 0 || cr > 0) {
+            emit BeneficiaryFeePaid(to, cl, cr);
+            _ring();
+        }
+    }
+
+    /// @notice Sets the beneficiary. Fees accrued so far belong to the previous beneficiary: they are paid out before the change. A frozen pair
+    /// pays the beneficiary nothing (as claimBeneficiaryFees), so the change waits for the unfreeze: refused, gas back.
+    /// The beneficiary of a launch token's pair is the token's creator (DexRoot.migrateLaunchToken): the exchange's owner
+    /// never takes it away, refused the same way. Only the root
+    function setBeneficiary(address _beneficiary, address sendGasTo) external onlyRoot {
+        if (_stopped() || _isLaunchPair()) {
+            _returnExcess(sendGasTo);
+            return;
+        }
+        _reserveOwnBalance();
+        if (_hasBeneficiary()) {
+            _payBeneficiaryFees(beneficiary);
+        }
+        beneficiary = _beneficiary;
+        emit BeneficiaryChanged(_beneficiary);
+        _ring();
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Tokens, reserves, fee, beneficiary and status of the pair. `_frozen` here and in getDetails: frozen or stopped for an upgrade
+    /// (the pair takes no operation either way); the field `upgrading` tells which. Anyone (getter)
+    function getPairData() internalMsg externalMsg external view returns (
+        address _leftRoot,
+        address _rightRoot,
+        uint128 _leftReserve,
+        uint128 _rightReserve,
+        uint128 _lpSupply,
+        uint128 _poolNumerator,
+        uint128 _beneficiaryNumerator,
+        uint128 _feeDenominator,
+        address _beneficiary,
+        uint128 _beneficiaryLeft,
+        uint128 _beneficiaryRight,
+        bool _active,
+        bool _frozen
+    ) {
+        return (
+            leftRoot,
+            rightRoot,
+            leftReserve,
+            rightReserve,
+            lpSupply,
+            fee.pool_numerator,
+            fee.beneficiary_numerator,
+            fee.denominator,
+            beneficiary,
+            beneficiaryLeft,
+            beneficiaryRight,
+            !paused,
+            _stopped()
+        );
+    }
+
+    /// @notice StableSwap data of a stable pair: decimals, the ramp of A, A now and a proposed change. Anyone (getter)
+    function getStableData() internalMsg externalMsg external view returns (
+        StableStructures.StableConfig _stable,
+        uint32 _amplification,
+        optional(StableStructures.PendingAmplification) _pendingA
+    ) {
+        require(isStable, DexErrors.NOT_STABLE);
+        return (stable, PairQuotes.amplificationAt(stable, uint32(block.timestamp)), pendingA);
+    }
+
+    /// @notice Expected results: the same calculation the operation does now; empty — the pair refuses it.
+    /// Swap of `amount`. Anyone (getter)
+    function getExpectedExchange(uint128 amount, bool spentLeft) internalMsg externalMsg external view returns (
+        optional(IExchangeResult.ExchangeResult)
+    ) {
+        return PairQuotes.quoteExchange(_state(), _pool(), spentLeft, amount);
+    }
+
+    /// @notice Expected input to receive `receiveAmount`; empty — refused. Anyone (getter)
+    function getExpectedSpendAmount(uint128 receiveAmount, bool receiveLeft) internalMsg externalMsg external view returns (
+        optional(PairQuotes.SpendQuote)
+    ) {
+        return PairQuotes.quoteSpendAmount(_state(), _pool(), receiveLeft, receiveAmount);
+    }
+
+    /// @notice Expected two-sided deposit; empty — refused. Anyone (getter)
+    function getExpectedDeposit(uint128 leftAmount, uint128 rightAmount) internalMsg externalMsg external view returns (
+        optional(PairQuotes.DepositQuote)
+    ) {
+        return PairQuotes.quoteAddLiquidity(_state(), _pool(), leftAmount, rightAmount);
+    }
+
+    /// @notice Expected one-token deposit; empty — refused. Anyone (getter)
+    function getExpectedDepositAutoChange(uint128 amount, bool isLeft) internalMsg externalMsg external view returns (
+        optional(PairQuotes.DepositQuote)
+    ) {
+        return PairQuotes.quoteAutoChangeDeposit(_state(), _pool(), isLeft, amount);
+    }
+
+    /// @notice Expected withdrawal of `lpAmount` LP; empty — refused. Anyone (getter)
+    function getExpectedWithdraw(uint128 lpAmount) internalMsg externalMsg external view returns (
+        optional(PairQuotes.WithdrawQuote)
+    ) {
+        return PairQuotes.quoteWithdraw(_state(), _pool(), lpAmount);
+    }
+
+    /// @notice The only first depositor of a launch token's pair (zero for other pairs), until the first deposit, and the LP
+    /// issued: the curve asks it to learn that its pair exists and whether its first deposit is in. Anyone (responsible getter)
+    function getFirstDeposit() internalMsg externalMsg external view responsible returns (address firstDepositor_, uint128 lpSupply_) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (firstDepositor, lpSupply);
+    }
+
+    /// @notice Address of the LpAccount of `owner` in this pair. Anyone (getter)
+    function getLpAccountAddress(address owner) internalMsg externalMsg external view returns (address) {
+        return _expectedLpAccount(owner);
+    }
+
+    /// @notice Tokens, vaults, reserves, type and status of the pair (`_frozen` as in getPairData). Anyone (getter)
+    function getDetails() internalMsg externalMsg external view returns (
+        address _leftRoot,
+        address _rightRoot,
+        address _leftVault,
+        address _rightVault,
+        uint128 _leftReserve,
+        uint128 _rightReserve,
+        uint128 _lpSupply,
+        bool _isStable,
+        bool _paused,
+        bool _frozen
+    ) {
+        return (
+            leftRoot,
+            rightRoot,
+            leftVault,
+            rightVault,
+            leftReserve,
+            rightReserve,
+            lpSupply,
+            isStable,
+            paused,
+            _stopped()
+        );
+    }
+}

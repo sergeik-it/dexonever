@@ -1,0 +1,67 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenRootBase.tsol";
+import "../interfaces/IBurnableByRootTokenRoot.tsol";
+import "../interfaces/IBurnableByRootTokenWallet.tsol";
+import "../libraries/TokenErrors.tsol";
+
+/**
+ * @title Burning by the root ({IBurnableByRootTokenRoot})
+ * @notice Lets the root owner burn tokens of any wallet, until disabled forever.
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenRootBurnableByRootBase is TokenRootBase, IBurnableByRootTokenRoot {
+
+    // `true` once burning by the root is disabled; never reset
+    bool burnByRootDisabled_;
+
+    /**
+     * @notice Burns `amount` tokens from the wallet of `walletOwner`; only the root owner.
+     * @dev Calls {IBurnableByRootTokenWallet-burnByRoot} on the wallet. The message is
+     * sent with bounce, but the root does not handle that bounce (its onBounce only
+     * handles internal_transfer).
+     */
+    function burnTokens(
+        uint128 amount,
+        address walletOwner,
+        address remainingGasTo,
+        address callbackTo,
+        TvmCell payload
+    )
+        override
+        external
+        onlyRootOwner
+    {
+        require(!burnByRootDisabled_, TokenErrors.BURN_BY_ROOT_DISABLED);
+        require(amount > 0, TokenErrors.WRONG_AMOUNT);
+        require(!walletOwner.isStdZero(), TokenErrors.WRONG_WALLET_OWNER);
+
+        IBurnableByRootTokenWallet(_getExpectedWalletAddress(walletOwner)).burnByRoot{
+            value: 0,
+            bounce: true,
+            flag: MsgFlag.REMAINING_GAS
+        }(
+            amount,
+            remainingGasTo,
+            callbackTo,
+            payload
+        );
+    }
+
+    /**
+     * @notice Disables burning by the root forever; only the root owner.
+     */
+    function disableBurnByRoot() override external responsible onlyRootOwner returns (bool) {
+        burnByRootDisabled_ = true;
+        _ring();
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } burnByRootDisabled_;
+    }
+
+    /**
+     * @notice Returns `true` if burning by the root is disabled.
+     */
+    function burnByRootDisabled() internalMsg externalMsg override external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } burnByRootDisabled_;
+    }
+
+}

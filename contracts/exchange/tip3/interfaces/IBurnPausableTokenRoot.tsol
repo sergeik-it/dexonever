@@ -1,0 +1,22 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Pausable burns
+ * @notice TokenRoot extension that lets the root owner pause and resume burns.
+ */
+interface IBurnPausableTokenRoot {
+
+    /**
+     * @notice Pauses or resumes burns; only the root owner.
+     * @dev While paused, the root rejects burn notifications, so they bounce and the
+     * tokens return to the wallets.
+     * @param paused `true` to pause, `false` to resume.
+     * @return The new `paused` value.
+    */
+    function setBurnPaused(bool paused) external responsible returns (bool);
+
+    /**
+     * @notice Returns `true` if burns are paused.
+    */
+    function burnPaused() internalMsg externalMsg external view responsible returns (bool);
+}

@@ -1,0 +1,528 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../../libraries/MsgFlag.tsol";
+import "../../libraries/Hubs.tsol";
+import "../libraries/JettonUtils.tsol";
+
+import "../interfaces/IAcceptTokensBurnCallback.tsol";
+import "../interfaces/ITokenRoot.tsol";
+import "../interfaces/ITokenWallet.tsol";
+import "../structures/ICallbackParamsStructure.tsol";
+import "../libraries/TokenErrors.tsol";
+
+/**
+ * @title TokenRoot base ({ITokenRoot})
+ * @notice Minimal TIP-3 TokenRoot functionality plus the jetton (TEP-74) minter messages.
+ * Extended by {TokenRootBurnableByRootBase}, {TokenRootBurnPausableBase},
+ * {TokenRootDisableableMintBase} and {TokenRootTransferableOwnershipBase}.
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenRootBase is ITokenRoot, ICallbackParamsStructure {
+
+    string static name_;
+    string static symbol_;
+    uint8 static decimals_;
+
+    address static rootOwner_;
+
+    TvmCell static walletCode_;
+
+    uint128 totalSupply_;
+
+    // The token's picture (ipfs://<CID>, or empty) and description: set once by the constructor, never changed.
+    // Not static, so the root address does not depend on them
+    string image_;
+    string description_;
+    // The event hub (DexHub) the token rings in every transaction that changes it: the supply, its flags, its owner.
+    // Hubs live in workchain 0, so only the 256-bit account id is kept: the initial data then has no unset address,
+    // which clients computing the token address would have to write. Zero: no hub (e.g. an LP token of a pair,
+    // whose supply the pair's own events report)
+    uint256 hubId_;
+
+    using JettonUtils for address;
+
+    /**
+     * @notice Handles jetton (TEP-74) minter messages: mint, change_admin,
+     * provide_wallet_address and burn_notification.
+     */
+    fallback() external virtual {
+        optional(uint32) functionIdOpt = msg.body.loadQ(uint32);
+
+        if (!functionIdOpt.hasValue()) {
+            revert(60);
+        }
+
+        uint32 functionId = functionIdOpt.get();
+        TvmCell empty;
+
+        if (functionId == JettonUtils.MINT_FUNCTION_ID) {
+            require(!rootOwner_.isStdZero() && rootOwner_ == msg.sender, TokenErrors.NOT_OWNER);
+            require(_mintEnabled(), TokenErrors.MINT_DISABLED);
+
+            JettonUtils.MintParams params = JettonUtils.decodeMintMsgParams();
+
+            require(params.amount > 0, TokenErrors.WRONG_AMOUNT);
+            require(!params.recipient.isStdZero(), TokenErrors.WRONG_RECIPIENT);
+
+            tvm.rawReserve(_reserve(), 0);
+            _ring();
+            _mint(
+                params.amount,
+                params.recipient,
+                params.deployWalletValue,
+                params.remainingGasTo,
+                params.callbackValue > 0,
+                params.payload.hasValue() ? params.payload.get() : empty,
+                params.callId
+            );
+
+            return;
+        }
+
+        if (functionId == JettonUtils.SET_ADMIN_FUNCTION_ID) {
+            require(!rootOwner_.isStdZero() && rootOwner_ == msg.sender, TokenErrors.NOT_OWNER);
+
+            JettonUtils.SetAdminParams params = JettonUtils.decodeSetAdminMsgParams();
+
+            tvm.rawReserve(_reserve(), 0);
+            _ring();
+
+            rootOwner_ = params.newOwner;
+
+            msg.sender.transfer({
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                bounce: false
+            });
+
+            return;
+        }
+
+        if (functionId == JettonUtils.PROVIDE_WALLET_ADDRESS_FUNCTION_ID) {
+            tvm.rawReserve(_reserve(), 0);
+
+            JettonUtils.ProvideWalletAddressParams params = JettonUtils.decodeProvideWalletAddressMsgParams();
+
+            address wallet = _getExpectedWalletAddress(params.walletOwner);
+
+            optional(TvmCell) walletOwnerOpt;
+
+            if (params.addWalletOwnerToCallback) {
+                TvmBuilder b;
+                b.store(params.walletOwner);
+
+                walletOwnerOpt = b.toCell();
+            }
+
+            JettonUtils.sendTakeWalletAddressCallback(
+                msg.sender,
+                params.callId,
+                wallet,
+                walletOwnerOpt,
+                0,
+                MsgFlag.ALL_NOT_RESERVED,
+                false
+            );
+
+            return;
+        }
+
+        if (functionId == JettonUtils.BURN_NOTIFICATION_FUNCTION_ID) {
+            JettonUtils.BurnNotificationParams params = JettonUtils.decodeBurnNotificationMsgParams();
+
+            _acceptBurn(
+                params.callId,
+                params.amount,
+                params.walletOwner,
+                params.remainingGasTo,
+                params.payload
+            );
+
+            return;
+        }
+
+        // Any other call is refused, so its value bounces back (a text comment, op 0, goes to receive and tops up the gas)
+        revert(60);
+    }
+
+    /**
+     * @dev Throws unless called by `rootOwner_`.
+     */
+    modifier onlyRootOwner() {
+        require(!rootOwner_.isStdZero() && rootOwner_ == msg.sender, TokenErrors.NOT_OWNER);
+        _;
+    }
+
+    /// @notice Returns the name of the token
+    function name() internalMsg externalMsg override external view responsible returns (string) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } name_;
+    }
+
+    /// @notice Returns the symbol of the token
+    function symbol() internalMsg externalMsg override external view responsible returns (string) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } symbol_;
+    }
+
+    /// @notice Returns the token's picture: ipfs://<CID>, or empty
+    function image() internalMsg externalMsg external view responsible returns (string) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } image_;
+    }
+
+    /// @notice Returns the token's description, or empty
+    function description() internalMsg externalMsg external view responsible returns (string) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } description_;
+    }
+
+    /// @notice Returns the number of decimals of the token
+    function decimals() internalMsg externalMsg override external view responsible returns (uint8) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } decimals_;
+    }
+
+    /// @notice Returns the amount of tokens in existence
+    function totalSupply() internalMsg externalMsg override external view responsible returns (uint128) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } totalSupply_;
+    }
+
+    /// @notice Returns the code of the token wallets
+    function walletCode() internalMsg externalMsg override external view responsible returns (TvmCell) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } walletCode_;
+    }
+
+    /// @notice Returns the owner of the root
+    function rootOwner() internalMsg externalMsg override external view responsible returns (address) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } rootOwner_;
+    }
+
+    /**
+     * @notice Returns the token wallet address of `walletOwner` (not the zero address).
+     */
+    function walletOf(address walletOwner)
+        internalMsg
+        externalMsg
+        override
+        public
+        view
+        responsible
+        returns (address)
+    {
+        require(!walletOwner.isStdZero(), TokenErrors.WRONG_WALLET_OWNER);
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } _getExpectedWalletAddress(walletOwner);
+    }
+
+    /**
+     * @notice Deploys a token wallet for `walletOwner` and returns its address.
+     * @dev `deployWalletValue` must cover the deploy.
+    */
+    function deployWallet(address walletOwner, uint128 deployWalletValue)
+        public
+        override
+        responsible
+        returns (address tokenWallet)
+    {
+        require(!walletOwner.isStdZero(), TokenErrors.WRONG_WALLET_OWNER);
+        tvm.rawReserve(_reserve(), 0);
+
+        tokenWallet = _deployWallet(_buildWalletInitData(walletOwner), deployWalletValue, msg.sender);
+
+        return { value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false } tokenWallet;
+    }
+
+    /**
+     * @notice Mints `amount` tokens to `recipient`; only the root owner. See {ITokenRoot-mint}.
+    */
+    function mint(
+        uint128 amount,
+        address recipient,
+        uint128 deployWalletValue,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    )
+        override
+        external
+        virtual
+        onlyRootOwner
+    {
+        require(_mintEnabled(), TokenErrors.MINT_DISABLED);
+        require(amount > 0, TokenErrors.WRONG_AMOUNT);
+        require(!recipient.isStdZero(), TokenErrors.WRONG_RECIPIENT);
+
+        tvm.rawReserve(_reserve(), 0);
+        _ring();
+
+        _mint(
+            amount,
+            recipient,
+            deployWalletValue,
+            remainingGasTo,
+            notify,
+            payload,
+            null
+        );
+    }
+
+    /**
+     * @dev Accepts a burn_notification from a token wallet of this root and decreases
+     * `totalSupply_`. Reverts (so the notification bounces and the wallet restores its
+     * balance) if burns are paused or the sender is not the wallet of `walletOwner`.
+     *
+     * Without `innerPayload` (a jetton burn) the remaining gas goes to `remainingGasTo`
+     * as jetton excesses. Otherwise `innerPayload` holds `(callbackTo, payload)`: the
+     * gas goes to `remainingGasTo` if `callbackTo` is zero, else
+     * {IAcceptTokensBurnCallback-onAcceptTokensBurn} is sent to `callbackTo`, without bounce.
+    */
+    function _acceptBurn(
+        uint64 callId,
+        uint128 amount,
+        address walletOwner,
+        address remainingGasTo,
+        optional(TvmCell) innerPayload
+    ) internal virtual {
+        require(_burnEnabled(), TokenErrors.BURN_DISABLED);
+        require(msg.sender == _getExpectedWalletAddress(walletOwner), TokenErrors.SENDER_IS_NOT_VALID_WALLET);
+
+        tvm.rawReserve(address(this).balance - msg.value, 2);
+
+        totalSupply_ -= amount;
+        _ring();
+
+        if (!innerPayload.hasValue()) {
+            remainingGasTo.sendExcessesCallback(
+                callId,
+                0,
+                MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                false
+            );
+
+            return;
+        }
+
+        (address callbackTo, TvmCell payload) = abi.decode(innerPayload.get(), (address, TvmCell));
+
+        if (callbackTo.isStdZero()) {
+            remainingGasTo.transfer({
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                bounce: false
+            });
+
+            return;
+        }
+
+        IAcceptTokensBurnCallback(callbackTo)
+            .onAcceptTokensBurn{
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                bounce: false
+            }(
+                amount,
+                walletOwner,
+                msg.sender,
+                remainingGasTo,
+                payload
+            );
+    }
+
+    // =============== Support functions ==================
+
+    /**
+     * @dev Mints: deploys the recipient's wallet if `deployWalletValue` > 0, increases
+     * `totalSupply_` and sends internal_transfer to the wallet.
+     *
+     * internal_transfer is sent with bounce: if the wallet cannot accept the mint
+     * (e.g. it is not deployed), {onBounce} decreases `totalSupply_` back.
+     */
+    function _mint(
+        uint128 amount,
+        address recipient,
+        uint128 deployWalletValue,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload,
+        optional(uint64) callId
+    )
+        internal
+    {
+        TvmCell stateInit = _buildWalletInitData(recipient);
+
+        address recipientWallet;
+
+        if(deployWalletValue > 0) {
+            recipientWallet = _deployWallet(stateInit, deployWalletValue, remainingGasTo);
+        } else {
+            recipientWallet = address.makeAddrStd(address(this).wid, tvm.hash(stateInit));
+        }
+
+        totalSupply_ += amount;
+
+        JettonUtils.internalTransferJettons(
+            recipientWallet,
+            callId.getOr(0),
+            varuint16(amount),
+            address(0),
+            notify ? 1 : 0,
+            abi.encode(callId.hasValue(), payload),
+            remainingGasTo,
+            0,
+            MsgFlag.ALL_NOT_RESERVED,
+            true
+        );
+    }
+
+    /**
+     * @dev Computes the token wallet address of `walletOwner`: the hash of the wallet
+     * `StateInit`, in the root's workchain.
+     *
+     * @param walletOwner Token wallet owner address
+     * @return Token wallet address
+    */
+    function _getExpectedWalletAddress(address walletOwner) internal view returns (address) {
+        return address.makeAddrStd(address(this).wid, tvm.hash(_buildWalletInitData(walletOwner)));
+    }
+
+    /**
+     * @notice Bounce handler: when a minting internal_transfer bounces, decreases
+     * `totalSupply_` back by its amount.
+     * @param slice Body of the bounced message.
+    */
+    onBounce(TvmSlice slice) external {
+        if (slice.load(uint32) == JettonUtils.INTERNAL_TRANSFER_FUNCTION_ID) {
+            slice.skip(64);
+
+            totalSupply_ -= slice.load(varuint16);
+            _ring();
+        }
+    }
+
+    /// @dev Rings the token's event hub (DexHub); nothing without a hub
+    function _ring() internal view {
+        if (hubId_ != 0) {
+            Hubs.ring(address.makeAddrStd(0, hubId_));
+        }
+    }
+
+    /**
+     * @notice Sends the balance above the target balance to `to`; only the root owner.
+     * @dev Reserves `_targetBalance()`, then sends everything not reserved (ALL_NOT_RESERVED).
+     * @param to Recipient of the surplus.
+     */
+    function sendSurplusGas(address to) external view onlyRootOwner {
+        tvm.rawReserve(_targetBalance(), 0);
+        to.transfer({
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /**
+     * @dev The amount to reserve before sending: the balance before this message,
+     * but not less than the target balance, so outgoing messages spend at most the
+     * incoming value.
+     */
+    function _reserve() internal view virtual returns (uint128) {
+        return math.max(address(this).balance - msg.value, _targetBalance());
+    }
+
+    /**
+     * @dev The balance the contract keeps for storage fees; used with `tvm.rawReserve`.
+     */
+    function _targetBalance() virtual internal pure returns (uint128);
+
+    /// @dev Returns whether minting is enabled
+    function _mintEnabled() virtual internal view returns (bool);
+
+    /// @dev Returns whether burning is enabled
+    function _burnEnabled() virtual internal view returns (bool);
+
+    /**
+     * @dev Builds the wallet `StateInit`.
+     * @param walletOwner The owner of the wallet.
+     * @return The wallet `StateInit`.
+     */
+    function _buildWalletInitData(address walletOwner) virtual internal view returns (TvmCell);
+
+    /**
+     * @dev Deploys a token wallet.
+     * @param initData The wallet `StateInit`.
+     * @param deployWalletValue Value attached to the deploy.
+     * @param remainingGasTo The address for the remaining gas.
+     * @return The wallet address.
+     */
+    function _deployWallet(TvmCell initData, uint128 deployWalletValue, address remainingGasTo) virtual internal view returns (address);
+
+    /// @notice Jetton (TEP-74) get_jetton_data: supply, mintable, admin, metadata (TEP-64 on-chain) and wallet code
+    function get_jetton_data() getter returns (
+        int,
+        bool,
+        address_std,
+        TvmCell,
+        TvmCell
+    ) {
+        mapping(uint256 => TvmCell) contentDict;
+
+        if (image_.byteLength() > 0) {
+            contentDict[JettonUtils.IMAGE_KEY] = pack_metadata_value(image_);
+        }
+        if (description_.byteLength() > 0) {
+            contentDict[JettonUtils.DESCRIPTION_KEY] = pack_metadata_value(description_);
+        }
+
+        contentDict[JettonUtils.DECIMALS_KEY] = pack_metadata_value(format("{}", decimals_));
+        contentDict[JettonUtils.NAME_KEY] = pack_metadata_value(name_);
+        contentDict[JettonUtils.SYMBOL_KEY] = pack_metadata_value(symbol_);
+
+        TvmBuilder content;
+
+        content.storeUint(0, 8);
+        content.store(contentDict);
+
+        return (
+            totalSupply_,
+            _mintEnabled(),
+            rootOwner_,
+            content.toCell(),
+            walletCode_
+        );
+    }
+
+    /// @notice Jetton (TEP-74) get_wallet_address: the token wallet address of `owner_address`
+    function get_wallet_address(address_std owner_address) getter returns (address_std) {
+        return _getExpectedWalletAddress(owner_address);
+    }
+
+    /// @dev Encodes a metadata value in the TEP-64 snake format: the prefix 0x00 and the bytes, SNAKE_HEAD_BYTES in
+    /// the first cell and SNAKE_CHUNK_BYTES in each next one, linked by the first reference. A single cell (127 bytes)
+    /// would not fit a 512-byte description
+    function pack_metadata_value(string value) private pure returns (TvmCell) {
+        uint32 length = value.byteLength();
+        uint32 head = math.min(length, JettonUtils.SNAKE_HEAD_BYTES);
+        optional(TvmCell) next;
+        if (length > head) {
+            // The chunks after the first cell, built from the last one back, each referencing the one after it
+            uint32 start = head + (length - head - 1) / JettonUtils.SNAKE_CHUNK_BYTES * JettonUtils.SNAKE_CHUNK_BYTES;
+            uint32 end = length;
+            while (true) {
+                TvmBuilder chunk;
+                chunk.store(TvmSlice(value.substr(start, end - start)));
+                if (next.hasValue()) {
+                    chunk.storeRef(next.get());
+                }
+                next = chunk.toCell();
+                if (start == head) {
+                    break;
+                }
+                end = start;
+                start -= JettonUtils.SNAKE_CHUNK_BYTES;
+            }
+        }
+
+        TvmBuilder b;
+        b.storeUint(0, 8);
+        b.store(TvmSlice(value.substr(0, head)));
+        if (next.hasValue()) {
+            b.storeRef(next.get());
+        }
+        return b.toCell();
+    }
+}

@@ -1,0 +1,28 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// Exit codes of the bridge's Everscale contracts: 200 and up, apart from the exchange's 100-199
+library BridgeErrors {
+    uint16 constant NOT_OWNER = 200;
+    uint16 constant NOT_UPGRADER = 201;
+    uint16 constant NOT_GUARDIAN = 202;
+    uint16 constant NOT_RELAY = 203;
+    uint16 constant NOT_ROOT = 204;
+    uint16 constant PAUSED = 205;
+    uint16 constant BAD_ROUND = 206;
+    uint16 constant BAD_TOKEN = 207;
+    uint16 constant BAD_AMOUNT = 208;
+    uint16 constant BAD_RECIPIENT = 209;
+    uint16 constant NOT_ENOUGH_GAS = 210;
+    uint16 constant ALREADY_DONE = 211;
+    uint16 constant NOT_QUEUED = 212;
+    uint16 constant TOO_EARLY = 213;
+    uint16 constant BAD_CODE = 214;
+    uint16 constant BAD_DELAY = 215;
+    uint16 constant NOT_EVENT = 216;
+    // an answer about a new token's root that is not from a root the bridge asked (BridgeRoot.setToken)
+    uint16 constant NOT_PENDING = 217;
+    // no such announced change (BridgeRoot.cancelChange)
+    uint16 constant NOT_ANNOUNCED = 218;
+    // a guardian's removal is cancelled by the owner only (BridgeRoot.cancelChange)
+    uint16 constant OWNER_CANCELS_ONLY = 219;
+}

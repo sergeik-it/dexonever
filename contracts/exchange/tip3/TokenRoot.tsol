@@ -1,0 +1,167 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./abstract/TokenRootTransferableOwnershipBase.tsol";
+import "./abstract/TokenRootBurnPausableBase.tsol";
+import "./abstract/TokenRootBurnableByRootBase.tsol";
+import "./abstract/TokenRootDisableableMintBase.tsol";
+
+import "./TokenWallet.tsol";
+import "./libraries/TokenErrors.tsol";
+import "./libraries/TokenGas.tsol";
+import "./Options.tsol";
+
+/**
+ * @title Fungible token root contract
+ * @notice TIP-3 TokenRoot: stores the token data (`name`, `symbol`, `decimals`,
+ * `walletCode_`, supply) and mints tokens. Also answers jetton (TEP-74) messages.
+ *
+ * Each holder has its own token wallet ({TokenWallet}) with the balance;
+ * transfers go directly between the sender's and the recipient's wallets.
+*/
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract TokenRoot is
+    TokenRootTransferableOwnershipBase,
+    TokenRootBurnPausableBase,
+    TokenRootBurnableByRootBase,
+    TokenRootDisableableMintBase
+{
+    // Only varies the root address
+    uint256 static randomNonce_;
+    // The contract allowed to deploy the root by an internal message; zero: the root owner
+    address static deployer_;
+
+    /**
+     * @notice Initializes the token flags, metadata and hub, and mints the initial supply.
+     * @dev `name_`, `symbol_`, `decimals_`, `rootOwner_`, `walletCode_`, `randomNonce_`
+     * and `deployer_` come from `StateInit`. `image_`, `description_` and `hubId_`
+     * are set only here.
+     *
+     * @param initialSupplyTo The owner of the wallet that receives the initial supply.
+     * @param initialSupply The initial amount to mint (none if 0 or `initialSupplyTo` is zero).
+     * @param deployWalletValue Value (nanoevers) to deploy the wallet of `initialSupplyTo`.
+     * @param mintDisabled `true` to disable minting.
+     * @param burnByRootDisabled `true` to disable burning by the root.
+     * @param burnPaused `true` to pause burns.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param image The token's picture (ipfs://<CID>, or empty); checked by the deployer, never changes.
+     * @param description The token's description (or empty); checked by the deployer, never changes.
+     * @param hub The event hub (DexHub) the token rings, in workchain 0; zero means none.
+     *
+     * Preconditions:
+     *
+     * - by external message: signed with the `StateInit` key and `deployer_` is zero;
+     * - by internal message: the sender is `deployer_`, or `rootOwner_` when `deployer_` is zero.
+    */
+    constructor(
+        address initialSupplyTo,
+        uint128 initialSupply,
+        uint128 deployWalletValue,
+        bool mintDisabled,
+        bool burnByRootDisabled,
+        bool burnPaused,
+        address remainingGasTo,
+        string image,
+        string description,
+        address hub
+    ) internalMsg externalMsg {
+
+        if (msg.pubkey() != 0) {
+            require(msg.pubkey() == tvm.pubkey() && deployer_.isStdZero(), TokenErrors.WRONG_ROOT_OWNER);
+            tvm.accept();
+        } else {
+            require(!deployer_.isStdZero() && msg.sender == deployer_ ||
+                    deployer_.isStdZero() && msg.sender == rootOwner_, TokenErrors.WRONG_ROOT_OWNER);
+        }
+
+        totalSupply_ = 0;
+        mintDisabled_ = mintDisabled;
+        burnByRootDisabled_ = burnByRootDisabled;
+        burnPaused_ = burnPaused;
+        image_ = image;
+        description_ = description;
+        require(hub.isStdZero() || hub.wid == 0, TokenErrors.WRONG_RECIPIENT);
+        hubId_ = hub.value;
+
+        tvm.rawReserve(_targetBalance(), 0);
+
+        if (!initialSupplyTo.isStdZero() && initialSupply != 0) {
+            TvmCell empty;
+
+            _mint(
+                initialSupply,
+                initialSupplyTo,
+                deployWalletValue,
+                remainingGasTo,
+                false,
+                empty,
+                null
+            );
+        } else if (!remainingGasTo.isStdZero()) {
+            remainingGasTo.transfer({
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                bounce: false
+            });
+        }
+    }
+    /**
+     * @notice Returns whether the root implements `interfaceID` ({SID}).
+     */
+    function supportsInterface(uint32 interfaceID) internalMsg externalMsg override external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (
+            interfaceID == uint32(0x3204ec29) ||    // SID
+            interfaceID == uint32(0x4371d8ed) ||    // TIP3TokenRoot
+            interfaceID == uint32(0x0b1fd263) ||    // ITokenRoot
+            interfaceID == uint32(0x18f7cce4) ||    // IBurnableByRootTokenRoot
+            interfaceID == uint32(0x0095b2fa) ||    // IDisableableMintTokenRoot
+            interfaceID == uint32(0x45c92654) ||    // IBurnPausableTokenRoot
+            interfaceID == uint32(0x1df385c6) ||    // ITransferableOwnership
+            interfaceID == uint32(0x2c76b961)       // JettonMinter
+        );
+    }
+
+    /**
+     * @dev See {TokenRootBase-_targetBalance}.
+     */
+    function _targetBalance() override internal pure returns (uint128) {
+        return TokenGas.TARGET_ROOT_BALANCE * Options.STORAGE_FEE_K;
+    }
+
+    /**
+     * @dev See {TokenRootBase-_buildWalletInitData}. The wallet `StateInit` holds
+     * `root_` (this root) and `owner_` as static variables, public key 0 (the wallet
+     * is controlled only by its owner's messages) and `walletCode_`.
+     */
+    function _buildWalletInitData(address walletOwner) override internal view returns (TvmCell) {
+        return abi.encodeStateInit({
+            contr: TokenWallet,
+            varInit: {
+                root_: address(this),
+                owner_: walletOwner
+            },
+            pubkey: 0,
+            code: walletCode_
+        });
+    }
+
+    /**
+     * @dev See {TokenRootBase-_deployWallet}. Deploys a {TokenWallet} in the root's workchain.
+     */
+    function _deployWallet(TvmCell initData, uint128 deployWalletValue, address)
+        override
+        internal
+        view
+        returns (address)
+    {
+       address tokenWallet = new TokenWallet {
+            stateInit: initData,
+            value: varuint16(deployWalletValue),
+            flag: MsgFlag.SENDER_PAYS_FEES,
+            code: walletCode_,
+            wid: address(this).wid
+        }();
+        return tokenWallet;
+    }
+
+}

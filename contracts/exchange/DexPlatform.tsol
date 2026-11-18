@@ -1,0 +1,55 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/MsgFlag.tsol";
+
+/// @title DexPlatform - the deploy stub of the root's children: its address follows from (root, type_id, params); deployed by
+/// the root (or an LpAccount by its pair), it installs the child's code and hands over its data, otherwise it gives the value
+/// back and is destroyed
+#[ExternalMessage(time)]
+#[TimeReplayProt]
+contract DexPlatform {
+    address static root;
+    uint8 static type_id;
+    TvmCell static params;
+
+
+    /// @param initData Extra data for the child that does not affect its address (LP token codes for a pair)
+    constructor(TvmCell code, uint32 version, address send_gas_to, TvmCell initData) {
+        if (msg.sender == root || _isOwnPairDeployingLpAccount()) {
+            _initialize(code, version, send_gas_to, initData);
+        } else {
+            send_gas_to.transfer({
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.DESTROY_IF_ZERO,
+                bounce: false
+            });
+        }
+    }
+
+    /// @notice An LpAccount is deployed by the pair whose address is the first field of its params
+    function _isOwnPairDeployingLpAccount() private view returns (bool) {
+        if (type_id != DexConstants.PLATFORM_TYPE_LP_ACCOUNT) {
+            return false;
+        }
+        return msg.sender == params.toSlice().load(address);
+    }
+
+    function _initialize(TvmCell code, uint32 version, address send_gas_to, TvmCell initData) private {
+        TvmBuilder builder;
+
+        builder.store(root);
+        builder.store(uint8(type_id));
+        builder.store(version);
+        builder.store(send_gas_to);
+        builder.store(tvm.code());
+        builder.store(params);
+        builder.store(initData);
+
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(builder.toCell());
+    }
+
+    function onCodeUpgrade(TvmCell data) private {}
+}

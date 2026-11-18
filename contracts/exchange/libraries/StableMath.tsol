@@ -1,0 +1,316 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+import "../structures/IFeeParams.tsol";
+import "../structures/StableStructures.tsol";
+import "./Quiet.tsol";
+import "./PairMath.tsol";
+
+/// @title StableMath - StableSwap invariant math for 2 tokens.
+/// Calculations run on quint256 (Quiet.tsol); a result is DexConstants.STABLE_RESULT_OK, DexConstants.STABLE_RESULT_REFUSED
+/// (no result) or DexConstants.STABLE_RESULT_FAILED (out of range, division by zero, no convergence).
+/// There is no referrer branch: the referrer share must be zero.
+library StableMath {
+
+
+    function pow10(uint8 n) internal returns (uint128 result) {
+        result = 1;
+        for (uint8 i = 0; i < n; i++) {
+            result *= 10;
+        }
+    }
+
+    /// @notice Common scale of the two tokens: precision = 10^max(decimals),
+    /// rate = 10^(max − decimals) × precision
+    function stableRates(uint8 decimals0, uint8 decimals1) internal returns (StableStructures.StableRates) {
+        uint8 maxDecimals = math.max(decimals0, decimals1);
+        uint128 precision = pow10(maxDecimals);
+        return StableStructures.StableRates(
+            precision,
+            pow10(maxDecimals - decimals0) * precision,
+            pow10(maxDecimals - decimals1) * precision
+        );
+    }
+
+    /// @notice Balance in the common scale. In range for any uint128 balance and decimals up to 18
+    function xp(uint256 balance, uint256 rate, uint256 precision) internal returns (uint256) {
+        return math.muldiv(rate, balance, precision);
+    }
+
+    function absDiff(uint256 a, uint256 b) internal returns (uint256) {
+        return a > b ? a - b : b - a;
+    }
+
+    function qxp(quint256 balance, quint256 rate, quint256 precision) internal returns (quint256) {
+        return math.muldiv(rate, balance, precision);
+    }
+
+    /// @notice Invariant D; NaN if it does not converge in DexConstants.STABLE_MAX_ITERATIONS
+    function stableD(quint256 x0, quint256 x1, StableStructures.Amplification a) internal returns (quint256) {
+        quint256 s = x0 + x1;
+        if (s.isNaN()) {
+            return NaN;
+        }
+        if (s.get() == 0) {
+            return 0;
+        }
+        quint256 d = s;
+        quint256 ann = Quiet.u128(quint256(a.value) * DexConstants.STABLE_COINS);
+        for (uint16 i = 0; i < DexConstants.STABLE_MAX_ITERATIONS; i++) {
+            quint256 dp = d;
+            dp = math.muldiv(dp, d, x0 * DexConstants.STABLE_COINS);
+            dp = math.muldiv(dp, d, x1 * DexConstants.STABLE_COINS);
+            quint256 prev = d;
+            d = math.muldiv(
+                math.muldiv(ann, s, quint256(a.precision)) + dp * DexConstants.STABLE_COINS,
+                d,
+                math.muldiv(ann - a.precision, d, quint256(a.precision)) + dp * (DexConstants.STABLE_COINS + 1)
+            );
+            if (d.isNaN()) {
+                return NaN;
+            }
+            if (Quiet.absDiff(d, prev).get() <= 1) {
+                return d;
+            }
+        }
+        return NaN;
+    }
+
+    /// @notice New balance of the second token when the first one became x, uint128 range.
+    /// xp0/xp1 are the current balances strictly in token order: D depends on the order through rounding
+    function stableY(quint256 x, quint256 xp0, quint256 xp1, StableStructures.Amplification a) internal returns (quint256) {
+        quint256 d = stableD(xp0, xp1, a);
+        quint256 ann = Quiet.u128(quint256(a.value) * DexConstants.STABLE_COINS);
+        quint256 c = math.muldiv(d, d, x * DexConstants.STABLE_COINS);
+        c = math.muldiv(c, d * a.precision, ann * DexConstants.STABLE_COINS);
+        quint256 b = x + math.muldiv(d, quint256(a.precision), ann);
+        quint256 y = d;
+        for (uint16 i = 0; i < DexConstants.STABLE_MAX_ITERATIONS; i++) {
+            quint256 prev = y;
+            y = (y * y + c) / (y * 2 + b - d);
+            if (y.isNaN()) {
+                return NaN;
+            }
+            if (Quiet.absDiff(y, prev).get() <= 1) {
+                return Quiet.u128(y);
+            }
+        }
+        return NaN;
+    }
+
+    /// @notice Pool and beneficiary parts of a fee; NaN if out of range. The referrer share is computed only for its
+    /// failure (a zero total divides by zero): that failure is passed on as a
+    /// NaN beneficiaryFee, which every caller checks
+    function splitFee(quint256 fees, quint256 referrerDivisor, IFeeParams.FeeParams fee) internal returns (quint256 poolFee, quint256 beneficiaryFee) {
+        quint256 referrerShare = Quiet.u128(math.muldiv(fees, quint256(fee.referrer_numerator), referrerDivisor));
+        poolFee = Quiet.u128(math.muldivc(fees, quint256(fee.pool_numerator), Quiet.u128(quint256(fee.beneficiary_numerator) + fee.pool_numerator)));
+        beneficiaryFee = Quiet.u128(fees - poolFee);
+        if (referrerShare.isNaN()) {
+            beneficiaryFee = NaN;
+        }
+    }
+
+    /// @notice Output of a swap of `amount` (spentFirst — token 0 is given) without a referrer
+    function stableExchange(
+        uint128 amount,
+        bool spentFirst,
+        uint128 balance0,
+        uint128 balance1,
+        StableStructures.StableRates rates,
+        IFeeParams.FeeParams fee,
+        StableStructures.Amplification a
+    ) internal returns (uint8 status, StableStructures.StableExchangeResult result) {
+        quint256 xp0 = qxp(balance0, rates.rate0, rates.precision);
+        quint256 xp1 = qxp(balance1, rates.rate1, rates.precision);
+        quint256 feeNumerator = PairMath.totalNumerator(fee);
+        quint256 xFee = Quiet.u128(math.muldivc(quint256(amount), feeNumerator, quint256(fee.denominator)));
+        (quint256 xPoolFee, quint256 xBeneficiaryFee) = splitFee(xFee, feeNumerator, fee);
+
+        quint256 x = (spentFirst ? xp0 : xp1) + math.muldiv(
+            Quiet.u128(quint256(amount) - xFee),
+            quint256(spentFirst ? rates.rate0 : rates.rate1),
+            quint256(rates.precision)
+        );
+        quint256 y = stableY(x, xp0, xp1, a);
+        quint256 dy = Quiet.u128(math.muldiv(
+            (spentFirst ? xp1 : xp0) - y,
+            quint256(rates.precision),
+            quint256(spentFirst ? rates.rate1 : rates.rate0)
+        ));
+        if (xBeneficiaryFee.isNaN() || dy.isNaN()) {
+            return (DexConstants.STABLE_RESULT_FAILED, result);
+        }
+        result = StableStructures.StableExchangeResult(Quiet.get128(dy), Quiet.get128(xPoolFee), Quiet.get128(xBeneficiaryFee));
+        if (
+            result.amount <= (spentFirst ? balance1 : balance0) &&
+            result.amount > 0 &&
+            (result.poolFee > 0 || fee.pool_numerator == 0) &&
+            (result.beneficiaryFee > 0 || fee.beneficiary_numerator == 0 || result.poolFee > 0)
+        ) {
+            return (DexConstants.STABLE_RESULT_OK, result);
+        }
+        return (DexConstants.STABLE_RESULT_REFUSED, result);
+    }
+
+    /// @notice How much to give to receive `receiveAmount` (receiveFirst — token 0 is received)
+    function stableSpendAmount(
+        uint128 receiveAmount,
+        bool receiveFirst,
+        uint128 balance0,
+        uint128 balance1,
+        StableStructures.StableRates rates,
+        IFeeParams.FeeParams fee,
+        StableStructures.Amplification a
+    ) internal returns (uint8 status, StableStructures.StableExchangeResult result) {
+        if (receiveAmount >= (receiveFirst ? balance0 : balance1) || receiveAmount == 0) {
+            return (DexConstants.STABLE_RESULT_REFUSED, result);
+        }
+        quint256 xp0 = qxp(balance0, rates.rate0, rates.precision);
+        quint256 xp1 = qxp(balance1, rates.rate1, rates.precision);
+        quint256 y = (receiveFirst ? xp0 : xp1) - math.muldiv(
+            quint256(receiveAmount),
+            quint256(receiveFirst ? rates.rate0 : rates.rate1),
+            quint256(rates.precision)
+        );
+        quint256 x = stableY(y, xp0, xp1, a);
+        quint256 feeDMinusN = Quiet.u128(Quiet.u128(Quiet.u128(
+            quint256(fee.denominator) - fee.pool_numerator) - fee.beneficiary_numerator) - fee.referrer_numerator
+        );
+        quint256 dxRaw = Quiet.u128(math.muldivc(
+            x - (receiveFirst ? xp1 : xp0),
+            quint256(rates.precision),
+            quint256(receiveFirst ? rates.rate1 : rates.rate0)
+        ));
+        quint256 dx = Quiet.u128(math.muldivc(dxRaw, quint256(fee.denominator), feeDMinusN));
+        quint256 xFee = Quiet.u128(math.muldivc(dx, PairMath.totalNumerator(fee), quint256(fee.denominator)));
+        quint256 xPoolFee = Quiet.u128(math.muldivc(xFee, quint256(fee.pool_numerator), Quiet.u128(quint256(fee.pool_numerator) + fee.beneficiary_numerator)));
+        quint256 xBeneficiaryFee = Quiet.u128(xFee - xPoolFee);
+        if (xBeneficiaryFee.isNaN()) {
+            return (DexConstants.STABLE_RESULT_FAILED, result);
+        }
+        result = StableStructures.StableExchangeResult(Quiet.get128(dx), Quiet.get128(xPoolFee), Quiet.get128(xBeneficiaryFee));
+        if (
+            (result.poolFee > 0 || fee.pool_numerator == 0) &&
+            (result.beneficiaryFee > 0 || fee.beneficiary_numerator == 0 || result.poolFee > 0)
+        ) {
+            return (DexConstants.STABLE_RESULT_OK, result);
+        }
+        return (DexConstants.STABLE_RESULT_REFUSED, result);
+    }
+
+    struct ImbalanceFee {
+        quint256 reduced;      // new balance without both fees
+        quint256 result;       // new balance without the beneficiary fee
+        quint256 difference;   // deviation from the pool proportion, the fee is taken from it
+        bool sell;
+        quint256 poolFee;
+        quint256 beneficiaryFee;
+    }
+
+    /// @notice Fee for the deviation of a deposit from the pool proportion, for one token: total × N / (4(N − 1)) of the
+    /// difference as one fraction rounded up, so an odd total keeps its half.
+    /// Any field is NaN if the calculation is out of range
+    function stableImbalanceFee(
+        quint256 oldBalance,
+        quint256 newBalance,
+        quint256 d0,
+        quint256 d1,
+        IFeeParams.FeeParams fee
+    ) internal returns (ImbalanceFee r) {
+        quint256 ideal = Quiet.u128(math.muldiv(d1, oldBalance, d0));
+        r.difference = Quiet.u128(Quiet.absDiff(ideal, newBalance));
+        quint256 fees = Quiet.u128(math.muldivc(
+            PairMath.totalNumerator(fee) * quint256(DexConstants.STABLE_COINS),
+            r.difference,
+            quint256(fee.denominator) * quint256(4 * (DexConstants.STABLE_COINS - 1))
+        ));
+        quint256 referrerDivisor = Quiet.u128(Quiet.u128(quint256(fee.beneficiary_numerator) + fee.pool_numerator) + fee.referrer_numerator);
+        (r.poolFee, r.beneficiaryFee) = splitFee(fees, referrerDivisor, fee);
+        r.result = Quiet.u128(newBalance - r.beneficiaryFee);
+        r.reduced = Quiet.u128(Quiet.u128(newBalance - r.poolFee) - r.beneficiaryFee);
+        r.sell = !ideal.isNaN() && !newBalance.isNaN() && ideal.get() < newBalance.get();
+    }
+
+    function isNaN(ImbalanceFee f) internal returns (bool) {
+        return f.reduced.isNaN() || f.result.isNaN() || f.difference.isNaN();
+    }
+
+    /// @notice Deposit of amount0/amount1 in any proportion without a referrer
+    function stableDeposit(
+        uint128 amount0,
+        uint128 amount1,
+        uint128 balance0,
+        uint128 balance1,
+        uint128 lpSupply,
+        StableStructures.StableRates rates,
+        IFeeParams.FeeParams fee,
+        StableStructures.Amplification a
+    ) internal returns (uint8 status, StableStructures.StableDepositResult r) {
+        quint256 d0 = stableD(qxp(balance0, rates.rate0, rates.precision), qxp(balance1, rates.rate1, rates.precision), a);
+        quint256 new0 = Quiet.u128(quint256(balance0) + amount0);
+        quint256 new1 = Quiet.u128(quint256(balance1) + amount1);
+        quint256 d1 = stableD(qxp(new0, rates.rate0, rates.precision), qxp(new1, rates.rate1, rates.precision), a);
+        if (d0.isNaN() || d1.isNaN()) {
+            return (DexConstants.STABLE_RESULT_FAILED, r);
+        }
+        // the first deposit is made with both tokens
+        if ((lpSupply == 0 && (amount0 == 0 || amount1 == 0)) || d0.get() >= d1.get()) {
+            return (DexConstants.STABLE_RESULT_REFUSED, r);
+        }
+        quint256 invariant = Quiet.u128(d1);
+        if (lpSupply == 0) {
+            if (invariant.isNaN()) {
+                return (DexConstants.STABLE_RESULT_FAILED, r);
+            }
+            if (invariant.get() == 0) {
+                return (DexConstants.STABLE_RESULT_REFUSED, r);
+            }
+            r.lpReward = Quiet.get128(invariant);
+            r.resultBalance0 = Quiet.get128(new0);
+            r.resultBalance1 = Quiet.get128(new1);
+            r.invariant = Quiet.get128(invariant);
+            return (DexConstants.STABLE_RESULT_OK, r);
+        }
+
+        ImbalanceFee f0 = stableImbalanceFee(balance0, new0, d0, d1, fee);
+        ImbalanceFee f1 = stableImbalanceFee(balance1, new1, d0, d1, fee);
+        if (isNaN(f0) || isNaN(f1)) {
+            return (DexConstants.STABLE_RESULT_FAILED, r);
+        }
+        quint256 d2 = stableD(qxp(f0.reduced, rates.rate0, rates.precision), qxp(f1.reduced, rates.rate1, rates.precision), a);
+        quint256 reward = Quiet.u128(math.muldiv(quint256(lpSupply), d2 - d0, d0));
+        if (reward.isNaN()) {
+            return (DexConstants.STABLE_RESULT_FAILED, r);
+        }
+        if (reward.get() == 0) {
+            return (DexConstants.STABLE_RESULT_REFUSED, r);
+        }
+        if (invariant.isNaN()) {
+            return (DexConstants.STABLE_RESULT_FAILED, r);
+        }
+        return (DexConstants.STABLE_RESULT_OK, depositResult(reward, invariant, f0, f1));
+    }
+
+    /// @notice A deposit into a non-empty pool from values already checked for NaN
+    function depositResult(
+        quint256 reward,
+        quint256 invariant,
+        ImbalanceFee f0,
+        ImbalanceFee f1
+    ) internal returns (StableStructures.StableDepositResult) {
+        return StableStructures.StableDepositResult(
+            Quiet.get128(reward),
+            Quiet.get128(f0.result),
+            Quiet.get128(f1.result),
+            Quiet.get128(invariant),
+            Quiet.get128(f0.difference),
+            Quiet.get128(f1.difference),
+            f0.sell,
+            f1.sell,
+            Quiet.get128(f0.poolFee),
+            Quiet.get128(f1.poolFee),
+            Quiet.get128(f0.beneficiaryFee),
+            Quiet.get128(f1.beneficiaryFee)
+        );
+    }
+}

@@ -1,0 +1,24 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenWalletBase.tsol";
+import "../interfaces/IDestroyable.tsol";
+import "../libraries/TokenErrors.tsol";
+
+/**
+ * @title Destroyable token wallet ({IDestroyable})
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenWalletDestroyableBase is TokenWalletBase, IDestroyable {
+
+    /**
+     * @notice Destroys the empty wallet and sends its balance to `remainingGasTo`; only the owner.
+     */
+    function destroy(address remainingGasTo) override external onlyOwner {
+        require(balance_ == 0, TokenErrors.NON_EMPTY_BALANCE);
+        remainingGasTo.transfer({
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.DESTROY_IF_ZERO,
+            bounce: false
+        });
+    }
+}

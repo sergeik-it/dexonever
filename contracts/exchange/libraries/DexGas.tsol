@@ -1,0 +1,384 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../tip3/libraries/TokenGas.tsol";
+
+/// @title DexGas - gas of the exchange.
+/// What pays for computation and forwarding is kept in gas units and turned into EVER at the
+/// workchain gas price of the network config (param 21) when it is checked or sent: a dearer gas raises every
+/// threshold by itself. What stays on a contract for its storage is kept in EVER: it follows the storage price, not
+/// the gas price. A value that deploys a contract is its storage reserve plus the gas of the deploy.
+/// The built-in gasToValue is not used: it compiles to the TON opcode GETGASFEE, which the Everscale VM does not have
+/// (exit code 6). At 1000 nanoEVER per gas, 1000 gas = 0.001 EVER.
+library DexGas {
+    // Storage reserves, EVER
+    uint128 constant MIN_CONTRACT_BALANCE = 0.2 ever;
+    // pairs and vaults hold users' funds and live as long as the exchange: a larger reserve pays their storage for years
+    // without maintenance (0.2 EVER lasts about a year of idleness)
+    uint128 constant PAIR_MIN_BALANCE = 1 ever;
+    uint128 constant VAULT_MIN_BALANCE = 1 ever;
+    // the root stores the code of every contract it deploys: it keeps more for their storage
+    uint128 constant ROOT_MIN_BALANCE = 1 ever;
+    uint128 constant LP_ACCOUNT_MIN_BALANCE = 0.05 ever;
+    // a shard of the deploy registry keeps its entries for good (DexRegistry)
+    uint128 constant REGISTRY_MIN_BALANCE = 1 ever;
+    // an event hub keeps no entries (DexHub): its storage is its few fields
+    uint128 constant HUB_MIN_BALANCE = 0.1 ever;
+
+    // Gas units
+    uint128 constant OPERATION = 100_000;
+    uint128 constant PAYOUT = 80_000;
+    // a new TIP-3 wallet: its deploy and the first transfer, on top of the wallet's target balance
+    uint128 constant WALLET_DEPLOY = 50_000;
+    // the call of a token root that deploys a wallet, on top of the wallet's deploy value
+    uint128 constant WALLET_DEPLOY_CALL = 150_000;
+    // the LP TokenRoot deploy, on top of its target balance
+    uint128 constant LP_ROOT_DEPLOY = 300_000;
+    // vault deploy: on top of its reserve and of its token wallet's deploy call
+    uint128 constant VAULT_DEPLOY = 500_000;
+    // pair deploy: on top of its reserve, its LP root and its LP wallet's deploy call
+    uint128 constant PAIR_DEPLOY = 700_000;
+    // a user's pair deploy asks the reserved pair list first (DexRoot.deployPair): the root's request, the list's answer
+    // and the root's answer handling, with their forwarding
+    uint128 constant PAIR_CHECK = 100_000;
+    // a round of the deploy registry (DexRegistry): the shard's claim or check and the root's handling of the answer
+    uint128 constant REGISTRY_HOP = 60_000;
+    // a registry shard's deploy: the platform and the shard's init, on top of its reserve
+    uint128 constant REGISTRY_DEPLOY = 100_000;
+    // an event hub's deploy: the platform and the hub's init, on top of its reserve
+    uint128 constant HUB_DEPLOY = 100_000;
+    // a bell at an event hub (DexHub.receive): its compute (about 760 gas), charged as the flat 1 000
+    // (0.001 EVER)
+    uint128 constant HUB_BELL = 1_000;
+    uint128 constant LP_MINT = 300_000;
+    // retryMint: a new question to the LP wallet that must carry a mint with a wallet deploy
+    uint128 constant RETRY_MINT = 150_000;
+    uint128 constant LP_BURN = 100_000;
+    // a call of the LP root by its owner (the pair): sendSurplusGas
+    uint128 constant LP_ROOT_CALL = 50_000;
+    // withdrawal: the LP burn and two payouts out of the incoming value, plus its own compute
+    uint128 constant WITHDRAW = 500_000;
+    // LpAccount deploy, on top of its reserve
+    uint128 constant LP_ACCOUNT_DEPLOY = 150_000;
+    // claims of kept payouts: a token transfer that may bounce back and be recorded again
+    uint128 constant CLAIM = 300_000;
+    // confirmation of a vault operation by the pair (the vault drops its journal entry)
+    uint128 constant CONFIRM = 30_000;
+    // the native vault's own work on a payout order with its actions: about 23 600 gas. The order must
+    // bring this and the answer onPayoutTaken, or the answer would be paid out of held; a pair sends PAYOUT + CONFIRM
+    uint128 constant NATIVE_PAYOUT_WORK = 40_000;
+    // admin calls forwarded by the root: the deepest one pays two payouts to the previous beneficiary
+    uint128 constant ADMIN_CALL = 500_000;
+    // every pair or vault of the owner's batch pause or freeze: it returns what is left to the owner
+    uint128 constant BATCH_CHILD = 50_000;
+    // every curve of the owner's batch freeze of buys: the launchpad forwards it, the curve returns what is left to the
+    // owner (two hops; with their forwarding, which does not follow the gas price, in BATCH_CURVE_FORWARD)
+    uint128 constant BATCH_CURVE = 100_000;
+    uint128 constant BATCH_CURVE_FORWARD = 0.02 ever;
+    // every pair or vault of the upgrader's batch move to the installed code: its move (about 48 000 gas of a pair and
+    // 25 000 of a vault), the gas left goes back to the upgrader; the code's
+    // forwarding is PAIR_FORWARD or VAULT_FORWARD (0.164 and 0.067 EVER measured)
+    uint128 constant BATCH_UPGRADE = 100_000;
+    // every curve of the upgrader's batch move (DexRoot.upgradeLaunches): the launchpad's hop with the curve's address
+    // and the curve's move with its whole state; the gas left goes back to the upgrader. The forwarding of the curve's
+    // code (about the size of a vault's, 0.067 EVER measured for that) is CURVE_CODE_FORWARD
+    uint128 constant BATCH_CURVE_UPGRADE = 150_000;
+    // the root's own gas for every address of such a batch: its address and the message with the code (about 15 000)
+    uint128 constant BATCH_UPGRADE_ROOT = 20_000;
+    // every address of a token list update: the entry and its event with a reason of up to 256 bytes (about 10 600)
+    uint128 constant LIST_ENTRY = 15_000;
+    // TokenFactory.createToken and the token root's deploy; with an initial supply — the mint. Measured:
+    // 17 800 gas of the factory, 16 600 of the root with the mint (9 600 without), 12 300 of the wallet
+    uint128 constant TOKEN_CREATE = 100_000;
+    uint128 constant TOKEN_MINT = 50_000;
+    // forwarding the token's code and its wallet's code, EVER: the forward prices (params 24, 25) do not follow the gas
+    // price, so this is not counted in gas. Measured at most 0.088 and 0.036 EVER
+    uint128 constant TOKEN_FORWARD = 0.25 ever;
+    // Launchpad
+    // createLaunch: the launchpad's request, the root's registration, the launchpad's answer and the curve's deploy, on
+    // top of the token's creation (TOKEN_CREATE, TOKEN_MINT, a wallet)
+    uint128 constant LAUNCH_CREATE = 200_000;
+    // forwarding the curve's code with the token's codes, EVER (as TOKEN_FORWARD; measured at most 0.128 EVER
+    // with the registration's messages). Gas measured: 131 000 of the launchpad, the root and the curve
+    uint128 constant LAUNCH_FORWARD = 0.3 ever;
+    // the launchpad's onCurveDeployed: the deployed curve's rest of the value to the creator through the launchpad
+    uint128 constant LAUNCH_DONE = 30_000;
+    // a curve's sell with the transfer of its token wallet (measured 24 000 of the curve and 15 000 of its wallet)
+    uint128 constant CURVE_TRADE = 100_000;
+    // a curve's buy: its own compute and the wallet's answer (measured 29 000 and 5 000) and the delivery (CURVE_DELIVERY)
+    uint128 constant CURVE_BUY = 150_000;
+    // the delivery of bought tokens: the curve's handling of the answer, the transfer of its wallet and the buyer's
+    // wallet taking the tokens (measured 25 000, 15 000 and 12 000)
+    uint128 constant CURVE_DELIVERY = 80_000;
+    // Forwarding of code, EVER: the forward prices (params 24, 25) do not follow the gas price, so at a gas price far below
+    // 1000 nanoEVER a threshold counted in gas only would let through deploys that then fail. Measured at most:
+    // a new TIP-3 wallet's code with its deploy (0.036 EVER)
+    uint128 constant WALLET_FORWARD = 0.05 ever;
+    // the platform of a vault with the vault's code (0.069 EVER)
+    uint128 constant VAULT_FORWARD = 0.15 ever;
+    // a curve's code from the launchpad to the curve (DexRoot.upgradeLaunches)
+    uint128 constant CURVE_CODE_FORWARD = 0.15 ever;
+    // the platform of a pair with the pair's code and the codes of its LP token and LpAccount (0.256 EVER)
+    uint128 constant PAIR_FORWARD = 0.4 ever;
+    // the platform of an LpAccount with its code (0.015 EVER; at the price ÷8 the deploy's gas part still covers it)
+    uint128 constant LP_ACCOUNT_FORWARD = 0.03 ever;
+    // a token transfer between two wallets with its notification and an operation payload (about 0.005 EVER)
+    uint128 constant TRANSFER_FORWARD = 0.05 ever;
+    // the platform of a registry shard with the shard's code (a smaller code than a vault's)
+    uint128 constant REGISTRY_FORWARD = 0.15 ever;
+    // a round of the deploy registry: the root's question to a shard and the answer, small cells (a deploy's description, a
+    // launch's data)
+    uint128 constant REGISTRY_HOP_FORWARD = 0.02 ever;
+    // the platform of an event hub with the hub's code
+    uint128 constant HUB_FORWARD = 0.1 ever;
+    // a bell's forwarding: a message with no body — 0.0005 EVER measured, twice that
+    uint128 constant HUB_BELL_FORWARD = 0.001 ever;
+    // the root's migrateLaunchToken on top of the two deploy values
+    uint128 constant LAUNCH_MIGRATE = 100_000;
+    // migrate of a curve: its own compute, paid by the caller (the deploys are paid from the pool)
+    uint128 constant CURVE_MIGRATE = 50_000;
+    // seed of a curve, paid by the caller: the questions to the pair, the vault and the curve's wallet, their answers and
+    // the release of the token (LAUNCH_RELEASE); measured 82 000 of the steps, 24 000 of
+    // them the last answer
+    uint128 constant CURVE_SEED = 250_000;
+    // the transfer of the pool's tokens to the vault, on top of the vault operation: the curve's wallet, the vault's wallet
+    // (about 35 000 together) and a margin; what is left comes back to the curve
+    uint128 constant CURVE_TOKEN_TRANSFER = 150_000;
+    // a vault's token transfer: its wallet and the recipient's (about 35 000 together, as the curve's) with a margin
+    uint128 constant VAULT_TOKEN_TRANSFER = 150_000;
+    // the root's releaseLaunchToken (measured about 17 000)
+    uint128 constant LAUNCH_RELEASE = 50_000;
+    // a curve's expire: its own compute, the release sent on with LAUNCH_RELEASE
+    uint128 constant CURVE_EXPIRE = 50_000;
+    // cancel of a half-filled LpAccount: two payouts back to the owner
+    uint128 constant LP_ACCOUNT_CANCEL = 500_000;
+    // LpAccount.onPairTook: the pair's answer that it took the halves
+    uint128 constant LP_ACCOUNT_ANSWER = 30_000;
+    // LpAccount's own transaction that sends the halves: its fees come out of what the pair gets
+    uint128 constant LP_ACCOUNT_SEND = 50_000;
+    // a vault operation (swap, deposit, half of a deposit): the deepest path pays an LpAccount deploy, two payouts and
+    // an LP mint with a wallet deploy; this is the gas on top of those two deploy values
+    uint128 constant VAULT_OPERATION = 650_000;
+    // swap routes: a pair step, a hop through the vault of the received token to the next pair (journal and
+    // confirmation), the extra of stable math, a payout at a leaf. Every pair checks the gas of its subtree
+    uint128 constant ROUTE_STEP = 200_000;
+    uint128 constant ROUTE_HOP = 150_000;
+    uint128 constant STABLE_STEP_EXTRA = 50_000;
+    // a leaf's payout order: the vault's work and its answer onPayoutTaken, as payoutGas
+    uint128 constant ROUTE_PAYOUT = PAYOUT + CONFIRM;
+
+    // param 21 that this library cannot read: three times 1000 nanoEVER per gas (in 1/65536
+    // nanoEVER). Every check of the exchange depends on the price; throwing here would stop all of them until an
+    // upgrade, and a price below the real one would let through operations that then run out of gas (a token
+    // notification does not bounce), so a too high one only refuses more. Not reachable while the network charges gas
+    // by param 21 itself, so checked by the code only; a get-method runs without the config and sees this price
+    uint128 constant FALLBACK_GAS_PRICE = 3 * 65536000;
+
+    /// @notice The workchain gas price of the config (param 21), in 1/65536 nanoEVER per gas. Reading it costs about
+    /// 2000 gas: a threshold reads it once (its gas units are summed first), a loop reads it once and passes it on.
+    /// Param 21 is GasLimitsPrices: an optional gas_flat_pfx (0xd1, flat_gas_limit, flat_gas_price) and gas_prices
+    /// (0xdd) or gas_prices_ext (0xde) starting with gas_price. The flat part is skipped: in the network configs the flat
+    /// price is the flat limit at gas_price, and the exchange's values are far above the flat limit (1000 gas), so it
+    /// changes nothing
+    function gasPrice() internal returns (uint128 price) {
+        price = FALLBACK_GAS_PRICE;
+        optional(TvmCell) param = tvm.rawConfigParam(21);
+        if (!param.hasValue()) {
+            return price;
+        }
+        TvmSlice s = param.get().toSlice();
+        uint8 tag = s.bits() >= 8 ? s.load(uint8) : 0;
+        if (tag == 0xd1 && s.bits() >= 136) {
+            s.skip(128);
+            tag = s.load(uint8);
+        }
+        if ((tag == 0xdd || tag == 0xde) && s.bits() >= 64) {
+            price = s.load(uint64);
+        }
+    }
+
+    /// @notice EVER of `gas` at `price`, rounded up: linear, so the gas of parts may be summed before
+    function valueAt(uint128 price, uint128 gas) internal returns (uint128) {
+        return math.muldivc(gas, price, 65536);
+    }
+
+    function gasValue(uint128 gas) internal returns (uint128) {
+        return valueAt(gasPrice(), gas);
+    }
+
+    function operationGas() internal returns (uint128) {
+        return gasValue(OPERATION);
+    }
+
+    /// @notice What a vault's token transfer carries when more gas came: the rest goes to the recipient at once, so a
+    /// transfer bounced for a missing wallet leaves at most this with the vault
+    function tokenSendValue() internal returns (uint128) {
+        return TRANSFER_FORWARD + gasValue(VAULT_TOKEN_TRANSFER);
+    }
+
+    /// @notice A payout order of a pair: the vault's work and its answer onPayoutTaken
+    function payoutGas() internal returns (uint128) {
+        return gasValue(PAYOUT + CONFIRM);
+    }
+
+    /// @notice claimUnpaid: the call and up to two payout orders
+    function claimUnpaidMinValue() internal returns (uint128) {
+        return gasValue(CLAIM + 2 * (PAYOUT + CONFIRM));
+    }
+
+    /// @notice deployWalletValue of a new TIP-3 wallet: its target balance and its deploy
+    function deployWalletValue() internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + gasValue(WALLET_DEPLOY);
+    }
+
+    /// @notice A token root's deployWallet call that carries deployWalletValue and the forwarding of the wallet's code
+    function deployWalletCallValue() internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD + gasValue(WALLET_DEPLOY + WALLET_DEPLOY_CALL);
+    }
+
+    /// @notice What a registry shard's deploy needs: its reserve, the forwarding of its code and the deploy
+    function deployRegistryValue() internal returns (uint128) {
+        return REGISTRY_MIN_BALANCE + REGISTRY_FORWARD + gasValue(REGISTRY_DEPLOY);
+    }
+
+    /// @notice What an event hub's deploy needs: its reserve, the forwarding of its code and the deploy
+    function deployHubValue() internal returns (uint128) {
+        return HUB_MIN_BALANCE + HUB_FORWARD + gasValue(HUB_DEPLOY);
+    }
+
+    /// @notice What a bell carries: its forwarding and the hub's compute (the sender pays it out of the operation's gas)
+    function hubBellValue() internal returns (uint128) {
+        return HUB_BELL_FORWARD + gasValue(HUB_BELL);
+    }
+
+    /// @notice The LP root's deploy: its reserve, the forwarding of its code and its wallet's code, its gas
+    function deployLpRootValue() internal returns (uint128) {
+        return TokenGas.TARGET_ROOT_BALANCE + TOKEN_FORWARD + gasValue(LP_ROOT_DEPLOY);
+    }
+
+    /// @notice What a vault deploy needs: the vault's reserve, its token wallet's deploy call, the forwarding of the codes,
+    /// the round of the deploy registry and the rest of the deploy
+    function deployVaultValue() internal returns (uint128) {
+        return VAULT_MIN_BALANCE + TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD + VAULT_FORWARD + REGISTRY_HOP_FORWARD +
+            gasValue(WALLET_DEPLOY + WALLET_DEPLOY_CALL + VAULT_DEPLOY + REGISTRY_HOP);
+    }
+
+    /// @notice What a pair deploy needs: the pair's reserve, its LP root, its LP wallet, the forwarding of the codes, the
+    /// round of the deploy registry and the rest of the deploy
+    function deployPairValue() internal returns (uint128) {
+        return PAIR_MIN_BALANCE + TokenGas.TARGET_ROOT_BALANCE + TokenGas.TARGET_WALLET_BALANCE + TOKEN_FORWARD +
+            WALLET_FORWARD + PAIR_FORWARD + REGISTRY_HOP_FORWARD +
+            gasValue(LP_ROOT_DEPLOY + WALLET_DEPLOY + WALLET_DEPLOY_CALL + PAIR_DEPLOY + REGISTRY_HOP);
+    }
+
+    function lpMintValue() internal returns (uint128) {
+        return gasValue(LP_MINT);
+    }
+
+    function retryMintMinValue() internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + gasValue(LP_MINT + WALLET_DEPLOY + RETRY_MINT);
+    }
+
+    function lpRootCallValue() internal returns (uint128) {
+        return gasValue(LP_ROOT_CALL);
+    }
+
+    function withdrawMinValue() internal returns (uint128) {
+        return gasValue(WITHDRAW);
+    }
+
+    function deployLpAccountValue() internal returns (uint128) {
+        return LP_ACCOUNT_MIN_BALANCE + LP_ACCOUNT_FORWARD + gasValue(LP_ACCOUNT_DEPLOY);
+    }
+
+    function claimMinValue() internal returns (uint128) {
+        return gasValue(CLAIM);
+    }
+
+    /// @notice The token surplus answer pays the transfer with a deploy of the recipient's wallet: refused below this,
+    /// not failed, since a failed answer would leave the withdrawal waiting for good
+    function surplusAnswerMinValue() internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD + gasValue(WALLET_DEPLOY + PAYOUT);
+    }
+
+    function surplusWithdrawMinValue() internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD + gasValue(WALLET_DEPLOY + PAYOUT + OPERATION);
+    }
+
+    function confirmValue() internal returns (uint128) {
+        return gasValue(CONFIRM);
+    }
+
+    function adminCallMinValue() internal returns (uint128) {
+        return gasValue(ADMIN_CALL);
+    }
+
+    /// @notice DexRoot.createOwnerToken: the root's call, the launchpad's reservation of the symbol (an admin call) and the
+    /// factory's token: its reserve, forwarding its code, its creation and the check of its name and symbol
+    function ownerTokenValue(string name, string symbol) internal returns (uint128) {
+        return gasValue(ADMIN_CALL + ADMIN_CALL + TOKEN_CREATE + tokenTextGas(name, symbol)) + TokenGas.TARGET_ROOT_BALANCE + TOKEN_FORWARD;
+    }
+
+    /// @notice DexRoot.setReservedSymbols of `count` symbols: the root's call and per symbol an entry at the launchpad and
+    /// one at the factory
+    function reservedSymbolsValue(uint256 count) internal returns (uint128) {
+        return gasValue(ADMIN_CALL + ADMIN_CALL + uint128(count) * 2 * LIST_ENTRY);
+    }
+
+    function lpAccountAnswerValue() internal returns (uint128) {
+        return gasValue(LP_ACCOUNT_ANSWER);
+    }
+
+    /// @notice The pair's part of a deposit (DexPair.addLiquidity): its work, two payouts of the excess and an LP mint with a wallet deploy
+    function lpDepositMinValue() internal returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD + gasValue(LP_ACCOUNT_SEND + WALLET_DEPLOY + VAULT_OPERATION + LP_ACCOUNT_ANSWER);
+    }
+
+    function lpAccountCancelMinValue() internal returns (uint128) {
+        return gasValue(LP_ACCOUNT_CANCEL);
+    }
+
+    /// @notice The deepest path of a vault operation: an LpAccount deploy and an LP mint with a wallet deploy, with the
+    /// forwarding of both codes
+    function vaultOperationMinValue() internal returns (uint128) {
+        return LP_ACCOUNT_MIN_BALANCE + LP_ACCOUNT_FORWARD + TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD +
+            gasValue(LP_ACCOUNT_DEPLOY + WALLET_DEPLOY + VAULT_OPERATION + LP_ACCOUNT_ANSWER);
+    }
+
+    /// @notice Gas a pair needs for its subtree of `pairs` pairs (itself included): every pair step, a vault hop to every
+    /// pair after it, stable math extra and every payout
+    function routeTreeGas(uint8 pairs, uint8 stablePairs, uint8 leaves) internal returns (uint128) {
+        return uint128(pairs) * ROUTE_STEP + uint128(pairs - 1) * ROUTE_HOP + uint128(stablePairs) * STABLE_STEP_EXTRA +
+            uint128(leaves) * ROUTE_PAYOUT;
+    }
+
+    /// @notice What a vault's platform must carry when its registry shard has answered: deployVaultValue without the
+    /// registry's round, at the gas price of the answer. A claim answered with less (the price rose since the request) is
+    /// refused, not deployed
+    function vaultPlatformValue() internal returns (uint128) {
+        return VAULT_MIN_BALANCE + VAULT_FORWARD + TokenGas.TARGET_WALLET_BALANCE + WALLET_FORWARD +
+            gasValue(VAULT_DEPLOY + WALLET_DEPLOY + WALLET_DEPLOY_CALL);
+    }
+
+    /// @notice The same for a pair: deployPairValue without the registry's round
+    function pairPlatformValue() internal returns (uint128) {
+        return PAIR_MIN_BALANCE + PAIR_FORWARD + TokenGas.TARGET_ROOT_BALANCE + TOKEN_FORWARD + TokenGas.TARGET_WALLET_BALANCE +
+            WALLET_FORWARD + gasValue(PAIR_DEPLOY + LP_ROOT_DEPLOY + WALLET_DEPLOY + WALLET_DEPLOY_CALL);
+    }
+
+    // TokenSymbol's check of a token's name and symbol, a byte of them: the dearest characters (two bytes in a block with
+    // forbidden code points) cost about 2 200 gas a byte, printable ASCII about 350
+    uint128 constant TOKEN_TEXT_BYTE = 2_500;
+    // LaunchParams' check of a token's description, a byte of it: two-byte letters cost about 1 490 gas a byte, ASCII
+    // about 670
+    uint128 constant TOKEN_DESCRIPTION_BYTE = 1_700;
+
+    /// @notice The gas of TokenSymbol's check of a name and a symbol
+    function tokenTextGas(string name, string symbol) internal returns (uint128) {
+        return (uint128(name.byteLength()) + symbol.byteLength()) * TOKEN_TEXT_BYTE;
+    }
+
+    /// @notice The gas of LaunchParams' check of a token's description
+    function descriptionGas(string description) internal returns (uint128) {
+        return uint128(description.byteLength()) * TOKEN_DESCRIPTION_BYTE;
+    }
+}

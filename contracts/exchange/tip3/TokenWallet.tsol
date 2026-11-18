@@ -1,0 +1,95 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./abstract/TokenWalletBurnableByRootBase.tsol";
+import "./abstract/TokenWalletBurnableBase.tsol";
+import "./abstract/TokenWalletDestroyableBase.tsol";
+
+import "./libraries/TokenErrors.tsol";
+import "./libraries/TokenGas.tsol";
+import "./Options.tsol";
+
+
+/**
+ * @title Fungible token wallet contract
+ * @notice TIP-3 TokenWallet of one holder, with burn, burn by root and destroy.
+ * Also answers jetton (TEP-74) messages.
+ *
+ * Transfers go directly from the sender's wallet to the receiver's wallet.
+ * All wallets of a token have the same code, so the receiver checks the sender
+ * by computing its address from the sender's owner.
+ */
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract TokenWallet is
+    TokenWalletBurnableBase,
+    TokenWalletBurnableByRootBase,
+    TokenWalletDestroyableBase
+{
+
+    /**
+     * @notice Creates the token wallet.
+     * @dev `root_` and `owner_` come from `StateInit`. The public key must be zero
+     * (the wallet is controlled only by its owner's messages) and `owner_` non-zero.
+    */
+    constructor() {
+        require(tvm.pubkey() == 0, TokenErrors.NON_ZERO_PUBLIC_KEY);
+        require(!owner_.isStdZero(), TokenErrors.WRONG_WALLET_OWNER);
+    }
+
+    /**
+     * @notice Returns whether the wallet implements `interfaceID` ({SID}).
+     */
+    function supportsInterface(uint32 interfaceID) internalMsg externalMsg override external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (
+            interfaceID == uint32(0x3204ec29) ||    // SID
+            interfaceID == uint32(0x4f479fa3) ||    // TIP3TokenWallet
+            interfaceID == uint32(0x2a4ac43e) ||    // TokenWallet
+            interfaceID == uint32(0x562548ad) ||    // BurnableTokenWallet
+            interfaceID == uint32(0x0c2ff20d) ||    // BurnableByRootTokenWallet
+            interfaceID == uint32(0x0f0258aa) ||    // Destroyable
+            interfaceID == uint32(0x41583c00)       // JettonWallet
+        );
+    }
+
+    /**
+     * @dev See {TokenWalletBase-_targetBalance}.
+     */
+    function _targetBalance() override internal pure returns (uint128) {
+        return TokenGas.TARGET_WALLET_BALANCE * Options.STORAGE_FEE_K;
+    }
+
+    /**
+     * @dev See {TokenWalletBase-_buildWalletInitData}. Used to deploy wallets and to
+     * check that an incoming transfer comes from a wallet of the same token: the same
+     * `root_`, the given `owner_`, public key 0 and this wallet's code.
+     */
+    function _buildWalletInitData(address walletOwner) override internal view returns (TvmCell) {
+        return abi.encodeStateInit({
+            contr: TokenWallet,
+            varInit: {
+                root_: root_,
+                owner_: walletOwner
+            },
+            pubkey: 0,
+            code: tvm.code()
+        });
+    }
+
+    /**
+     * @dev See {TokenWalletBase-_deployWallet}. Deploys a {TokenWallet} in this wallet's workchain.
+     */
+    function _deployWallet(TvmCell initData, uint128 deployWalletValue, address)
+        override
+        internal
+        view
+        returns (address)
+    {
+        address wallet = new TokenWallet {
+            stateInit: initData,
+            value: varuint16(deployWalletValue),
+            wid: address(this).wid,
+            flag: MsgFlag.SENDER_PAYS_FEES
+        }();
+        return wallet;
+    }
+}

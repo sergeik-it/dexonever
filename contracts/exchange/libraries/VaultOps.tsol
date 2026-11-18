@@ -1,0 +1,61 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./DexConstants.tsol";
+/// The pair's entry points for an operation a vault forwards
+interface IDexPairVaultOperation {
+    function onVaultDeposit(uint64 opId, address sender, uint128 amount, TvmCell payload) external;
+    function onVaultExchange(uint64 opId, address sender, uint128 amount, TvmCell payload) external;
+    function onVaultLpDeposit(uint64 opId, address sender, uint128 amount, TvmCell payload) external;
+}
+
+/// The pair's answer to a payout it ordered: the vault took it over
+interface IDexPairPayoutTaken {
+    function onPayoutTaken(uint64 opId) external;
+}
+
+/// @title VaultOps - operations a vault forwards to a pair, and the journal entry kept for each of them
+library VaultOps {
+
+
+    /// @notice Which pair the operation is for: the vault computes its address the same way the root does,
+    /// so a payload cannot send the tokens to an arbitrary contract
+    struct PairRef {
+        address tokenA;
+        address tokenB;
+        bool isStable;
+    }
+
+    /// @notice An operation sent to a pair and not confirmed yet: a bounce of it returns `amount` to `sender`
+    struct PendingOp {
+        address sender;
+        uint128 amount;
+        address pair;
+    }
+
+    /// @notice A payload from a user as a slice. An exotic cell (a library cell, a proof) throws on toSlice, and a wallet
+    /// notification does not bounce: the tokens or LP would stay with the receiver unaccounted. Here it gives its own
+    /// data, which never has a payload layout (library 264 bits, pruned branch 16 + 272·k, proof 280 bits and a ref,
+    /// update 552 bits and two refs), so the layout check refuses it and the tokens go back
+    function payloadSlice(TvmCell cell) internal returns (TvmSlice s) {
+        (s, ) = cell.exoticToSlice();
+    }
+
+    function parsePairRef(TvmCell cell) internal returns (bool ok, PairRef ref) {
+        // exactly the expected layout without refs, both tokens standard addresses without anycast (tag 100):
+        // anything else would make the loads misread or throw after the vault took the tokens
+        TvmSlice s = payloadSlice(cell);
+        if (s.bits() != DexConstants.PAIR_REF_BITS || s.refs() != 0 || s.preloadUint(3) != DexConstants.STD_ADDRESS_TAG) {
+            return (false, ref);
+        }
+        ref.tokenA = s.load(address);
+        if (s.preloadUint(3) != DexConstants.STD_ADDRESS_TAG) {
+            return (false, ref);
+        }
+        (ref.tokenB, ref.isStable) = s.load(address, bool);
+        return (true, ref);
+    }
+
+    function isKnownOp(uint8 op) internal returns (bool) {
+        return op == DexConstants.VAULT_OP_SWAP || op == DexConstants.VAULT_OP_DEPOSIT || op == DexConstants.VAULT_OP_LP_DEPOSIT;
+    }
+}

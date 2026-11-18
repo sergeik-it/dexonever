@@ -1,0 +1,690 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/VaultOps.tsol";
+import "./libraries/Upgrade.tsol";
+import "./libraries/Hubs.tsol";
+import "./tip3/interfaces/ITokenRoot.tsol";
+import "./tip3/interfaces/ITokenWallet.tsol";
+import "./tip3/interfaces/IAcceptTokensTransferCallback.tsol";
+import "./tip3/interfaces/IBounceTokensTransferCallback.tsol";
+import "./DexPlatform.tsol";
+import "./VaultJournal.tsol";
+import "./EverSurplus.tsol";
+
+/// @title DexTokenVault - TIP-3 token custody contract
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DexTokenVault is VaultJournal, EverSurplus, IAcceptTokensTransferCallback, IBounceTokensTransferCallback {
+
+    address public root;
+    address public tokenRoot;
+    address public tokenWallet;
+    TvmCell public platformCode;
+    // the event hub this vault rings (DexHub): from the root, the platform code and the vault's own address, so it is not
+    // in the state the vault packs for a new code — the new code computes it again
+    address public hub;
+    uint32 public version;
+
+    bool public paused;
+    bool public frozen;
+    // The upgrader's own stop for a move to a code with other messages: it stops what the
+    // freeze stops, so a step of an operation begun on the old code is refused, not run by the new one. Apart from
+    // `frozen`: the upgrader never lifts the freeze of the owner or the manager. Lifted by the upgrader or the owner
+    bool public upgrading;
+    // While stopped (frozen or upgrading), the owner may let users take their funds out: payouts go out instead of into
+    // unclaimed, claimFor and claimBounced work; new operations and the owner's withdrawals stay stopped. Cleared once
+    // neither stop is left
+    bool public withdrawalsAllowed;
+
+    // Payouts that came while the vault was frozen, claimable by their recipients after the unfreeze
+    mapping(address => uint128) unclaimed;
+
+    // Payouts that bounced because the recipient had no token wallet yet, by that wallet's address.
+    // The address comes from the vault's own wallet (the token root derived it), so it is the recipient's.
+    mapping(address => uint128) bouncedByWallet;
+
+    // Tokens the vault owes: every notified transfer in and every bounce back adds, every transfer out subtracts.
+    // What the wallet holds above it came without a notification (surplus tokens) and belongs to nobody: the
+    // owner may withdraw it (announceTokenSurplus, then withdrawTokenSurplus not before DexConstants.OWNER_WITHDRAWAL_DELAY)
+    uint128 accounted;
+
+    // Token surplus withdrawal announced by the owner: `reason` goes to the events for the exchange's log
+    struct TokenSurplusRequest {
+        uint128 amount;
+        address recipient;
+        string reason;
+        uint32 readyAt;
+    }
+    optional(TokenSurplusRequest) surplusRequest;
+    // The wallet's balance was asked for the request and the answer has not come yet; tokens the vault sent out
+    // since then are not off that balance yet (vault → wallet messages arrive in order) and are counted apart
+    bool surplusQuerying;
+    uint128 sentSinceQuery;
+    address surplusGasTo;
+    // when the balance was asked; the question waits for its own answer or bounce without a deadline: an
+    // answer delayed past a deadline would be taken for a new question's, with what was sent since it uncounted
+    uint32 surplusQueriedAt;
+
+
+    /// A payout of a frozen vault is kept: `amount` — all that waits for `owner` now
+    event Unclaimed(address owner, uint128 amount);
+    event Claimed(address owner, uint128 amount);
+    event VaultStatus(bool paused, bool frozen);
+    /// The upgrader stopped the vault for a move to a new code, or the stop was lifted
+    event UpgradeStatus(bool upgrading);
+    /// The owner let users take their funds out of the frozen vault (payouts, unclaimed and bounced claims) or took
+    /// it back; the unfreeze takes it back by itself
+    event WithdrawalsAllowed(bool allowed);
+    /// A transfer to a recipient without a token wallet bounced: `amount` — all that waits for `wallet` now
+    event PayoutBounced(address wallet, uint128 amount);
+    event BouncedClaimed(address wallet, uint128 amount);
+    // a command to the contract's own wallet that it refused (a failure of its own, for example too little gas after a rise
+    // of the network's prices) comes back: the tokens never left, and what was owed stays owed —
+    // not a surplus of the owner. Whom it was owed to the bounce does not tell (256 bits): the debt waits for a new code
+    event SendBounced(uint128 amount);
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+    /// The owner announced a withdrawal of tokens that came without a notification: it runs between readyAt and expiresAt
+    event TokenSurplusAnnounced(uint128 amount, address recipient, string reason, uint32 readyAt, uint32 expiresAt);
+    event TokenSurplusWithdrawn(uint128 amount, address recipient, string reason);
+    /// The withdrawal was asked for more than the surplus (`surplus` — what there was): nothing left the vault
+    event TokenSurplusRefused(uint128 amount, uint128 surplus);
+    event TokenSurplusCancelled(uint128 amount, address recipient);
+
+    modifier onlyRoot() {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice Only the root: moves the vault to its installed code: only a newer version; the state goes over as a
+    /// whole (Upgrade.tsol). Only a stopped vault moves (DexRoot.setVaultsUpgrading), so no
+    /// step begun on the old code meets the new one. An older or equal version or a vault not stopped is refused, the gas goes back
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external onlyRoot {
+        if (newVersion <= version || !upgrading) {
+            _returnExcess(sendGasTo);
+            return;
+        }
+        TvmCell surplus = abi.encode(accounted, surplusRequest, surplusQuerying, sentSinceQuery, surplusGasTo, everSurplusRequest, surplusQueriedAt);
+        TvmCell state = abi.encode(
+            root, tokenRoot, tokenWallet, platformCode, paused, frozen, upgrading, withdrawalsAllowed,
+            unclaimed, bouncedByWallet, nextOpId, pendingCount, pendingOps, surplus
+        );
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(_stateLayout(), version, newVersion, sendGasTo, state));
+    }
+
+    /// @notice Layout of the state this code packs for its next code (Upgrade.tsol)
+    function _stateLayout() internal pure virtual returns (uint16) {
+        return DexConstants.TOKEN_VAULT_STATE_LAYOUT;
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // the only layout so far; a code that changes the layout unpacks this one too
+        require(layout == DexConstants.TOKEN_VAULT_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        TvmCell surplus;
+        (
+            root, tokenRoot, tokenWallet, platformCode, paused, frozen, upgrading, withdrawalsAllowed,
+            unclaimed, bouncedByWallet, nextOpId, pendingCount, pendingOps, surplus
+        ) = abi.decode(state, (
+            address, address, address, TvmCell, bool, bool, bool, bool,
+            mapping(address => uint128), mapping(address => uint128), uint64, uint32, mapping(uint64 => VaultOps.PendingOp), TvmCell
+        ));
+        (accounted, surplusRequest, surplusQuerying, sentSinceQuery, surplusGasTo, everSurplusRequest, surplusQueriedAt) =
+            abi.decode(surplus, (uint128, optional(TokenSurplusRequest), bool, uint128, address, optional(EverSurplusRequest), uint32));
+        version = newVersion;
+        hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_VAULT, address(this));
+        emit CodeUpgraded(oldVersion, version);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice A bell at the vault's event hub in every transaction that emits an event (EventBell)
+    function _ring() internal override {
+        Hubs.ring(hub);
+    }
+
+    /// @notice Initialize from DexPlatform, or take over the state of the previous code (upgrade)
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        root = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        address sendGasTo = s.load(address);
+        platformCode = s.loadRef();
+        hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_VAULT, address(this));
+
+        TvmSlice params = s.loadRef().toSlice();
+        tokenRoot = params.load(address);
+
+        _requestTokenWallet();
+
+        tvm.rawReserve(varuint16(DexGas.VAULT_MIN_BALANCE), 0);
+        sendGasTo.transfer({
+            value: varuint16(0),
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /// @notice The address of the pair of `tokenA` and `tokenB` (the root's platform), used to authenticate pairs
+    function computePairAddress(
+        address tokenA,
+        address tokenB,
+        bool _isStable
+    ) public view returns (address) {
+        (address left, address right) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+
+        TvmBuilder b;
+        b.store(left);
+        b.store(right);
+        b.store(_isStable);
+
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: {
+                root: root,
+                type_id: DexConstants.PLATFORM_TYPE_PAIR,
+                params: b.toCell()
+            },
+            code: platformCode
+        });
+        return address(tvm.hash(stateInit));
+    }
+
+    /// @notice The vault deploys its own token wallet; the address arrives in onTokenWallet from the token root only
+    function _requestTokenWallet() private view {
+        ITokenRoot(tokenRoot).deployWallet{
+            value: varuint16(DexGas.deployWalletCallValue()),
+            flag: 0,
+            bounce: false,
+            callback: DexTokenVault.onTokenWallet
+        }(address(this), DexGas.deployWalletValue());
+    }
+
+    /// @notice Repeats the wallet request while the vault has none: a vault deployed before its token root
+    /// existed got no answer. Anyone may call it and pays the request; the rest of the value returns.
+    function requestWallet() external view {
+        require(tokenWallet.isNone(), DexErrors.ALREADY_DEPLOYED);
+        require(msg.value >= DexGas.deployWalletCallValue() + DexGas.operationGas(), DexErrors.NOT_ENOUGH_GAS);
+        _reserveOwnBalance();
+        _requestTokenWallet();
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Only the token root, once: its answer to deployWallet with the vault's own token wallet
+    function onTokenWallet(address wallet) external {
+        require(msg.sender == tokenRoot, DexErrors.NOT_AUTHORIZED);
+        require(tokenWallet.isNone(), DexErrors.NOT_AUTHORIZED);
+        tokenWallet = wallet;
+    }
+
+    /// @notice The vault's token wallet, none until the token root answered. The vault takes a notification only from
+    /// that wallet, so a contract that sends tokens on its own schedule (a launchpad curve) asks this first
+    function tokenWalletOf() external view responsible returns (address) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } tokenWallet;
+    }
+
+    /// @notice Only the vault's token wallet: incoming tokens with an operation payload (swap, deposit, LP deposit)
+    function onAcceptTokensTransfer(
+        address /* _tokenRoot */,
+        uint128 amount,
+        address sender,
+        address /* senderWallet */,
+        address remainingGasTo,
+        TvmCell payload
+    ) external override {
+        require(msg.sender == tokenWallet, DexErrors.NOT_AUTHORIZED);
+        // A wallet notification does not bounce: after the sender check every refusal returns the tokens
+        _reserveOwnBalance();
+        accounted += amount;
+
+        // payload: exactly uint8 op, ref PairRef, ref operation payload
+        TvmSlice s = VaultOps.payloadSlice(payload);
+        bool wellFormed = s.bits() == DexConstants.VAULT_PAYLOAD_BITS && s.refs() == DexConstants.VAULT_PAYLOAD_REFS;
+        if (paused || _stopped() || !wellFormed || msg.value < DexGas.vaultOperationMinValue()) {
+            returnTokens(amount, sender, remainingGasTo);
+            return;
+        }
+        uint8 op = s.load(uint8);
+        (bool refOk, VaultOps.PairRef ref) = VaultOps.parsePairRef(s.loadRef());
+        TvmCell opPayload = s.loadRef();
+        bool ours = refOk && (ref.tokenA == tokenRoot || ref.tokenB == tokenRoot);
+        if (!ours || !VaultOps.isKnownOp(op)) {
+            returnTokens(amount, sender, remainingGasTo);
+            return;
+        }
+
+        _sendOperation(op, sender, amount, computePairAddress(ref.tokenA, ref.tokenB, ref.isStable), opPayload);
+    }
+
+    /// @notice Only the previous pair: a step of a swap route; the pair (this token, prevOther, prevStable) gave `amount` of this token
+    /// (already here) for the route's `sender` and hands the next step over; it goes to its pair like a user swap,
+    /// journalled and refunded on a bounce. A refused step (paused or frozen vault, wrong pair reference) pays the
+    /// amount to the sender, kept in unclaimed if the vault is frozen
+    function routeSwap(
+        uint128 amount,
+        address sender,
+        address prevOther,
+        bool prevStable,
+        TvmCell pairRef,
+        TvmCell routePayload
+    ) external {
+        require(msg.sender == computePairAddress(tokenRoot, prevOther, prevStable), DexErrors.NOT_AUTHORIZED);
+        _reserveOwnBalance();
+        (bool refOk, VaultOps.PairRef ref) = VaultOps.parsePairRef(pairRef);
+        bool ours = refOk && (ref.tokenA == tokenRoot || ref.tokenB == tokenRoot);
+        if (amount == 0) {
+            sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        if (paused || _stopped() || !ours) {
+            _payTo(sender, amount);
+            return;
+        }
+        _sendOperation(DexConstants.VAULT_OP_SWAP, sender, amount, computePairAddress(ref.tokenA, ref.tokenB, ref.isStable), routePayload);
+    }
+
+    /// @notice The journal's hooks (VaultJournal): the vault keeps its own balance, a bounced operation's tokens
+    /// go back to its sender
+    function _reserveOwnFunds() internal override {
+        _reserveOwnBalance();
+    }
+
+    function _refundBounced(VaultOps.PendingOp pending) internal override {
+        _reserveOwnBalance();
+        _sendTokens(pending.amount, pending.sender, pending.sender);
+    }
+
+    /// @notice Payout by a command of the pair (tokenA, tokenB, isStable): only that pair may call it. The vault answers the
+    /// pair that it took the payout over; a refusal bounces to the pair, which keeps the amount
+    /// for the recipient
+    function payout(
+        uint64 opId,
+        address recipient,
+        uint128 amount,
+        address tokenA,
+        address tokenB,
+        bool _isStable
+    ) external {
+        address expected = computePairAddress(tokenA, tokenB, _isStable);
+        // a pair pays out only the tokens it holds: a defect of a future pair code cannot reach other vaults
+        require(msg.sender == expected && (tokenRoot == tokenA || tokenRoot == tokenB), DexErrors.NOT_AUTHORIZED);
+        _reserveOwnBalance();
+        IDexPairPayoutTaken(msg.sender).onPayoutTaken{ value: varuint16(DexGas.confirmValue()), flag: 0, bounce: false }(opId);
+        _payTo(recipient, amount);
+    }
+
+    /// @notice Pays `amount` to `recipient` with all gas left after the reserve. A frozen vault pays nothing out:
+    /// the pair has already taken the amount off its reserves, so it is kept for the recipient and claimed after
+    /// the unfreeze
+    function _payTo(address recipient, uint128 amount) private {
+        if (_withdrawalsBlocked()) {
+            unclaimed[recipient] += amount;
+            emit Unclaimed(recipient, unclaimed[recipient]);
+            _ring();
+            recipient.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        _sendTokens(amount, recipient, recipient);
+    }
+
+    /// @notice Pays out tokens kept for `owner` while the vault was frozen. Anyone may call it and pays the
+    /// gas (a contract owner may be unable to call); the tokens can only go to `owner`.
+    function claimFor(address owner) external {
+        require(!_withdrawalsBlocked(), DexErrors.FROZEN);
+        uint128 amount = unclaimed[owner];
+        require(amount > 0, DexErrors.INVALID_AMOUNT);
+        require(msg.value >= DexGas.claimMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        delete unclaimed[owner];
+        emit Claimed(owner, amount);
+        _reserveOwnBalance();
+        _ring();
+        _sendTokens(amount, owner, msg.sender);
+    }
+
+    /// @notice Only the vault's token wallet: a transfer from it bounced (the recipient's wallet does not exist):
+    /// the tokens are back on the vault's wallet and are kept for that recipient wallet
+    function onBounceTokensTransfer(
+        address /* tokenRoot */,
+        uint128 amount,
+        address revertedFrom
+    ) external override {
+        require(msg.sender == tokenWallet, DexErrors.NOT_AUTHORIZED);
+        accounted += amount;
+        bouncedByWallet[revertedFrom] += amount;
+        emit PayoutBounced(revertedFrom, bouncedByWallet[revertedFrom]);
+        _ring();
+    }
+
+    /// @notice Sends bounced tokens straight to the recipient's wallet once it exists. Anyone may call it
+    /// and pays the gas; the tokens can only go to that wallet. If it still does not exist, the transfer
+    /// bounces again and the amount is kept again. A frozen vault pays nothing out, as in claimFor.
+    function claimBounced(address wallet) external {
+        require(!_withdrawalsBlocked(), DexErrors.FROZEN);
+        uint128 amount = bouncedByWallet[wallet];
+        require(amount > 0, DexErrors.INVALID_AMOUNT);
+        require(msg.value >= DexGas.claimMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        delete bouncedByWallet[wallet];
+        emit BouncedClaimed(wallet, amount);
+        _reserveOwnBalance();
+        _ring();
+        _countSent(amount);
+        TvmCell empty;
+        ITokenWallet(tokenWallet).transferToWallet{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: true
+        }(amount, wallet, msg.sender, false, empty);
+    }
+
+    /// @notice Tokens kept for the recipient wallet `wallet` after a bounced transfer; anyone may call
+    function getBounced(address wallet) internalMsg externalMsg external view returns (uint128) {
+        return bouncedByWallet[wallet];
+    }
+
+    /// @notice Tokens kept for `owner` while the vault was frozen; anyone may call
+    function getUnclaimed(address owner) internalMsg externalMsg external view returns (uint128) {
+        return unclaimed[owner];
+    }
+
+    /// @notice Keeps the vault's own balance (at least VAULT_MIN_BALANCE) out of the outgoing gas
+    function _reserveOwnBalance() internal pure {
+        tvm.rawReserve(
+            math.max(varuint16(DexGas.VAULT_MIN_BALANCE), address(this).balance - msg.value),
+            2
+        );
+    }
+
+    /// @notice Helper to return tokens on error
+    function returnTokens(uint128 amount, address recipient, address remainingGasTo) internal {
+        _sendTokens(amount, recipient, remainingGasTo);
+    }
+
+    /// @notice Tokens leave the vault's books: they are off the wallet once it sends them
+    function _countSent(uint128 amount) internal {
+        accounted -= amount;
+        if (surplusQuerying) {
+            sentSinceQuery += amount;
+        }
+    }
+
+    /// @notice Sends owed tokens from the vault's wallet with all gas left after the vault's reserve
+    /// With much gas the transfer carries only tokenSendValue and the rest goes to remainingGasTo at once: a transfer that
+    /// bounces (no wallet of the recipient) brings its gas back into this vault, which keeps it, so a bounce consumes at
+    /// most that. With little gas — all of it to the transfer: a fixed value would come out of the vault's own reserve
+    function _sendTokens(uint128 amount, address recipient, address remainingGasTo) internal {
+        _countSent(amount);
+        TvmBuilder b;
+        TvmCell emptyCell = b.toCell();
+
+        uint128 carried = DexGas.tokenSendValue();
+        bool split = msg.value >= 2 * carried;
+        ITokenWallet(tokenWallet).transfer{
+            value: varuint16(split ? carried : 0),
+            flag: split ? 0 : MsgFlag.ALL_NOT_RESERVED,
+            bounce: true
+        }(
+            amount,
+            recipient,
+            0,
+            remainingGasTo,
+            false,
+            emptyCell
+        );
+        if (split) {
+            remainingGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+        }
+    }
+
+    /// @notice Only the root: pauses or resumes new operations. Admin calls from the root: the gas left goes back to
+    /// the caller (sendGasTo)
+    function setPaused(bool _paused, address sendGasTo) external onlyRoot {
+        paused = _paused;
+        emit VaultStatus(paused, frozen);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Only the root: freezes or unfreezes the vault (operations and payouts stop)
+    function setFrozen(bool _frozen, address sendGasTo) external onlyRoot {
+        frozen = _frozen;
+        emit VaultStatus(paused, frozen);
+        _ring();
+        _dropWithdrawalsIfRunning();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Only the root: sets or lifts the upgrade stop. The upgrade stop starts with withdrawals stopped, even those the owner let out under a freeze: steps of a
+    /// withdrawal must not cross to the new code. The owner may let them out again knowingly
+    function setUpgrading(bool _upgrading, address sendGasTo) external onlyRoot {
+        upgrading = _upgrading;
+        emit UpgradeStatus(upgrading);
+        _ring();
+        if (_upgrading) {
+            _dropWithdrawals();
+        } else {
+            _dropWithdrawalsIfRunning();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Frozen or stopped for an upgrade: everything stops, withdrawals and payouts included
+    function _stopped() private view returns (bool) {
+        return frozen || upgrading;
+    }
+
+    /// @notice Once neither stop is left, the allowed withdrawals go: the next stop starts with them stopped
+    function _dropWithdrawalsIfRunning() private {
+        if (!_stopped()) {
+            _dropWithdrawals();
+        }
+    }
+
+    function _dropWithdrawals() private {
+        if (withdrawalsAllowed) {
+            withdrawalsAllowed = false;
+            emit WithdrawalsAllowed(false);
+            _ring();
+        }
+    }
+
+    /// @notice Only the root: users' withdrawals from a stopped vault, allowed or taken back by the owner. Allowing them for a vault
+    /// that is not stopped is refused (they work anyway, and the flag would outlive no stop)
+    function setWithdrawalsAllowed(bool allowed, address sendGasTo) external onlyRoot {
+        if (!allowed || _stopped()) {
+            withdrawalsAllowed = allowed;
+            emit WithdrawalsAllowed(allowed);
+            _ring();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Users' funds stay in: stopped, and the owner did not let them out
+    function _withdrawalsBlocked() private view returns (bool) {
+        return _stopped() && !withdrawalsAllowed;
+    }
+
+    /// @notice EVER of the vault above VAULT_MIN_BALANCE (gas of bounced payouts settles here) belong to nobody:
+    /// the owner withdraws them announced (EverSurplus); the tokens are not touched. Only the root
+    function announceEverSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external onlyRoot {
+        _announceEverSurplus(amount, recipient, reason, sendGasTo);
+    }
+
+    /// @notice Only the root: cancels the announced EVER surplus withdrawal
+    function cancelEverSurplus(address sendGasTo) external onlyRoot {
+        _cancelEverSurplus(sendGasTo);
+    }
+
+    /// @notice Only the root: runs the announced EVER surplus withdrawal once its delay passed
+    function withdrawEverSurplus(address sendGasTo) external onlyRoot {
+        _withdrawEverSurplus(sendGasTo);
+    }
+
+    function _everKept() internal view override returns (uint128) {
+        return DexGas.VAULT_MIN_BALANCE;
+    }
+
+    function _everSurplusFrozen() internal view override returns (bool) {
+        return _stopped();
+    }
+
+    /// @notice Only the root, for the owner: announces a withdrawal of the token surplus (tokens that came without a notification):
+    /// `amount` to `recipient`, not before DexConstants.OWNER_WITHDRAWAL_DELAY and not after DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW past that. A new
+    /// announcement replaces the previous one. A recipient outside the basechain, a zero amount, a reason longer than
+    /// DexConstants.OWNER_WITHDRAWAL_MAX_REASON_BYTES or an announcement while the balance is being asked are refused, the gas goes back
+    function announceTokenSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external onlyRoot {
+        if (amount == 0 || !OwnerWithdrawal.validTarget(recipient, reason) || surplusQuerying) {
+            _returnExcess(sendGasTo);
+            return;
+        }
+        _cancelTokenSurplus();
+        uint32 readyAt = uint32(block.timestamp) + DexConstants.OWNER_WITHDRAWAL_DELAY;
+        surplusRequest = TokenSurplusRequest(amount, recipient, reason, readyAt);
+        emit TokenSurplusAnnounced(amount, recipient, reason, readyAt, readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Only the root: cancels the announced token surplus withdrawal
+    function cancelTokenSurplus(address sendGasTo) external onlyRoot {
+        if (!surplusQuerying) {
+            _cancelTokenSurplus();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    function _cancelTokenSurplus() private {
+        if (surplusRequest.hasValue()) {
+            emit TokenSurplusCancelled(surplusRequest.get().amount, surplusRequest.get().recipient);
+            _ring();
+            delete surplusRequest;
+        }
+    }
+
+    /// @notice Only the root: runs the announced token surplus withdrawal: asks the wallet for its balance, the answer decides (onSurplusBalance).
+    /// Refused while frozen, outside the window, while an answer is awaited or with less than SURPLUS_WITHDRAW_MIN_VALUE;
+    /// the gas goes back
+    function withdrawTokenSurplus(address sendGasTo) external onlyRoot {
+        uint32 nowTime = uint32(block.timestamp);
+        bool ready = surplusRequest.hasValue() && nowTime >= surplusRequest.get().readyAt &&
+            nowTime <= surplusRequest.get().readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW;
+        if (!ready || _stopped() || surplusQuerying || tokenWallet.isNone() || msg.value < DexGas.surplusWithdrawMinValue()) {
+            _returnExcess(sendGasTo);
+            return;
+        }
+        _beginSurplusQuery(sendGasTo);
+        _reserveOwnBalance();
+        ITokenWallet(tokenWallet).balance{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true, callback: DexTokenVault.onSurplusBalance }();
+    }
+
+    function _beginSurplusQuery(address sendGasTo) internal {
+        surplusQueriedAt = uint32(block.timestamp);
+        surplusQuerying = true;
+        sentSinceQuery = 0;
+        surplusGasTo = sendGasTo;
+    }
+
+    /// @notice Only the vault's token wallet, while asked: its balance for the announced withdrawal. The surplus is the balance less what the vault owes
+    /// and less what it sent out after the question (not off this balance yet): the withdrawal leaves only within it
+    function onSurplusBalance(uint128 balance) external {
+        require(msg.sender == tokenWallet && surplusQuerying, DexErrors.NOT_AUTHORIZED);
+        surplusQuerying = false;
+        address gasTo = surplusGasTo;
+        uint128 owed = accounted + sentSinceQuery;
+        uint128 surplus = balance > owed ? balance - owed : 0;
+        _reserveOwnBalance();
+        TokenSurplusRequest request = surplusRequest.get();
+        // too little gas for the transfer with a wallet deploy: refused, so the answer itself never fails
+        if (_stopped() || request.amount > surplus || msg.value < DexGas.surplusAnswerMinValue()) {
+            emit TokenSurplusRefused(request.amount, surplus);
+            _ring();
+            gasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        delete surplusRequest;
+        emit TokenSurplusWithdrawn(request.amount, request.recipient, request.reason);
+        _ring();
+        // not owed to anyone, so not off `accounted`; the recipient's wallet is deployed if it has none
+        TvmCell empty;
+        ITokenWallet(tokenWallet).transfer{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(
+            request.amount, request.recipient, DexGas.deployWalletValue(), gasTo, false, empty
+        );
+    }
+
+    /// @notice The balance question bounced: the withdrawal can be run again. A transfer of owed tokens the vault's own
+    /// wallet refused: the tokens are owed again (SendBounced)
+    function _onOtherBounce(uint32 functionId, TvmSlice body) internal override {
+        bool sent = functionId == abi.functionId(ITokenWallet.transfer) || functionId == abi.functionId(ITokenWallet.transferToWallet);
+        if (sent && msg.sender == tokenWallet) {
+            uint128 amount = body.load(uint128);
+            accounted += amount;
+            emit SendBounced(amount);
+            _ring();
+            return;
+        }
+        if (functionId == abi.functionId(TIP3TokenWallet.balance) && surplusQuerying) {
+            surplusQuerying = false;
+            _reserveOwnBalance();
+            surplusGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+        }
+    }
+
+    /// @notice Tokens the vault owes and the announced surplus withdrawal; anyone may call
+    function getTokenSurplus() internalMsg externalMsg external view returns (
+        uint128 _accounted,
+        bool _announced,
+        uint128 _amount,
+        address _recipient,
+        string _reason,
+        uint32 _readyAt,
+        uint32 _expiresAt,
+        bool _querying
+    ) {
+        _accounted = accounted;
+        _querying = surplusQuerying;
+        if (surplusRequest.hasValue()) {
+            TokenSurplusRequest r = surplusRequest.get();
+            return (accounted, true, r.amount, r.recipient, r.reason, r.readyAt, r.readyAt + DexConstants.OWNER_WITHDRAWAL_APPLY_WINDOW, surplusQuerying);
+        }
+    }
+
+    function _returnExcess(address to) private pure {
+        _reserveOwnBalance();
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The vault's data: root, token root, token wallet, version, active (not paused) and stopped; anyone may call
+    function getVaultData() internalMsg externalMsg external view returns (
+        address _root,
+        address _tokenRoot,
+        address _tokenWallet,
+        uint32 _version,
+        bool _active,
+        bool _frozen
+    ) {
+        return (root, tokenRoot, tokenWallet, version, !paused, _stopped());
+    }
+
+    /// @notice The vault's state: root, token root, token wallet, version, paused and stopped; anyone may call
+    function getDetails() internalMsg externalMsg external view returns (
+        address _root,
+        address _tokenRoot,
+        address _tokenWallet,
+        uint32 _version,
+        bool _paused,
+        bool _frozen
+    ) {
+        return (root, tokenRoot, tokenWallet, version, paused, _stopped());
+    }
+}

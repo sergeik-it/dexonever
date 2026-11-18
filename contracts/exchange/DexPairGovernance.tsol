@@ -1,0 +1,207 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/PairQuotes.tsol";
+import "./structures/IFeeParams.tsol";
+import "./structures/StableStructures.tsol";
+import "./structures/IDexPairEvents.tsol";
+import "./DexPairLpToken.tsol";
+
+/// @title DexPairGovernance - what the root governs in a pair: pause and freeze, the fee with its timelock and
+/// window, and the smooth change of A of a stable pair
+abstract contract DexPairGovernance is DexPairLpToken, IDexPairEvents {
+
+    address public root;
+
+    // Fees
+    IFeeParams.FeeParams public fee;
+    // A fee change waits DexConstants.PAIR_FEE_CHANGE_DELAY after the proposal
+    uint128 pendingPoolNumerator;
+    uint128 pendingBeneficiaryNumerator;
+    uint32 pendingFeeAvailableAt;
+
+    // StableSwap: decimals and A are set by the root owner at the deploy and are not part of the address
+    bool public isStable;
+    StableStructures.StableConfig stable;
+    optional(StableStructures.PendingAmplification) pendingA;
+
+    // Admin & Emergency
+    bool public paused;
+    bool public frozen;
+    // The upgrader's own stop for a move to a code with other messages: it stops what the
+    // freeze stops, so a step of an operation begun on the old code is refused, not run by the new one. Apart from
+    // `frozen`: the upgrader never lifts the freeze of the owner or the manager. Lifted by the upgrader or the owner
+    bool public upgrading;
+    // While stopped (frozen or upgrading), the owner may let users take their funds out (DexPair: withdrawals of
+    // liquidity, claimUnpaid); swaps, deposits and the beneficiary stay stopped. Cleared once neither stop is left
+    bool public withdrawalsAllowed;
+
+    modifier onlyRoot() {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    // Admin calls come from the root with the caller's gas. A refused call changes nothing and does not throw:
+    // either way the gas left goes back to the caller (sendGasTo), as the pair's other refusals
+
+    /// @notice Pauses or resumes the pair. Only the root
+    function setPaused(bool _paused, address sendGasTo) external onlyRoot {
+        paused = _paused;
+        emit PairStatus(paused, frozen);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Freezes or unfreezes the pair; allowed withdrawals are taken back once neither stop is left. Only the root
+    function setFrozen(bool _frozen, address sendGasTo) external onlyRoot {
+        frozen = _frozen;
+        emit PairStatus(paused, frozen);
+        _ring();
+        _dropWithdrawalsIfRunning();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Sets or lifts the upgrade stop. It starts with withdrawals stopped, even those the owner let out under a freeze: steps of a
+    /// withdrawal must not cross to the new code. The owner may let them out again knowingly. Only the root
+    function setUpgrading(bool _upgrading, address sendGasTo) external onlyRoot {
+        upgrading = _upgrading;
+        emit UpgradeStatus(upgrading);
+        _ring();
+        if (_upgrading) {
+            _dropWithdrawals();
+        } else {
+            _dropWithdrawalsIfRunning();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Frozen or stopped for an upgrade: everything stops, withdrawals and payouts included
+    function _stopped() internal view returns (bool) {
+        return frozen || upgrading;
+    }
+
+    /// @notice Once neither stop is left, the allowed withdrawals go: the next stop starts with them stopped
+    function _dropWithdrawalsIfRunning() private {
+        if (!_stopped()) {
+            _dropWithdrawals();
+        }
+    }
+
+    function _dropWithdrawals() private {
+        if (withdrawalsAllowed) {
+            withdrawalsAllowed = false;
+            emit WithdrawalsAllowed(false);
+            _ring();
+        }
+    }
+
+    /// @notice Users' withdrawals from a stopped pair, allowed or taken back by the owner. Allowing them for a pair that
+    /// is not stopped is refused (they work anyway, and the flag would outlive no stop). Only the root
+    function setWithdrawalsAllowed(bool allowed, address sendGasTo) external onlyRoot {
+        if (!allowed || _stopped()) {
+            withdrawalsAllowed = allowed;
+            emit WithdrawalsAllowed(allowed);
+            _ring();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice The pair of a launch token (DexRoot.migrateLaunchToken): its beneficiary is the token's creator
+    function _isLaunchPair() internal view virtual returns (bool);
+
+    /// @notice Users' funds stay in: stopped, and the owner did not let them out
+    function _withdrawalsBlocked() internal view returns (bool) {
+        return _stopped() && !withdrawalsAllowed;
+    }
+
+    /// @notice Root proposes a fee (already validated there). Any change waits DexConstants.PAIR_FEE_CHANGE_DELAY and then applyFee, a decrease
+    /// too: the providers' income and the beneficiary's part change only after a window to leave. The pair of a launch
+    /// token refuses a lower beneficiary part: it is the token's creator's (as the beneficiary itself, DexPair). Only the root
+    function proposeFee(uint128 poolNumerator, uint128 beneficiaryNumerator, address sendGasTo) external onlyRoot {
+        if (!(_isLaunchPair() && beneficiaryNumerator < fee.beneficiary_numerator)) {
+            pendingPoolNumerator = poolNumerator;
+            pendingBeneficiaryNumerator = beneficiaryNumerator;
+            pendingFeeAvailableAt = uint32(block.timestamp) + DexConstants.PAIR_FEE_CHANGE_DELAY;
+            emit FeeProposed(poolNumerator, beneficiaryNumerator, pendingFeeAvailableAt, pendingFeeAvailableAt + DexConstants.PAIR_FEE_CHANGE_APPLY_WINDOW);
+            _ring();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Applies a proposed fee once DexConstants.PAIR_FEE_CHANGE_DELAY has passed, within DexConstants.PAIR_FEE_CHANGE_APPLY_WINDOW; earlier, later or
+    /// with nothing proposed it is refused. Only the root
+    function applyFee(address sendGasTo) external onlyRoot {
+        uint32 nowTime = uint32(block.timestamp);
+        if (pendingFeeAvailableAt != 0 && nowTime >= pendingFeeAvailableAt && nowTime <= pendingFeeAvailableAt + DexConstants.PAIR_FEE_CHANGE_APPLY_WINDOW) {
+            fee.pool_numerator = pendingPoolNumerator;
+            fee.beneficiary_numerator = pendingBeneficiaryNumerator;
+            pendingFeeAvailableAt = 0;
+            emit FeeChanged(fee.pool_numerator, fee.beneficiary_numerator);
+            _ring();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice The proposed fee and its apply window (zeros if none). Anyone (getter)
+    function getPendingFee() internalMsg externalMsg external view returns (
+        uint128 _poolNumerator,
+        uint128 _beneficiaryNumerator,
+        uint32 _availableAt,
+        uint32 _expiresAt
+    ) {
+        return (
+            pendingPoolNumerator,
+            pendingBeneficiaryNumerator,
+            pendingFeeAvailableAt,
+            pendingFeeAvailableAt == 0 ? 0 : pendingFeeAvailableAt + DexConstants.PAIR_FEE_CHANGE_APPLY_WINDOW
+        );
+    }
+
+    /// @notice Smooth change of A of a stable pair. The first command records it; the same command again after
+    /// DexConstants.AMPLIFICATION_CHANGE_DELAY, but within DexConstants.AMPLIFICATION_CHANGE_APPLY_WINDOW, starts it: A goes linearly from its current
+    /// value to `target` in `duration`. The limits are checked at the proposal and at the start, from A at that time.
+    /// A regular or frozen pair, or a change beyond the limits, is refused. Only the root
+    function setAmplification(uint32 target, uint32 duration, address sendGasTo) external onlyRoot {
+        _changeAmplification(target, duration);
+        _returnExcess(sendGasTo);
+    }
+
+    function _changeAmplification(uint32 target, uint32 duration) private {
+        uint32 nowTime = uint32(block.timestamp);
+        if (!isStable || _stopped()) {
+            return;
+        }
+        uint32 current = PairQuotes.amplificationAt(stable, nowTime);
+        if (!PairQuotes.isAllowedAmplificationChange(current, target, duration)) {
+            return;
+        }
+
+        bool proposed = false;
+        if (pendingA.hasValue()) {
+            StableStructures.PendingAmplification p = pendingA.get();
+            proposed = p.target == target && p.duration == duration && nowTime <= p.expiresAt;
+            if (proposed && nowTime >= p.readyAt) {
+                stable.aFrom = current;
+                stable.aTo = target;
+                stable.rampStart = nowTime;
+                stable.rampEnd = nowTime + duration;
+                delete pendingA;
+                emit AmplificationRamp(stable.aFrom, stable.aTo, stable.rampStart, stable.rampEnd);
+                _ring();
+                return;
+            }
+        }
+        if (!proposed) {
+            pendingA.set(StableStructures.PendingAmplification(
+                target,
+                duration,
+                nowTime + DexConstants.AMPLIFICATION_CHANGE_DELAY,
+                nowTime + DexConstants.AMPLIFICATION_CHANGE_DELAY + DexConstants.AMPLIFICATION_CHANGE_APPLY_WINDOW
+            ));
+            emit AmplificationProposed(target, duration, nowTime + DexConstants.AMPLIFICATION_CHANGE_DELAY, nowTime + DexConstants.AMPLIFICATION_CHANGE_DELAY + DexConstants.AMPLIFICATION_CHANGE_APPLY_WINDOW);
+            _ring();
+        }
+    }
+
+}

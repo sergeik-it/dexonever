@@ -1,0 +1,37 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// A deposit into the bridge vault of the EVM network (BridgeVault.Deposited), as the relays see it
+struct DepositData {
+    uint64 depositId;
+    // the token in the EVM network and its amount there (USDT of BSC: 18 decimals)
+    uint160 evmToken;
+    uint256 amount;
+    uint160 evmSender;
+    // who gets the tokens in Everscale
+    address recipient;
+    // the EVM transaction of the deposit: for the watcher and the site
+    uint256 evmTxHash;
+}
+
+/// A withdrawal to the EVM network: what the relays sign (EIP-712) for BridgeVault.withdraw
+struct WithdrawalData {
+    uint160 evmToken;
+    uint160 recipient;
+    // the amount in the EVM network: the burned amount less the sender service's fee, times the token's scale
+    uint256 amount;
+    // who burned the tokens in Everscale, and how much
+    address everSender;
+    uint128 burned;
+    // the sender service sends it to the EVM network (its fee is kept); otherwise the user does
+    bool bySender;
+}
+
+/// What a deposit event calls on the root
+interface IBridgeRootEvents {
+    function onDepositConfirmed(DepositData data, uint32 round) external;
+}
+
+/// What the root calls on a deposit or withdrawal event: a new round of the relays
+interface IBridgeEvent {
+    function refresh(uint32 round, mapping(address => bool) relays, uint8 threshold) external;
+}

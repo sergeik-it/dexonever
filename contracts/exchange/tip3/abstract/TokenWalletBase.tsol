@@ -1,0 +1,479 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../../libraries/MsgFlag.tsol";
+
+import "../interfaces/ITokenWallet.tsol";
+import "../interfaces/ITokenRoot.tsol";
+import "../interfaces/IAcceptTokensTransferCallback.tsol";
+import "../interfaces/IAcceptTokensMintCallback.tsol";
+import "../interfaces/IBounceTokensTransferCallback.tsol";
+import "../interfaces/IBounceTokensBurnCallback.tsol";
+import "../libraries/TokenErrors.tsol";
+import "../libraries/JettonUtils.tsol";
+
+/**
+ * @title TokenWallet base ({ITokenWallet})
+ * @notice Minimal TIP-3 TokenWallet functionality plus the jetton (TEP-74) wallet messages.
+ * Extended by {TokenWalletBurnableBase}, {TokenWalletBurnableByRootBase} and
+ * {TokenWalletDestroyableBase}.
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenWalletBase is ITokenWallet {
+
+    address static root_;
+    address static owner_;
+
+    uint128 balance_;
+
+    using JettonUtils for address;
+
+    /**
+     * @dev Throws unless called by the TokenRoot.
+     */
+    modifier onlyRoot() {
+        require(root_ == msg.sender, TokenErrors.NOT_ROOT);
+        _;
+    }
+
+    /**
+     * @dev Throws unless called by `owner_`.
+     */
+    modifier onlyOwner() {
+        require(owner_ == msg.sender, TokenErrors.NOT_OWNER);
+        _;
+    }
+
+    /**
+     * @notice Returns the token balance of the wallet.
+     */
+    function balance() internalMsg externalMsg override external view responsible returns (uint128) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } balance_;
+    }
+
+    /**
+     * @notice Returns the owner of the wallet.
+     */
+    function owner() internalMsg externalMsg override external view responsible returns (address) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } owner_;
+    }
+
+    /**
+     * @notice Returns the TokenRoot of the wallet.
+     */
+    function root() internalMsg externalMsg override external view responsible returns (address) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } root_;
+    }
+
+    /**
+     * @notice Returns the code of the wallet.
+     */
+    function walletCode() internalMsg externalMsg override external view responsible returns (TvmCell) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } tvm.code();
+    }
+
+    /**
+     * @notice Transfers `amount` tokens to the wallet of `recipient`; only the owner.
+     * @dev See {_transfer}.
+     */
+    function transfer(
+        uint128 amount,
+        address recipient,
+        uint128 deployWalletValue,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    )
+        override
+        external
+        virtual
+        onlyOwner
+    {
+        _transfer(
+            amount,
+            recipient,
+            deployWalletValue,
+            remainingGasTo,
+            notify,
+            payload,
+            null
+        );
+    }
+
+    /**
+     * @notice Transfers `amount` tokens to the deployed token wallet `recipientTokenWallet`; only the owner.
+     * @dev Like {transfer}, but takes the wallet address. If that wallet does not exist
+     * or rejects the transfer, the message bounces and {onBounce} restores the balance.
+    */
+    function transferToWallet(
+        uint128 amount,
+        address recipientTokenWallet,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    )
+        override
+        external
+        virtual
+        onlyOwner
+    {
+        require(amount > 0, TokenErrors.WRONG_AMOUNT);
+        require(amount <= balance_, TokenErrors.NOT_ENOUGH_BALANCE);
+        require(!recipientTokenWallet.isStdZero() && recipientTokenWallet != address(this), TokenErrors.WRONG_RECIPIENT);
+
+        tvm.rawReserve(_reserve(), 0);
+
+        balance_ -= amount;
+
+        JettonUtils.internalTransferJettons(
+            recipientTokenWallet,
+            0,
+            varuint16(amount),
+            owner_,
+            notify ? 1 : 0,
+            abi.encode(false, payload),
+            remainingGasTo,
+            0,
+            MsgFlag.ALL_NOT_RESERVED,
+            true
+        );
+    }
+
+    /**
+     * @dev Accepts internal_transfer from a wallet of the same token (owned by `sender`)
+     * or from the root (a mint, `sender` is zero) and increases the balance.
+     *
+     * `payload` holds `(isJettonCall, p)`. Without `notify` the remaining gas goes to
+     * `remainingGasTo` (as jetton excesses for a jetton call). With `notify` the owner
+     * receives transfer_notification (jetton call), onAcceptTokensMint (mint) or
+     * onAcceptTokensTransfer, without bounce.
+     */
+    function _acceptTransfer(
+        uint64 callId,
+        uint128 amount,
+        address sender,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    ) private {
+        require(
+            msg.sender == address.makeAddrStd(address(this).wid, tvm.hash(_buildWalletInitData(sender))) ||
+            msg.sender == root_,
+            TokenErrors.SENDER_IS_NOT_VALID_WALLET
+        );
+
+        tvm.rawReserve(_reserve(), 2);
+
+        balance_ += amount;
+
+        (bool isJettonCall, TvmCell p) = abi.decode(payload, (bool, TvmCell));
+
+        if (!notify) {
+            if (isJettonCall) {
+                remainingGasTo.sendExcessesCallback(
+                    callId,
+                    0,
+                    MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                    false
+                );
+            } else {
+                remainingGasTo.transfer({
+                    value: 0,
+                    flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                    bounce: false
+                });
+            }
+
+            return;
+        }
+
+        if (isJettonCall) {
+            owner_.sendTransferNotificationCallback(
+                callId,
+                varuint16(amount),
+                sender,
+                p,
+                0,
+                MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                false
+            );
+
+            return;
+        }
+
+        if (sender.isStdZero()) {
+            IAcceptTokensMintCallback(owner_)
+                .onAcceptTokensMint{
+                    value: 0,
+                    bounce: false,
+                    flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS
+                }(
+                    root_,
+                    amount,
+                    remainingGasTo,
+                    p
+                );
+
+            return;
+        }
+
+        IAcceptTokensTransferCallback(owner_)
+            .onAcceptTokensTransfer{
+                value: 0,
+                flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                bounce: false
+            }(
+                root_,
+                amount,
+                sender,
+                msg.sender,
+                remainingGasTo,
+                p
+            );
+    }
+
+    /**
+     * @notice Bounce handler: when an outgoing internal_transfer or burn_notification
+     * bounces, restores `balance_` and notifies the owner
+     * (onBounceTokensTransfer / onBounceTokensBurn).
+     * @param body Body of the bounced message.
+    */
+    onBounce(TvmSlice body) external {
+        tvm.rawReserve(_reserve(), 2);
+
+        uint32 functionId = body.load(uint32);
+
+        if (functionId == JettonUtils.INTERNAL_TRANSFER_FUNCTION_ID) {
+            body.skip(64);
+
+            varuint16 amount = body.load(varuint16);
+
+            balance_ += amount;
+
+            IBounceTokensTransferCallback(owner_)
+                .onBounceTokensTransfer{
+                    value: 0,
+                    flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                    bounce: false
+                }(
+                    root_,
+                    amount,
+                    msg.sender
+                );
+
+            return;
+        }
+
+        if (functionId == JettonUtils.BURN_NOTIFICATION_FUNCTION_ID) {
+            body.skip(64);
+
+            uint128 amount = body.load(varuint16);
+
+            balance_ += amount;
+
+            IBounceTokensBurnCallback(owner_)
+                .onBounceTokensBurn{
+                    value: 0,
+                    flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+                    bounce: false
+                }(root_, amount);
+
+            return;
+        }
+    }
+
+    /**
+     * @notice Handles jetton (TEP-74) wallet messages: transfer and burn (from the owner)
+     * and internal_transfer (from a wallet of the same token or the root).
+     * @dev A jetton transfer always attaches `_targetBalance()` to deploy the recipient's wallet.
+     */
+    fallback() virtual external {
+        optional(uint32) functionIdOpt = msg.body.loadQ(uint32);
+
+        if (!functionIdOpt.hasValue()) {
+            revert(60);
+        }
+
+        uint32 functionId = functionIdOpt.get();
+        TvmCell empty;
+
+        if (functionId == JettonUtils.TRANSFER_FUNCTION_ID) {
+            require(msg.sender == owner_ && !owner_.isStdZero(), TokenErrors.NOT_OWNER);
+
+            JettonUtils.TransferParams params = JettonUtils.decodeTransferMsgParams();
+
+            _transfer(
+                params.amount,
+                params.recipient,
+                _targetBalance(),
+                params.remainingGasTo,
+                params.callbackValue > 0,
+                params.payload.hasValue() ? params.payload.get() : empty,
+                params.callId
+            );
+
+            return;
+        }
+
+        if (functionId == JettonUtils.BURN_FUNCTION_ID) {
+            require(msg.sender == owner_ && !owner_.isStdZero(), TokenErrors.NOT_OWNER);
+
+            JettonUtils.BurnParams params = JettonUtils.decodeBurnMsgParams();
+
+            _burn(
+                params.amount,
+                params.callbackTo,
+                params.callbackTo,
+                params.payload.hasValue() ? params.payload.get() : empty,
+                params.callId
+            );
+
+            return;
+        }
+
+        if (functionId == JettonUtils.INTERNAL_TRANSFER_FUNCTION_ID) {
+            JettonUtils.InternalTransferParams params = JettonUtils.decodeInternalTransferMsgParams();
+
+            _acceptTransfer(
+                params.callId,
+                params.amount,
+                params.walletOwner,
+                params.remainingGasTo,
+                params.callbackValue > 0,
+                params.payload.get()
+            );
+
+            return;
+        }
+
+        // Any other call is refused, so its value bounces back (a text comment, op 0, goes to receive and tops up the gas)
+        revert(60);
+    }
+
+    /**
+     * @dev Sends `amount` tokens to the wallet of `recipient` (not zero, not the owner):
+     * deploys that wallet first if `deployWalletValue` > 0, decreases `balance_` and sends
+     * internal_transfer with bounce. If the receiving wallet does not exist or rejects it,
+     * {onBounce} restores the balance.
+     */
+    function _transfer(
+        uint128 amount,
+        address recipient,
+        uint128 deployWalletValue,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload,
+        optional(uint64) callId
+    ) virtual internal {
+        require(amount > 0, TokenErrors.WRONG_AMOUNT);
+        require(amount <= balance_, TokenErrors.NOT_ENOUGH_BALANCE);
+        require(!recipient.isStdZero() && recipient != owner_, TokenErrors.WRONG_RECIPIENT);
+
+        tvm.rawReserve(_reserve(), 0);
+
+        TvmCell stateInit = _buildWalletInitData(recipient);
+
+        address recipientWallet;
+
+        if (deployWalletValue > 0) {
+            recipientWallet = _deployWallet(stateInit, deployWalletValue, remainingGasTo);
+        } else {
+            recipientWallet = address.makeAddrStd(address(this).wid, tvm.hash(stateInit));
+        }
+
+        balance_ -= amount;
+
+        JettonUtils.internalTransferJettons(
+            recipientWallet,
+            callId.getOr(0),
+            varuint16(amount),
+            owner_,
+            notify ? 1 : 0,
+            abi.encode(callId.hasValue(), payload),
+            remainingGasTo,
+            0,
+            MsgFlag.ALL_NOT_RESERVED,
+            true
+        );
+    }
+
+    /**
+     * @dev Burns `amount` tokens: decreases `balance_` and sends burn_notification to the
+     * root with bounce. If the root rejects it, {onBounce} restores the balance.
+     * For a jetton burn (`callId` set) no callback payload is sent.
+    */
+    function _burn(
+        uint128 amount,
+        address remainingGasTo,
+        address callbackTo,
+        TvmCell payload,
+        optional(uint64) callId
+    ) internal {
+        require(amount > 0, TokenErrors.WRONG_AMOUNT);
+        require(amount <= balance_, TokenErrors.NOT_ENOUGH_BALANCE);
+
+        tvm.rawReserve(_reserve(), 0);
+
+        balance_ -= amount;
+
+        JettonUtils.burnNotification(
+            root_,
+            callId.getOr(0),
+            varuint16(amount),
+            owner_,
+            remainingGasTo,
+            callId.hasValue() ? null : abi.encode(callbackTo, payload),
+            0,
+            MsgFlag.ALL_NOT_RESERVED,
+            true
+        );
+    }
+
+    /**
+     * @notice Sends the balance above the target balance to `to`; only the owner.
+     * @dev Reserves `_targetBalance()`, then sends everything not reserved (ALL_NOT_RESERVED).
+     * @param to Recipient of the surplus.
+     */
+    function sendSurplusGas(address to) external view onlyOwner {
+        tvm.rawReserve(_targetBalance(), 0);
+        to.transfer({
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /**
+     * @dev The amount to reserve before sending: the balance before this message,
+     * but not less than the target balance, so outgoing messages spend at most the
+     * incoming value.
+     */
+    function _reserve() internal pure returns (uint128) {
+        return math.max(address(this).balance - msg.value, _targetBalance());
+    }
+
+    /**
+     * @dev The balance the contract keeps for storage fees; used with `tvm.rawReserve`.
+     */
+    function _targetBalance() virtual internal pure returns (uint128);
+
+    /**
+     * @dev Builds the wallet `StateInit`.
+     * @param walletOwner The owner of the wallet.
+     * @return The wallet `StateInit`.
+     */
+    function _buildWalletInitData(address walletOwner) virtual internal view returns (TvmCell);
+
+    /**
+     * @dev Deploys a token wallet.
+     * @param initData The wallet `StateInit`.
+     * @param deployWalletValue Value attached to the deploy.
+     * @param remainingGasTo The address for the remaining gas.
+     * @return The wallet address.
+     */
+    function _deployWallet(TvmCell initData, uint128 deployWalletValue, address remainingGasTo) virtual internal view returns (address);
+
+    /// @notice Jetton (TEP-74) get_wallet_data: balance, owner, root (jetton master) and wallet code
+    function get_wallet_data() getter returns (int, address_std, address_std, TvmCell) {
+        return (balance_, owner_, root_, tvm.code());
+    }
+}

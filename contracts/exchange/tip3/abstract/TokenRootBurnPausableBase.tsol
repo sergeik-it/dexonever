@@ -1,0 +1,38 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenRootBase.tsol";
+import "../interfaces/IBurnPausableTokenRoot.tsol";
+
+/**
+ * @title Pausable burns of the TokenRoot ({IBurnPausableTokenRoot})
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenRootBurnPausableBase is TokenRootBase, IBurnPausableTokenRoot {
+
+    // `true` while burns are paused
+    bool burnPaused_;
+
+    /**
+     * @notice Returns `true` if burns are paused.
+     */
+    function burnPaused() internalMsg externalMsg override external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } burnPaused_;
+    }
+
+    /**
+     * @notice Pauses or resumes burns; only the root owner.
+    */
+    function setBurnPaused(bool paused) override external responsible onlyRootOwner returns (bool) {
+        burnPaused_ = paused;
+        _ring();
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } burnPaused_;
+    }
+
+     /**
+      * @dev See {TokenRootBase-_burnEnabled}.
+      */
+    function _burnEnabled() override internal view returns (bool) {
+        return !burnPaused_;
+    }
+
+}

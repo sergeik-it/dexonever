@@ -1,0 +1,33 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title TIP-3.1 TokenRoot
+ */
+interface TIP3TokenRoot {
+    /**
+     * @notice Returns the name of the token.
+     */
+    function name() internalMsg externalMsg external view responsible returns (string);
+
+    /**
+     * @notice Returns the symbol of the token.
+     */
+    function symbol() internalMsg externalMsg external view responsible returns (string);
+
+    /**
+     * @notice Returns the number of decimals of the token.
+     * @dev For display only: with 6 decimals a balance of `42_500_000` is shown as `42.5`.
+     * It does not affect any arithmetic of the contract.
+     */
+    function decimals() internalMsg externalMsg external view responsible returns (uint8);
+
+    /**
+     * @notice Returns the amount of tokens in existence.
+     */
+    function totalSupply() internalMsg externalMsg external view responsible returns (uint128);
+
+    /**
+     * @notice Returns the code of the TokenWallet contract.
+     */
+    function walletCode() internalMsg externalMsg external view responsible returns (TvmCell);
+}

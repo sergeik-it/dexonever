@@ -1,0 +1,18 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Disableable mint
+ * @notice TokenRoot extension that lets the root owner disable minting forever.
+ */
+interface IDisableableMintTokenRoot {
+    /**
+     * @notice Disables minting forever; only the root owner. Irreversible.
+     * @return `true`.
+    */
+    function disableMint() external responsible returns (bool);
+
+    /**
+     * @notice Returns `true` if minting is disabled.
+    */
+    function mintDisabled() internalMsg externalMsg external view responsible returns (bool);
+}

@@ -1,0 +1,34 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Transfer callback
+ * @notice Callback a token wallet sends to its owner when it receives a transfer.
+ *
+ * Chain of calls:
+ *
+ *  senderOwner -> ITokenWallet(senderWallet).transfer(...) ->
+ *                 ITokenWallet(receiverWallet).internal_transfer(...) ->
+ *                 IAcceptTokensTransferCallback(receiverOwner).onAcceptTokensTransfer(...)
+ */
+interface IAcceptTokensTransferCallback {
+
+    /**
+     * @notice Called by the token wallet after it has accepted a transfer.
+     * @param tokenRoot TokenRoot of the received tokens.
+     * @param amount The amount of tokens received.
+     * @param sender Owner of the sender's token wallet.
+     * @param senderWallet The sender's token wallet.
+     * @param remainingGasTo The address that should receive the remaining gas.
+     * @param payload Additional data attached to the transfer by the sender.
+    */
+    function onAcceptTokensTransfer(
+        address tokenRoot,
+        uint128 amount,
+        address sender,
+        address senderWallet,
+        address remainingGasTo,
+        TvmCell payload
+    ) external;
+
+
+}

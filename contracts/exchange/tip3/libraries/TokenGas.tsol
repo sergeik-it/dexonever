@@ -1,0 +1,15 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title Gas and balance constants of the token contracts
+library TokenGas {
+    // Balances the wallet and the root keep for storage fees (times Options.STORAGE_FEE_K)
+    uint128 constant TARGET_WALLET_BALANCE = 0.1 ever;
+    uint128 constant TARGET_ROOT_BALANCE = 1 ever;
+
+    varuint16 constant DEPLOY_TOKEN_ROOT_GAS = varuint16(0.0005 ever);
+
+    // Minimum gas (in gas units, priced by DexGas.gasValue) for a burn with a callback. The root sends the callback
+    // without a bounce after the tokens are burnt, so a callback that runs out of gas loses them. This covers the
+    // wallet's and the root's burn and a callback that can at least return the tokens, with a twofold margin
+    uint128 constant BURN_WITH_CALLBACK_GAS = 150_000;
+}

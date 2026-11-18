@@ -1,0 +1,32 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenWalletBase.tsol";
+import "../libraries/TokenGas.tsol";
+import "../../libraries/DexGas.tsol";
+import "../interfaces/IBurnableTokenWallet.tsol";
+
+/**
+ * @title Burning of wallet tokens by the owner ({IBurnableTokenWallet})
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenWalletBurnableBase is TokenWalletBase, IBurnableTokenWallet {
+
+    /**
+     * @notice Burns `amount` tokens of the wallet; only the owner. See {TokenWalletBase-_burn}.
+     */
+    function burn(uint128 amount, address remainingGasTo, address callbackTo, TvmCell payload)
+        override
+        external
+        onlyOwner
+    {
+        // The callback runs after the tokens are burnt and does not bounce, so a burn with a callback needs enough gas
+        require(callbackTo.value == 0 || msg.value >= DexGas.gasValue(TokenGas.BURN_WITH_CALLBACK_GAS), TokenErrors.LOW_BURN_GAS);
+        _burn(
+            amount,
+            remainingGasTo,
+            callbackTo,
+            payload,
+            null
+        );
+    }
+}

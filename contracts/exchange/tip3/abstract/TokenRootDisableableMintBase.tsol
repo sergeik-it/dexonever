@@ -1,0 +1,39 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TokenRootBase.tsol";
+import "../interfaces/IDisableableMintTokenRoot.tsol";
+
+
+/**
+ * @title Disableable mint of the TokenRoot ({IDisableableMintTokenRoot})
+ */
+#[ExternalMessage(expire, pubkey)]
+abstract contract TokenRootDisableableMintBase is TokenRootBase, IDisableableMintTokenRoot {
+
+    // `true` once minting is disabled; never reset
+    bool mintDisabled_;
+
+    /**
+     * @notice Disables minting forever; only the root owner.
+     */
+    function disableMint() override external responsible onlyRootOwner returns (bool) {
+        mintDisabled_ = true;
+        _ring();
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } mintDisabled_;
+    }
+
+    /**
+     * @notice Returns `true` if minting is disabled.
+     */
+    function mintDisabled() internalMsg externalMsg override external view responsible returns (bool) {
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } mintDisabled_;
+    }
+
+    /**
+     * @dev See {TokenRootBase-_mintEnabled}.
+     */
+    function _mintEnabled() override internal view returns (bool) {
+        return !mintDisabled_;
+    }
+
+}

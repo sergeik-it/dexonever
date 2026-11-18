@@ -1,0 +1,1825 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/TokenSymbol.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./DexPlatform.tsol";
+import "./DexRegistry.tsol";
+import "./DexHub.tsol";
+import "./libraries/PairQuotes.tsol";
+import "./libraries/Upgrade.tsol";
+import "./EverSurplus.tsol";
+import "./TokenList.tsol";
+import "./libraries/LaunchParams.tsol";
+
+interface IDexStoppable {
+    function setPaused(bool _paused, address sendGasTo) external;
+    function setFrozen(bool _frozen, address sendGasTo) external;
+    function setUpgrading(bool _upgrading, address sendGasTo) external;
+    function setWithdrawalsAllowed(bool allowed, address sendGasTo) external;
+}
+
+interface IDexPairAdmin {
+    function setBeneficiary(address _beneficiary, address sendGasTo) external;
+    function proposeFee(uint128 poolNumerator, uint128 beneficiaryNumerator, address sendGasTo) external;
+    function applyFee(address sendGasTo) external;
+    function setAmplification(uint32 target, uint32 duration, address sendGasTo) external;
+    function setLpAccountCode(TvmCell code, uint32 version, address sendGasTo) external;
+    function collectLpRootSurplus(address sendGasTo) external;
+}
+
+/// The launchpad's answer to a registration of a launch token: the token's vault, its pair with EVER and the EVER vault,
+/// as the root computes them, for the curve
+interface ILaunchRegistration {
+    function onLaunchRegistered(bool registered, address vault, address pair, address nativeVault, TvmCell payload) external;
+}
+
+/// The launchpad's calls of the exchange's owner (Launchpad.tsol), with what the root checked
+interface ILaunchpadAdmin {
+    function setParams(uint128 threshold, uint128 creatorFeeNumerator, uint128 platformFeeNumerator, uint128 launchFeeNumerator, uint32 expiry, address sendGasTo) external;
+    function setPaused(bool paused, address sendGasTo) external;
+    function collectPlatformFees(uint64 nonce, address recipient, address sendGasTo) external;
+    function announceCurveSurplus(uint64 nonce, uint128 amount, address recipient, string reason, address sendGasTo) external;
+    function cancelCurveSurplus(uint64 nonce, address sendGasTo) external;
+    function withdrawCurveSurplus(uint64 nonce, address sendGasTo) external;
+    function setCurveFrozen(uint64 nonce, bool frozen, address sendGasTo) external;
+    function setUpgrading(bool upgrading, address sendGasTo) external;
+    function setCurveCode(TvmCell code, uint32 version, address sendGasTo) external;
+    function upgradeCurve(uint64 nonce, address sendGasTo) external;
+    function setCurveUpgrading(uint64 nonce, bool upgrading, address sendGasTo) external;
+    function setReserved(string[] symbols, bool isReserved, TvmCell next) external;
+}
+
+// the owner's tokens and reserved symbols at the token factory (DexRoot.createOwnerToken, setReservedSymbols)
+interface ITokenFactoryOwner {
+    function createOwnerToken(string name, string symbol, uint8 decimals, address tokenOwner, address sendGasTo) external;
+    function setReserved(string[] symbols, bool isReserved, address sendGasTo) external;
+    function setPaused(bool paused, address sendGasTo) external;
+}
+
+interface IDexUpgradable {
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external;
+}
+
+/// A contract the root does not deploy (a token list, the token factory): it checks the kind of the code it gets
+interface IDexUpgradableInstance {
+    function upgrade(uint8 kind, TvmCell code, uint32 newVersion, address sendGasTo) external;
+}
+
+// the token factory and the launchpad: the codes of the tokens they deploy (DexRoot.setTokenCode)
+interface ITokenCodeHolder {
+    function setTokenCode(TvmCell rootCode, TvmCell walletCode, uint32 version, address sendGasTo) external;
+}
+
+interface IDexTokenVaultAdmin {
+    function announceTokenSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external;
+    function cancelTokenSurplus(address sendGasTo) external;
+    function withdrawTokenSurplus(address sendGasTo) external;
+}
+
+/// @title DexRoot - the exchange's root: deploys vaults, pairs, registry shards and event hubs at deterministic
+/// addresses, holds the installed codes and the fees of new pairs, and forwards the owner's, the manager's and the
+/// upgrader's administrative calls under their timelocks
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DexRoot is EverSurplus {
+
+    // a pair of a batch move to the installed code (upgradePairs), named by its tokens as upgradePair does
+    struct InstalledCode {
+        TvmCell code;
+        uint32 version;
+    }
+
+    struct PairKey {
+        address tokenA;
+        address tokenB;
+        bool isStable;
+    }
+
+    // a registry shard's or an event hub's deploy on its way: its index (number), and who paid for it and gets the value
+    // back if it bounces
+    struct PendingDeploy {
+        uint8 number;
+        address sendGasTo;
+    }
+
+    // a user's pair deploy waiting for the reserved pair list's answer (deployPair → onListChecked)
+    struct PairRequest {
+        address tokenA;
+        address tokenB;
+        address payer;
+    }
+
+    address public owner;
+    address public pendingOwner;
+    address public manager;
+    // The upgrader (a multisig of its own) changes the code and stops pairs and vaults for a move to it
+    // (setPairsUpgrading); the owner pauses and freezes, withdraws surpluses and may veto a proposed code. Renounced, no
+    // code is proposed or installed any more and the upgrader stops nothing; it still hands the codes installed before to
+    // the contracts behind them (renounceUpgrades)
+    address public upgrader;
+    address public pendingUpgrader;
+    bool public upgradesRenounced;
+    // When true, the upgrader cannot stop pairs and vaults for an upgrade (setUpgraderStops). Lifting a stop stays allowed
+    bool public upgraderStopsDisabled;
+    // The installed code of the kinds whose instances the root does not deploy (DexConstants.CODE_KIND_TOKEN_LIST and
+    // on), by kind: upgradeContract sends it to an instance
+    mapping(uint8 => InstalledCode) public installedCodes;
+    bool public active;
+
+    // Platform and Child codes
+    TvmCell public platformCode;
+    TvmCell public vaultCode;
+    TvmCell public nativeVaultCode;
+    TvmCell public pairCode;
+    TvmCell public lpAccountCode;
+    TvmCell public lpRootCode;
+    TvmCell public lpWalletCode;
+
+    uint32 public platformVersion;
+    uint32 public vaultVersion;
+    uint32 public nativeVaultVersion;
+    uint32 public pairVersion;
+    uint32 public lpAccountVersion;
+
+    uint32 public rootVersion;
+    uint32 public pendingCodeAvailableAt;
+    uint8 public pendingCodeKind;
+    TvmCell public pendingCode;
+
+    // Fees
+    uint128 public poolNumerator;
+    uint128 public beneficiaryNumerator;
+    address public beneficiary;
+
+    // Fee Timelock
+    uint32 public pendingFeeAvailableAt;
+    uint128 public pendingPoolNumerator;
+    uint128 public pendingBeneficiaryNumerator;
+
+    // The deploy registry: which vaults and pairs are deployed and who paid for each lives in
+    // DexConstants.REGISTRY_SHARDS shards (DexRegistry) by the first byte of the address, not here, so the root's state
+    // stays bounded. A deploy first claims its address in its shard and goes on only on its answer; a deployed address is
+    // refused, its value goes back
+    TvmCell public registryCode;
+    uint32 public registryVersion;
+    // the shards whose deploy was sent and those that confirmed it, a bit by index: the root opens only with all of them
+    uint256 registriesSent;
+    uint256 registriesReady;
+    // a shard's deploy on its way: its address → index and payer (a bounced one may be sent again)
+    mapping(address => PendingDeploy) registriesDeploying;
+
+    // The event hubs (DexHub): DexConstants.HUB_FAMILIES × HUBS_PER_FAMILY of them, numbered
+    // family × HUBS_PER_FAMILY + index; deployed as the registry's shards, the exchange opens only with all of them
+    TvmCell public hubCode;
+    uint32 public hubVersion;
+    uint64 hubsSent;
+    uint64 hubsReady;
+    mapping(address => PendingDeploy) hubsDeploying;
+
+    // The launchpad registers the token of a new curve before the token exists. Until that curve releases it, nobody but
+    // the curve deploys the token's vault and its pair with EVER, and no other pair of the token is deployed: the token
+    // has no market but its curve. Set by the constructor and never changed; the launchpad moves to new codes in place
+    // (upgradeContract, setLaunchCurveCode). Zero: the exchange has no launchpad (only a new root code could bring one)
+    address public launchpad;
+    mapping(address => address) launchCurves;
+
+    // The reserved pair list (TokenList of kind PAIR_LIST_RESERVED): the pairs only the owner
+    // deploys (WEVER / EVER from the launch). A user's deployPair asks it and deploys on its answer; the owner's does not
+    // ask. Given to the constructor, as the launchpad: the deploy computes its address before either exists. Zero — no
+    // reserved pairs (only a new root code could bring a list)
+    address public reservedPairList;
+    mapping(uint64 => PairRequest) pairRequests;
+    uint64 pairRequestNonce;
+
+    // How long a proposed code waits (proposeCode): set by the deploy, never changed, at most
+    // DexConstants.CODE_UPGRADE_DELAY. 0: a proposed code may be applied at once
+    uint32 public codeDelay;
+
+    /// A vault or pair deploy was sent (the native vault: token 0). A deploy that bounces gives the event too;
+    /// an indexer drops repeats by address. `creator` of a pair: who asked for it (a user's deploy is made in the answer
+    /// of the reserved pair list, so the caller of that transaction is the list), the token's creator for a launch pair
+    event VaultDeployed(address tokenRoot, address vault);
+    event PairDeployed(address pair, address left, address right, bool isStable, address creator);
+    /// The registry has `target` deployed already (or its shard is stopped for an upgrade): no deploy, the value went back
+    /// to `payer`
+    event DeployRefused(address target, address payer);
+    event RegistryDeployed(uint8 index, address shard);
+    event HubDeployed(uint8 family, uint8 index, address hub);
+    event OwnerProposed(address pendingOwner);
+    event OwnerChanged(address owner);
+    event UpgraderProposed(address pendingUpgrader);
+    event UpgraderChanged(address upgrader);
+    event UpgradesRenounced();
+    event ManagerChanged(address manager);
+    event RootStatus(bool active);
+    /// Fees of new pairs: an increase waits DexConstants.NEW_PAIR_FEE_INCREASE_DELAY and applyFees, a decrease applies at once
+    event FeesProposed(uint128 poolNumerator, uint128 beneficiaryNumerator, uint32 availableAt, uint32 expiresAt);
+    event FeesChanged(uint128 poolNumerator, uint128 beneficiaryNumerator);
+    /// A proposed fee increase was dropped (the new owner decides on fees)
+    event FeesCancelled(uint128 poolNumerator, uint128 beneficiaryNumerator);
+    event CodeProposed(uint8 kind, uint256 codeHash, uint32 availableAt, uint32 expiresAt);
+    event CodeApplied(uint8 kind, uint32 version);
+    event CodeCancelled(uint8 kind);
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+    event LaunchpadChanged(address launchpad);
+    event UpgraderStopsAllowed(bool allowed);
+    event LaunchTokenRegistered(address tokenRoot, address curve);
+    event LaunchTokenReleased(address tokenRoot);
+    // the launchpad refused a reservation of symbols (its call bounced): the factory was not asked
+    event ReservedSymbolsRefused();
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    modifier onlyUpgrader() {
+        require(msg.sender == upgrader, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice A change of the code: the upgrader's, until the upgrades are renounced
+    modifier onlyUpgrades() {
+        require(msg.sender == upgrader, DexErrors.NOT_AUTHORIZED);
+        require(!upgradesRenounced, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    /// @notice A proposed code is cancelled by the upgrader or vetoed by the owner
+    modifier onlyUpgraderOrOwner() {
+        require(msg.sender == upgrader || msg.sender == owner, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+
+
+    /// @notice Deployed by an external message signed by the deploy key. The root starts closed (active = false)
+    constructor(
+        address _owner,
+        address _upgrader,
+        address _manager,
+        address _beneficiary,
+        TvmCell _platformCode,
+        TvmCell _vaultCode,
+        TvmCell _nativeVaultCode,
+        TvmCell _pairCode,
+        TvmCell _lpAccountCode,
+        TvmCell _lpRootCode,
+        TvmCell _lpWalletCode,
+        TvmCell _registryCode,
+        TvmCell _hubCode,
+        address _launchpad,
+        address _reservedPairList,
+        uint32 _codeDelay
+    ) externalMsg {
+        require(tvm.pubkey() != 0 && msg.pubkey() == tvm.pubkey(), DexErrors.NOT_AUTHORIZED);
+        // only the key is checked before tvm.accept: the constructor reads the whole storage and its long input on the
+        // external message's free gas, and the checks of the settings would take it past the limit. Settings refused
+        // after it abort the deploy too: the root is not constructed, the deploy key pays the fee
+        tvm.accept();
+        require(_codeDelay <= DexConstants.CODE_UPGRADE_DELAY, DexErrors.INVALID_AMOUNT);
+        require(_launchpad.isStdAddrWithoutAnyCast() && _reservedPairList.isStdAddrWithoutAnyCast(), DexErrors.INVALID_AMOUNT);
+        // the beneficiary of the pairs' fees: payouts reach only a standard address of workchain 0
+        require(_isStd0(_beneficiary), DexErrors.INVALID_AMOUNT);
+        launchpad = _launchpad;
+        reservedPairList = _reservedPairList;
+        if (!_launchpad.isStdZero()) {
+            emit LaunchpadChanged(_launchpad);
+        }
+        owner = _owner;
+        upgrader = _upgrader;
+        manager = _manager;
+        beneficiary = _beneficiary;
+        // closed until the owner has filled the exchange (reserved symbols, the owner's tokens, the lists) and opens it
+        // with setRootActive
+        active = false;
+
+        platformCode = _platformCode;
+        vaultCode = _vaultCode;
+        nativeVaultCode = _nativeVaultCode;
+        pairCode = _pairCode;
+        lpAccountCode = _lpAccountCode;
+        lpRootCode = _lpRootCode;
+        lpWalletCode = _lpWalletCode;
+        registryCode = _registryCode;
+        hubCode = _hubCode;
+        codeDelay = _codeDelay;
+
+        platformVersion = 1;
+        vaultVersion = 1;
+        nativeVaultVersion = 1;
+        pairVersion = 1;
+        lpAccountVersion = 1;
+        registryVersion = 1;
+        hubVersion = 1;
+        rootVersion = 1;
+
+        poolNumerator = DexConstants.DEFAULT_POOL_FEE;
+        beneficiaryNumerator = DexConstants.DEFAULT_BENEFICIARY_FEE;
+    }
+
+    /// @notice Deterministic StateInit for child contracts
+    function getPlatformStateInit(uint8 typeId, TvmCell params) internalMsg externalMsg public view returns (TvmCell) {
+        return abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: {
+                root: address(this),
+                type_id: typeId,
+                params: params
+            },
+            code: platformCode
+        });
+    }
+
+    /// @notice Expected address calculation
+    function expectedPlatformAddress(uint8 typeId, TvmCell params) internalMsg externalMsg public view returns (address) {
+        TvmCell stateInit = getPlatformStateInit(typeId, params);
+        return address(tvm.hash(stateInit));
+    }
+
+    /// @notice Expected Token Vault Address
+    function getVaultAddress(address tokenRoot) internalMsg externalMsg public view returns (address) {
+        TvmBuilder b;
+        b.store(tokenRoot);
+        return expectedPlatformAddress(DexConstants.PLATFORM_TYPE_TOKEN_VAULT, b.toCell());
+    }
+
+    /// @notice Expected Native Vault Address (tokenRoot = address(0))
+    function getNativeVaultAddress() internalMsg externalMsg public view returns (address) {
+        TvmBuilder b;
+        b.store(address(0));
+        return expectedPlatformAddress(DexConstants.PLATFORM_TYPE_NATIVE_VAULT, b.toCell());
+    }
+
+    /// @notice Platform params of a pair: (left, right, isStable) with left < right. Decimals and A of a stable
+    /// pair are not part of the address: a stable pair of two tokens is one, its parameters are the owner's
+    function _pairParams(address tokenA, address tokenB, bool isStable) private pure returns (TvmCell) {
+        (address left, address right) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        TvmBuilder b;
+        b.store(left);
+        b.store(right);
+        b.store(isStable);
+        return b.toCell();
+    }
+
+    /// @notice Expected Pair Address
+    function getPairAddress(address tokenA, address tokenB, bool isStable) internalMsg externalMsg public view returns (address) {
+        return expectedPlatformAddress(DexConstants.PLATFORM_TYPE_PAIR, _pairParams(tokenA, tokenB, isStable));
+    }
+
+    /// @notice The registry shard of an address: its first byte (DexRegistry)
+    function getRegistryOf(address target) internalMsg externalMsg public view returns (address) {
+        return getRegistryAddress(uint8(target.value >> 248));
+    }
+
+    /// @notice The address of registry shard `index`: a platform of the root with the index for params
+    function getRegistryAddress(uint8 index) internalMsg externalMsg public view returns (address) {
+        return expectedPlatformAddress(DexConstants.PLATFORM_TYPE_REGISTRY, _registryParams(index));
+    }
+
+    /// @notice The event hub of family `family` that `target` rings: the first 4 bits of its address (DexHub)
+    function getHubOf(uint8 family, address target) internalMsg externalMsg public view returns (address) {
+        return getHubAddress(family, uint8(target.value >> 252));
+    }
+
+    /// @notice The address of hub `index` of family `family`: a platform of the root with the two for params
+    function getHubAddress(uint8 family, uint8 index) internalMsg externalMsg public view returns (address) {
+        TvmBuilder b;
+        b.store(family, index);
+        return expectedPlatformAddress(DexConstants.PLATFORM_TYPE_HUB, b.toCell());
+    }
+
+    function _registryParams(uint8 index) private pure returns (TvmCell) {
+        TvmBuilder b;
+        b.store(index);
+        return b.toCell();
+    }
+
+    /// @notice Asks the registry shard of the platform (`typeId`, `params`) to take its address for `payer`, with `value`
+    /// (or all, flag 64); the deploy goes on in onRegistryClaim. `details` — what a pair's init data and its PairDeployed
+    /// take besides the address. Returns the address
+    function _claim(uint8 typeId, TvmCell params, TvmCell details, uint128 value, uint8 flag, address payer) private view returns (address) {
+        address target = expectedPlatformAddress(typeId, params);
+        DexRegistry(getRegistryOf(target)).claim{ value: varuint16(value), flag: flag, bounce: false }(
+            target, payer, abi.encode(typeId, params, details, payer)
+        );
+        return target;
+    }
+
+    /// @notice The registry shard of `target` answers a claim: a free address is deployed now with all the value (the
+    /// payer gets a bounced deploy back through the shard and the gas the platform does not use); a deployed one, or a
+    /// shard stopped for an upgrade, deploys nothing — the value goes back to the payer (DeployRefused). A free address
+    /// whose answer brings less than the platform needs at the gas price now (it rose since the request) is not deployed
+    /// either: the shard frees it again and returns the value to the payer
+    function onRegistryClaim(uint8 status, address target, TvmCell call) external {
+        (uint8 typeId, TvmCell params, TvmCell details, address payer) = abi.decode(call, (uint8, TvmCell, TvmCell, address));
+        require(msg.sender == getRegistryOf(target) && expectedPlatformAddress(typeId, params) == target, DexErrors.NOT_AUTHORIZED);
+        if (status != DexConstants.REGISTRY_FREE) {
+            emit DeployRefused(target, payer);
+            payer.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        uint128 needed = typeId == DexConstants.PLATFORM_TYPE_PAIR ? DexGas.pairPlatformValue() : DexGas.vaultPlatformValue();
+        if (msg.value < needed) {
+            emit DeployRefused(target, payer);
+            DexRegistry(msg.sender).release{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(target);
+            return;
+        }
+        TvmCell empty;
+        if (typeId == DexConstants.PLATFORM_TYPE_PAIR) {
+            TvmSlice p = params.toSlice();
+            (address left, address right, bool isStable) = p.load(address, address, bool);
+            (uint8 decimalsLeft, uint8 decimalsRight, uint32 amplification, address pairBeneficiary, address firstDepositor, address creator) =
+                abi.decode(details, (uint8, uint8, uint32, address, address, address));
+            _deployPlatform(typeId, params, pairCode, pairVersion, _pairInitData(decimalsLeft, decimalsRight, amplification, pairBeneficiary, firstDepositor), payer);
+            emit PairDeployed(target, left, right, isStable, creator);
+        } else if (typeId == DexConstants.PLATFORM_TYPE_NATIVE_VAULT) {
+            _deployPlatform(typeId, params, nativeVaultCode, nativeVaultVersion, empty, payer);
+            emit VaultDeployed(address(0), target);
+        } else {
+            _deployPlatform(typeId, params, vaultCode, vaultVersion, empty, payer);
+            emit VaultDeployed(params.toSlice().load(address), target);
+        }
+    }
+
+    /// @notice Deploys a platform whose address its registry shard took, with all the value of this call
+    function _deployPlatform(uint8 typeId, TvmCell params, TvmCell code, uint32 version, TvmCell initData, address payer) private view {
+        new DexPlatform{
+            stateInit: getPlatformStateInit(typeId, params),
+            value: 0,
+            flag: MsgFlag.REMAINING_GAS,
+            bounce: true
+        }(code, version, payer, initData);
+    }
+
+    /// @notice A failed deploy bounced: its registry shard frees the address and sends the value to the payer. A shard's
+    /// or a hub's own deploy bounced: it may be sent again, the value goes back to its payer. A question to the reserved
+    /// pair list bounced (no list there): the pair is not deployed, the value goes back to its payer
+    onBounce(TvmSlice body) external {
+        if (msg.sender == launchpad && !_noLaunchpad()) {
+            if (body.load(uint32) == abi.functionId(ILaunchpadAdmin.setReserved)) {
+                emit ReservedSymbolsRefused();
+                owner.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            }
+            return;
+        }
+        if (msg.sender == reservedPairList && !_noReservedPairList()) {
+            if (body.load(uint32) == abi.functionId(ITokenList.checkListed)) {
+                _refundPairRequest(body.load(uint64));
+            }
+            return;
+        }
+        uint32 functionId = body.load(uint32);
+        // the factory refused the owner's token: its gas goes back to the owner instead of staying on the root
+        if (functionId == abi.functionId(ITokenFactoryOwner.createOwnerToken)) {
+            owner.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        if (functionId != abi.functionId(DexPlatform)) {
+            return;
+        }
+        optional(PendingDeploy) shard = registriesDeploying.fetch(msg.sender);
+        if (shard.hasValue()) {
+            delete registriesDeploying[msg.sender];
+            registriesSent &= ~(uint256(1) << shard.get().number);
+            shard.get().sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        optional(PendingDeploy) hub = hubsDeploying.fetch(msg.sender);
+        if (hub.hasValue()) {
+            delete hubsDeploying[msg.sender];
+            hubsSent &= ~(uint64(1) << hub.get().number);
+            hub.get().sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        DexRegistry(getRegistryOf(msg.sender)).release{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    /// @notice Deploys the TIP-3 token vault of `tokenRoot`; anyone, while the root is active. The caller pays:
+    /// msg.value >= DexGas.deployVaultValue(), the rest returns to the caller
+    function deployVault(address tokenRoot) external returns (address) {
+        require(active, DexErrors.PAUSED);
+        require(msg.value >= DexGas.deployVaultValue(), DexErrors.NOT_ENOUGH_GAS);
+        require(tokenRoot != address(0), DexErrors.INVALID_TOKEN);
+        _requireStdToken(tokenRoot);
+        _requireOffCurve(tokenRoot);
+        return _claimVault(tokenRoot, 0, MsgFlag.REMAINING_GAS, msg.sender);
+    }
+
+    function _claimVault(address tokenRoot, uint128 value, uint8 flag, address payer) private view returns (address) {
+        TvmBuilder b;
+        b.store(tokenRoot);
+        TvmCell empty;
+        return _claim(DexConstants.PLATFORM_TYPE_TOKEN_VAULT, b.toCell(), empty, value, flag, payer);
+    }
+
+    /// @notice A token is named by the standard form of its address only: the address decoder accepts an anycast form
+    /// too, whose vault deploy would fail only on the way to the token (leaving a platform and a VaultDeployed event
+    /// behind), and a vault or pair of another form would be another address for the same token
+    function _requireStdToken(address tokenRoot) private pure {
+        require(_isStd0(tokenRoot), DexErrors.INVALID_TOKEN);
+    }
+
+    /// @notice A standard address of workchain 0 without anycast, the only form the exchange's contracts and the tokens
+    /// live at: another workchain or an anycast form would take a registry entry and leave a dead platform
+    function _isStd0(address target) private pure returns (bool) {
+        return target.isStdAddrWithoutAnyCast() && target.wid == 0;
+    }
+
+    /// @notice A token on a curve of the launchpad gets no vault and no pair from anyone but its curve
+    function _requireOffCurve(address tokenRoot) private view {
+        require(!launchCurves.exists(tokenRoot), DexErrors.ON_CURVE);
+    }
+
+    /// @notice Deploys the native EVER vault; anyone, while the root is active. The caller pays:
+    /// msg.value >= DexGas.deployVaultValue()
+    function deployNativeVault() external returns (address) {
+        require(active, DexErrors.PAUSED);
+        require(msg.value >= DexGas.deployVaultValue(), DexErrors.NOT_ENOUGH_GAS);
+        TvmBuilder b;
+        b.store(address(0));
+        TvmCell params = b.toCell();
+
+        TvmCell empty;
+        return _claim(DexConstants.PLATFORM_TYPE_NATIVE_VAULT, params, empty, 0, MsgFlag.REMAINING_GAS, msg.sender);
+    }
+
+    /// @notice LP token and LpAccount codes, the current fees, the beneficiary, for a stable pair decimals (left, right)
+    /// and A, and the only first depositor (zero: anyone) handed to a new pair; they do not take part in the pair address
+    function _pairInitData(
+        uint8 decimalsLeft,
+        uint8 decimalsRight,
+        uint32 amplification,
+        address pairBeneficiary,
+        address firstDepositor
+    ) private view returns (TvmCell) {
+        TvmBuilder b;
+        b.store(lpRootCode);
+        b.store(lpWalletCode);
+        b.store(lpAccountCode);
+        b.store(lpAccountVersion);
+        b.store(poolNumerator);
+        b.store(beneficiaryNumerator);
+        b.store(pairBeneficiary);
+        b.store(decimalsLeft, decimalsRight, amplification);
+        b.store(firstDepositor);
+        return b.toCell();
+    }
+
+    /// @notice Deploys a constant-product pair; anyone, while the root is active. The caller pays:
+    /// msg.value >= DexGas.deployPairValue() (plus PAIR_CHECK gas for a user). A user's deploy first
+    /// asks the reserved pair list (one more round of messages, PAIR_CHECK): a pair in it is the owner's, the value goes
+    /// back; so does it if the list does not answer. The owner's deploy does not ask. Returns the pair's address either way
+    function deployPair(address tokenA, address tokenB) external returns (address) {
+        require(active, DexErrors.PAUSED);
+        require(tokenA != tokenB, DexErrors.INVALID_TOKEN);
+        _requireStdToken(tokenA);
+        _requireStdToken(tokenB);
+        _requireOffCurve(tokenA);
+        _requireOffCurve(tokenB);
+        if (msg.sender == owner || _noReservedPairList()) {
+            require(msg.value >= DexGas.deployPairValue(), DexErrors.NOT_ENOUGH_GAS);
+            return _claimPair(tokenA, tokenB, false, 0, 0, 0, beneficiary, address(0), 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
+        }
+        require(msg.value >= DexGas.deployPairValue() + DexGas.gasValue(DexGas.PAIR_CHECK), DexErrors.NOT_ENOUGH_GAS);
+        address pair = getPairAddress(tokenA, tokenB, false);
+        uint64 id = pairRequestNonce;
+        pairRequestNonce++;
+        pairRequests[id] = PairRequest(tokenA, tokenB, msg.sender);
+        ITokenList(reservedPairList).checkListed{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: true }(id, pair);
+        return pair;
+    }
+
+    /// @notice The reserved pair list answers a user's deployPair: a pair not in it is deployed now, unless meanwhile it
+    /// was deployed, its token went on a curve, the root was paused or the gas price rose past the value left; then, as for
+    /// a reserved pair, the value goes back to the payer
+    function onListChecked(uint64 id, bool listed) external {
+        require(msg.sender == reservedPairList && !_noReservedPairList(), DexErrors.NOT_AUTHORIZED);
+        optional(PairRequest) found = pairRequests.fetch(id);
+        if (!found.hasValue()) {
+            return;
+        }
+        PairRequest request = found.get();
+        bool refused = listed || !active || launchCurves.exists(request.tokenA) || launchCurves.exists(request.tokenB) ||
+            msg.value < DexGas.deployPairValue();
+        if (refused) {
+            _refundPairRequest(id);
+            return;
+        }
+        delete pairRequests[id];
+        _claimPair(request.tokenA, request.tokenB, false, 0, 0, 0, beneficiary, address(0), 0, MsgFlag.REMAINING_GAS, request.payer, request.payer);
+    }
+
+    /// @notice A user's pair deploy that is not made: its value goes back to the payer
+    function _refundPairRequest(uint64 id) private {
+        optional(PairRequest) found = pairRequests.fetch(id);
+        if (!found.hasValue()) {
+            return;
+        }
+        delete pairRequests[id];
+        found.get().payer.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    function _noReservedPairList() private view returns (bool) {
+        return reservedPairList.isNone() || reservedPairList.isStdZero();
+    }
+
+    /// @notice Deploys a StableSwap pair: only the owner, since decimals and A are trusted and are not part of the
+    /// address (one stable pair per two tokens). The owner pays: msg.value >= DexGas.deployPairValue()
+    function deployStablePair(
+        address tokenA,
+        address tokenB,
+        uint8 decimalsA,
+        uint8 decimalsB,
+        uint32 amplification
+    ) external onlyOwner returns (address) {
+        require(active, DexErrors.PAUSED);
+        require(tokenA != tokenB, DexErrors.INVALID_TOKEN);
+        require(msg.value >= DexGas.deployPairValue(), DexErrors.NOT_ENOUGH_GAS);
+        // rate = 10^(max − decimals) × 10^max must fit into uint128
+        require(
+            decimalsA <= DexConstants.STABLE_MAX_DECIMALS && decimalsB <= DexConstants.STABLE_MAX_DECIMALS,
+            DexErrors.INVALID_DECIMALS
+        );
+        require(PairQuotes.isAmplificationInRange(amplification), DexErrors.INVALID_AMPLIFICATION);
+        _requireStdToken(tokenA);
+        _requireStdToken(tokenB);
+        _requireOffCurve(tokenA);
+        _requireOffCurve(tokenB);
+
+        (uint8 decimalsLeft, uint8 decimalsRight) = tokenA < tokenB ? (decimalsA, decimalsB) : (decimalsB, decimalsA);
+        return _claimPair(tokenA, tokenB, true, decimalsLeft, decimalsRight, amplification, beneficiary, address(0), 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
+    }
+
+    /// `payer` gets a bounced deploy and the gas left back, `creator` goes into PairDeployed; the decimals (left, right),
+    /// A, the beneficiary and the first depositor go into the pair's init data when its shard answers
+    function _claimPair(
+        address tokenA,
+        address tokenB,
+        bool isStable,
+        uint8 decimalsLeft,
+        uint8 decimalsRight,
+        uint32 amplification,
+        address pairBeneficiary,
+        address firstDepositor,
+        uint128 value,
+        uint8 flag,
+        address payer,
+        address creator
+    ) private view returns (address) {
+        TvmCell details = abi.encode(decimalsLeft, decimalsRight, amplification, pairBeneficiary, firstDepositor, creator);
+        return _claim(DexConstants.PLATFORM_TYPE_PAIR, _pairParams(tokenA, tokenB, isStable), details, value, flag, payer);
+    }
+
+    // ==========================================
+    // Launch tokens
+    // ==========================================
+
+    /// @notice The launchpad registers the token of a new curve before deploying it: the token's address is known in
+    /// advance, so its vault or its pair with EVER could be deployed ahead. They must not be deployed (and the token not on
+    /// a curve yet): the root asks the registry shards of the vault, the pair with EVER and the stable pair with EVER one
+    /// after another (onRegistryCheck), the token held as on its curve meanwhile — no deploy of them starts. Registered,
+    /// only `curve` deploys them now. The answer carries `payload` back with the gas left; a call not from the launchpad
+    /// registers nothing and its sender gets the answer at once
+    function registerLaunchToken(address tokenRoot, address curve, TvmCell payload) external {
+        if (msg.sender != launchpad || launchCurves.exists(tokenRoot)) {
+            _answerLaunch(msg.sender, false, tokenRoot, payload);
+            return;
+        }
+        launchCurves[tokenRoot] = curve;
+        _checkLaunch(tokenRoot, curve, payload, 0);
+    }
+
+    /// @notice What a launch's registration asks the registry about at `step`: the token's vault, its pair with EVER, its
+    /// stable pair with EVER
+    function _launchTarget(address tokenRoot, uint8 step) private view returns (address) {
+        return step == 0 ? getVaultAddress(tokenRoot) : getPairAddress(tokenRoot, address(0), step == DexConstants.LAUNCH_CHECK_STEPS - 1);
+    }
+
+    function _checkLaunch(address tokenRoot, address curve, TvmCell payload, uint8 step) private view {
+        address target = _launchTarget(tokenRoot, step);
+        DexRegistry(getRegistryOf(target)).check{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            target, abi.encode(tokenRoot, curve, payload, step)
+        );
+    }
+
+    /// @notice A registry shard answers a launch's registration: a free address goes on to the next step, after the last
+    /// the token is registered; a deployed one (or a shard stopped for an upgrade) refuses the launch and frees the token
+    function onRegistryCheck(uint8 status, address target, TvmCell data) external {
+        (address tokenRoot, address curve, TvmCell payload, uint8 step) = abi.decode(data, (address, address, TvmCell, uint8));
+        require(msg.sender == getRegistryOf(target) && target == _launchTarget(tokenRoot, step), DexErrors.NOT_AUTHORIZED);
+        bool free = status == DexConstants.REGISTRY_FREE;
+        if (free && step + 1 < DexConstants.LAUNCH_CHECK_STEPS) {
+            _checkLaunch(tokenRoot, curve, payload, step + 1);
+            return;
+        }
+        if (free) {
+            emit LaunchTokenRegistered(tokenRoot, curve);
+        } else {
+            delete launchCurves[tokenRoot];
+        }
+        _answerLaunch(launchpad, free, tokenRoot, payload);
+    }
+
+    function _answerLaunch(address to, bool registered, address tokenRoot, TvmCell payload) private view {
+        ILaunchRegistration(to).onLaunchRegistered{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            registered, getVaultAddress(tokenRoot), getPairAddress(tokenRoot, address(0), false), getNativeVaultAddress(), payload
+        );
+    }
+
+    /// @notice The curve of a launch token, its sale over, deploys the token's vault and the pair of the token and EVER
+    /// and pays both deploys. The pair takes its first deposit only from the curve, and the beneficiary part of its fee
+    /// goes to the token's creator. What is deployed already its registry shard refuses, and its value comes back, so the
+    /// curve repeats the call after a bounced deploy. `payer` paid the deploys (the curve, or the caller of a repeat): a
+    /// bounced or refused deploy returns to it, the rest of the value goes to it. Payouts reach only a standard address of
+    /// workchain 0: a creator of another form leaves the beneficiary part to the exchange's beneficiary, a payer of another
+    /// form leaves what comes back to the curve. Refusing instead would stop the curve's migration for good (its creator
+    /// and the payer it names do not change)
+    function migrateLaunchToken(address tokenRoot, address creator, address payer) external {
+        optional(address) curve = launchCurves.fetch(tokenRoot);
+        require(curve.hasValue() && curve.get() == msg.sender, DexErrors.NOT_AUTHORIZED);
+        require(active, DexErrors.PAUSED);
+        uint128 vaultValue = DexGas.deployVaultValue();
+        uint128 pairValue = DexGas.deployPairValue();
+        require(msg.value >= vaultValue + pairValue + DexGas.gasValue(DexGas.LAUNCH_MIGRATE), DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+
+        address pairBeneficiary = _isStd0(creator) ? creator : beneficiary;
+        address gasTo = _isStd0(payer) ? payer : msg.sender;
+        _claimVault(tokenRoot, vaultValue, 0, gasTo);
+        _claimPair(tokenRoot, address(0), false, 0, 0, 0, pairBeneficiary, msg.sender, pairValue, 0, gasTo, creator);
+        gasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The curve saw its vault and its pair deployed, or it closed without buys for its expiry (LaunchCurve.expire):
+    /// the token is off the curve, anyone deploys its pairs. The curve sends just the gas of this call; the little left
+    /// stays on the root (too little for the curve to take it in)
+    function releaseLaunchToken(address tokenRoot) external {
+        optional(address) curve = launchCurves.fetch(tokenRoot);
+        require(curve.hasValue() && curve.get() == msg.sender, DexErrors.NOT_AUTHORIZED);
+        delete launchCurves[tokenRoot];
+        emit LaunchTokenReleased(tokenRoot);
+    }
+
+    /// @notice Threshold, fees, the launch's fee (of the threshold) and the expiry (without buys) of the launchpad's new
+    /// curves, within LaunchParams; a curve keeps those it was created with. The call goes on without a bounce: the bounds
+    /// and the gas are checked here
+    function setLaunchParams(
+        uint128 threshold,
+        uint128 creatorFeeNumerator,
+        uint128 platformFeeNumerator,
+        uint128 launchFeeNumerator,
+        uint32 expiry
+    ) external view onlyOwner {
+        _requireAdminGas();
+        require(LaunchParams.valid(threshold, creatorFeeNumerator, platformFeeNumerator, launchFeeNumerator, expiry), DexErrors.INVALID_AMOUNT);
+        ILaunchpadAdmin(_activeLaunchpad()).setParams{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            threshold, creatorFeeNumerator, platformFeeNumerator, launchFeeNumerator, expiry, msg.sender
+        );
+    }
+
+    /// @notice New launches stop (the owner or the manager) or go on (the owner only); the curves trade on
+    function setLaunchPaused(bool _paused) external view {
+        _requireStopRights(_paused);
+        ILaunchpadAdmin(_activeLaunchpad()).setPaused{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_paused, msg.sender);
+    }
+
+    /// @notice Stops buys and the migration of the curve `nonce` — the owner or the manager: a shortage found by the bot;
+    /// or resumes them (the owner only). Sells go on
+    function setLaunchFrozen(uint64 nonce, bool _frozen) external view {
+        _requireFreezeRights(_frozen);
+        ILaunchpadAdmin(_activeLaunchpad()).setCurveFrozen{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(nonce, _frozen, msg.sender);
+    }
+
+    /// @notice The platform's fees of up to DexConstants.MAX_ADMIN_BATCH_TARGETS curves go to `recipient` with one call,
+    /// as collectLaunchFees each (two hops: the launchpad and the curve); the gas left of every curve comes back to the owner
+    function collectLaunchesFees(uint64[] nonces, address recipient) external view onlyOwner {
+        require(recipient.isStdAddrWithoutAnyCast() && !recipient.isStdZero(), DexErrors.INVALID_AMOUNT);
+        address launchpad_ = _activeLaunchpad();
+        uint128 childValue = _reserveForBatch(nonces.length, DexGas.BATCH_CURVE, DexGas.BATCH_CURVE_FORWARD, 0);
+        for (uint64 nonce : nonces) {
+            ILaunchpadAdmin(launchpad_).collectPlatformFees{ value: varuint16(childValue), flag: 0, bounce: false }(nonce, recipient, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The platform's fee of the curve `nonce` goes to `recipient`
+    function collectLaunchFees(uint64 nonce, address recipient) external view onlyOwner {
+        _requireAdminGas();
+        require(recipient.isStdAddrWithoutAnyCast() && !recipient.isStdZero(), DexErrors.INVALID_AMOUNT);
+        ILaunchpadAdmin(_activeLaunchpad()).collectPlatformFees{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            nonce, recipient, msg.sender
+        );
+    }
+
+    /// @notice Tokens on the curve `nonce` above what it owes (token surplus): the owner announces their
+    /// withdrawal with `reason` for the exchange's log, runs it with withdrawLaunchSurplus not before 2 days, within 7 (the
+    /// curve checks it and the surplus, refusals are quiet)
+    function announceLaunchSurplus(uint64 nonce, uint128 amount, address recipient, string reason) external view onlyOwner {
+        _requireAdminGas();
+        ILaunchpadAdmin(_activeLaunchpad()).announceCurveSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            nonce, amount, recipient, reason, msg.sender
+        );
+    }
+
+    /// @notice The owner cancels the announced surplus withdrawal of the curve `nonce`
+    function cancelLaunchSurplus(uint64 nonce) external view onlyOwner {
+        _requireAdminGas();
+        ILaunchpadAdmin(_activeLaunchpad()).cancelCurveSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(nonce, msg.sender);
+    }
+
+    /// @notice The owner runs the announced surplus withdrawal of the curve `nonce`
+    function withdrawLaunchSurplus(uint64 nonce) external view onlyOwner {
+        _requireAdminGas();
+        ILaunchpadAdmin(_activeLaunchpad()).withdrawCurveSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(nonce, msg.sender);
+    }
+
+    /// @notice A call of the launchpad needs one: to no address it would keep the gas
+    function _noLaunchpad() private view returns (bool) {
+        return launchpad.isNone() || launchpad.isStdZero();
+    }
+
+    function _activeLaunchpad() private view returns (address) {
+        require(!launchpad.isStdZero() && !launchpad.isNone(), DexErrors.NOT_READY);
+        return launchpad;
+    }
+
+    /// @notice The curve of a token on the launchpad, zero for a token that is not on a curve
+    function getLaunchCurve(address tokenRoot) internalMsg externalMsg external view returns (address) {
+        return launchCurves.fetch(tokenRoot).getOr(address(0));
+    }
+
+    // ==========================================
+    // Governance, Emergency & Timelocks
+    // ==========================================
+
+    /// @notice The owner proposes a new owner (step 1 of 2)
+    function transferOwner(address _pendingOwner) public onlyOwner {
+        pendingOwner = _pendingOwner;
+        emit OwnerProposed(_pendingOwner);
+    }
+    /// @notice Alias of transferOwner
+    function transferOwnership(address _pendingOwner) external onlyOwner {
+        transferOwner(_pendingOwner);
+    }
+
+    /// @notice The proposed owner accepts ownership (step 2 of 2). The manager, a proposed fee change and an announced
+    /// withdrawal of the root's EVER surplus were left by the previous owner: they are dropped, the new owner decides on
+    /// them. A proposed code is the upgrader's: it stays, the new owner may veto it
+    function acceptOwner() public {
+        require(msg.sender == pendingOwner, DexErrors.NOT_AUTHORIZED);
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        if (manager != address(0)) {
+            manager = address(0);
+            emit ManagerChanged(manager);
+        }
+        if (pendingFeeAvailableAt != 0) {
+            emit FeesCancelled(pendingPoolNumerator, pendingBeneficiaryNumerator);
+            _clearPendingFees();
+        }
+        _dropEverSurplus();
+        emit OwnerChanged(owner);
+    }
+    /// @notice Alias of acceptOwner
+    function acceptOwnership() external {
+        acceptOwner();
+    }
+
+    /// @notice The upgrader hands its role over in two steps, as the owner does
+    function transferUpgrader(address _pendingUpgrader) external onlyUpgrader {
+        pendingUpgrader = _pendingUpgrader;
+        emit UpgraderProposed(_pendingUpgrader);
+    }
+
+    /// @notice The proposed upgrader accepts the role
+    function acceptUpgrader() external {
+        require(msg.sender == pendingUpgrader, DexErrors.NOT_AUTHORIZED);
+        upgrader = pendingUpgrader;
+        pendingUpgrader = address(0);
+        emit UpgraderChanged(upgrader);
+    }
+
+    /// @notice The upgrader gives up changing the code, for good: the proposed code is dropped, no code is proposed or
+    /// installed any more (proposeCode, applyCode), the root keeps its code. The upgrader loses its stop for an upgrade
+    /// (one left is lifted by the owner), but still hands the codes installed before to the contracts behind them: a pair,
+    /// a vault, a registry shard, the launchpad or a curve moves only if it was stopped for an upgrade before the renounce;
+    /// an event hub, a token list and the token factory move without a stop; the installed LpAccount, token and curve codes
+    /// still go to pairs, the token factory and the launchpad
+    function renounceUpgrades() external onlyUpgrader {
+        require(!upgradesRenounced, DexErrors.NOT_AUTHORIZED);
+        upgradesRenounced = true;
+        if (pendingCodeKind != 0) {
+            emit CodeCancelled(pendingCodeKind);
+            _clearPendingCode();
+        }
+        emit UpgradesRenounced();
+    }
+
+    /// @notice The owner sets the manager (zero: none)
+    function setManager(address _manager) external onlyOwner {
+        manager = _manager;
+        emit ManagerChanged(_manager);
+    }
+
+    /// @notice Closes the root to deploys (the owner or the manager) or opens it (the owner only, with all registry
+    /// shards and event hubs deployed)
+    function setRootActive(bool _active) public {
+        if (!_active) {
+            require(msg.sender == manager || msg.sender == owner, DexErrors.NOT_AUTHORIZED);
+            active = false;
+        } else {
+            require(msg.sender == owner, DexErrors.NOT_AUTHORIZED);
+            // every deploy goes through its registry shard, and every contract rings its event hub: the exchange opens only
+            // with all of them deployed
+            require(registriesReady == type(uint256).max && hubsReady == type(uint64).max, DexErrors.NOT_READY);
+            active = true;
+        }
+        emit RootStatus(active);
+    }
+    /// @notice Alias of setRootActive
+    function setActive(bool _active) external {
+        setRootActive(_active);
+    }
+
+    /// @notice The owner sets the fees of new pairs: a decrease applies at once, an increase is proposed and waits
+    /// DexConstants.NEW_PAIR_FEE_INCREASE_DELAY (applyFees)
+    function setFees(uint128 _poolNumerator, uint128 _beneficiaryNumerator) external onlyOwner {
+        _requireValidFee(_poolNumerator, _beneficiaryNumerator);
+
+        if (_poolNumerator <= poolNumerator && _beneficiaryNumerator <= beneficiaryNumerator) {
+            poolNumerator = _poolNumerator;
+            beneficiaryNumerator = _beneficiaryNumerator;
+            _clearPendingFees();
+            emit FeesChanged(_poolNumerator, _beneficiaryNumerator);
+        } else {
+            pendingPoolNumerator = _poolNumerator;
+            pendingBeneficiaryNumerator = _beneficiaryNumerator;
+            pendingFeeAvailableAt = uint32(block.timestamp) + DexConstants.NEW_PAIR_FEE_INCREASE_DELAY;
+            emit FeesProposed(_poolNumerator, _beneficiaryNumerator, pendingFeeAvailableAt, pendingFeeAvailableAt + DexConstants.ROOT_PROPOSAL_APPLY_WINDOW);
+        }
+    }
+
+    /// @notice The owner applies a proposed fee increase after its delay, within DexConstants.ROOT_PROPOSAL_APPLY_WINDOW
+    function applyFees() external onlyOwner {
+        require(pendingFeeAvailableAt > 0, DexErrors.NO_PENDING);
+        require(uint32(block.timestamp) >= pendingFeeAvailableAt, DexErrors.TIMELOCK_ACTIVE);
+        require(uint32(block.timestamp) <= pendingFeeAvailableAt + DexConstants.ROOT_PROPOSAL_APPLY_WINDOW, DexErrors.EXPIRED);
+        poolNumerator = pendingPoolNumerator;
+        beneficiaryNumerator = pendingBeneficiaryNumerator;
+        _clearPendingFees();
+        emit FeesChanged(poolNumerator, beneficiaryNumerator);
+    }
+
+    /// @notice No fee increase is proposed any more: the getters show zeros, not a dropped proposal
+    function _clearPendingFees() private {
+        pendingFeeAvailableAt = 0;
+        pendingPoolNumerator = 0;
+        pendingBeneficiaryNumerator = 0;
+    }
+
+    /// @notice A fee is at most 5% and not zero: the pool/beneficiary split divides by their sum. The beneficiary part is
+    /// at most the pool part: liquidity providers get at least half of the fee
+    function _requireValidFee(uint128 _poolNumerator, uint128 _beneficiaryNumerator) private pure {
+        uint128 total = _poolNumerator + _beneficiaryNumerator;
+        require(total > 0 && total <= DexConstants.MAX_PAIR_FEE_NUMERATOR, DexErrors.INVALID_AMOUNT);
+        require(_beneficiaryNumerator <= _poolNumerator, DexErrors.INVALID_AMOUNT);
+    }
+
+    // ==========================================
+    // Pairs and vaults: pause, freeze, beneficiary, fees, native surplus
+    // ==========================================
+
+    /// @notice Admin calls are forwarded with the caller's gas and do not bounce: too little gas would be lost
+    /// silently, so it is checked here
+    function _requireAdminGas() private pure {
+        require(msg.value >= DexGas.adminCallMinValue(), DexErrors.NOT_ENOUGH_GAS);
+    }
+
+    /// @notice Pausing is for the owner or the manager; lifting it is for the owner only
+    function _requireStopRights(bool stopping) private view {
+        _requireAdminGas();
+        bool allowed = msg.sender == owner || (stopping && msg.sender == manager);
+        require(allowed, DexErrors.NOT_AUTHORIZED);
+    }
+
+    /// @notice Freezing is for the owner or the manager; lifting it is for the owner only
+    function _requireFreezeRights(bool freezing) private view {
+        _requireAdminGas();
+        // the owner sets and lifts it, the manager only sets it. The upgrader only upgrades code and goes away with
+        // renounceUpgrades
+        bool allowed = msg.sender == owner || (freezing && msg.sender == manager);
+        require(allowed, DexErrors.NOT_AUTHORIZED);
+    }
+
+    /// @notice Pauses a pair or a vault (the owner or the manager) or lifts the pause (the owner only). Pause stops swaps
+    /// and deposits; withdrawals of liquidity still work
+    function setChildPaused(address target, bool _paused) external view {
+        _requireStopRights(_paused);
+        IDexStoppable(target).setPaused{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_paused, msg.sender);
+    }
+
+    /// @notice Freezes a pair or a vault (the owner or the manager) or lifts the freeze (the owner only). Freeze stops
+    /// everything, withdrawals and payouts included
+    function setChildFrozen(address target, bool _frozen) external view {
+        _requireFreezeRights(_frozen);
+        IDexStoppable(target).setFrozen{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_frozen, msg.sender);
+    }
+
+    /// @notice The owner pauses or lifts the pause of many pairs and vaults with one call (up to DexConstants.MAX_ADMIN_BATCH_TARGETS), as setChildPaused each
+    function setChildrenPaused(address[] targets, bool _paused) external onlyOwner {
+        uint128 childValue = _reserveForBatch(targets.length, DexGas.BATCH_CHILD, 0, 0);
+        for (address target : targets) {
+            IDexStoppable(target).setPaused{ value: varuint16(childValue), flag: 0, bounce: false }(_paused, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner freezes or unfreezes many pairs and vaults with one call, as setChildFrozen each
+    function setChildrenFrozen(address[] targets, bool _frozen) external onlyOwner {
+        uint128 childValue = _reserveForBatch(targets.length, DexGas.BATCH_CHILD, 0, 0);
+        for (address target : targets) {
+            IDexStoppable(target).setFrozen{ value: varuint16(childValue), flag: 0, bounce: false }(_frozen, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner lets users take their funds out of many stopped pairs and vaults (or takes that back) with one
+    /// call, as setChildWithdrawals each: after a freeze of many, one request of its multisig opens their withdrawals
+    function setChildrenWithdrawals(address[] targets, bool allowed) external view onlyOwner {
+        uint128 childValue = _reserveForBatch(targets.length, DexGas.BATCH_CHILD, 0, 0);
+        for (address target : targets) {
+            IDexStoppable(target).setWithdrawalsAllowed{ value: varuint16(childValue), flag: 0, bounce: false }(allowed, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner freezes or unfreezes buys of many curves with one call (up to DexConstants.MAX_ADMIN_BATCH_TARGETS), as setLaunchFrozen each
+    function setLaunchesFrozen(uint64[] nonces, bool _frozen) external view onlyOwner {
+        address launchpad_ = _activeLaunchpad();
+        uint128 childValue = _reserveForBatch(nonces.length, DexGas.BATCH_CURVE, DexGas.BATCH_CURVE_FORWARD, 0);
+        for (uint64 nonce : nonces) {
+            ILaunchpadAdmin(launchpad_).setCurveFrozen{ value: varuint16(childValue), flag: 0, bounce: false }(nonce, _frozen, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice A batch has 1..MAX_CHILDREN_BATCH targets (the root's gas and outgoing messages are bounded) and, for
+    /// each of them, `childGas` and `childForward` EVER sent on and `rootGas` of the root's own on top of an admin
+    /// call; the root keeps the balance it had, the rest goes back to the caller. Returns the value of one target (the
+    /// gas price is read once for the batch)
+    function _reserveForBatch(uint256 count, uint128 childGas, uint128 childForward, uint128 rootGas) private pure returns (uint128 childValue) {
+        require(count > 0 && count <= DexConstants.MAX_ADMIN_BATCH_TARGETS, DexErrors.INVALID_AMOUNT);
+        uint128 price = DexGas.gasPrice();
+        childValue = DexGas.valueAt(price, childGas) + childForward;
+        uint128 need = DexGas.valueAt(price, DexGas.ADMIN_CALL) + uint128(count) * (childValue + DexGas.valueAt(price, rootGas));
+        require(msg.value >= need, DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+    }
+
+    /// @notice The owner adds (`listed`) or removes token addresses of a token list (TokenList: the white or the black
+    /// one): 1..MAX_LIST_UPDATE addresses, the reason (for the events) within
+    /// MAX_REASON_BYTES. At once: a label moves no funds. The call goes on without a bounce, so the gas of every address
+    /// is checked here (an update short of gas would be lost silently); the list returns the gas left to the owner
+    function updateTokenList(address list, address[] tokens, bool listed, string reason) external view onlyOwner {
+        require(
+            tokens.length > 0 && tokens.length <= DexConstants.MAX_TOKEN_LIST_UPDATE && reason.byteLength() <= DexConstants.OWNER_WITHDRAWAL_MAX_REASON_BYTES,
+            DexErrors.INVALID_AMOUNT
+        );
+        require(msg.value >= DexGas.gasValue(DexGas.ADMIN_CALL + uint128(tokens.length) * DexGas.LIST_ENTRY), DexErrors.NOT_ENOUGH_GAS);
+        ITokenList(list).update{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(tokens, listed, reason, msg.sender);
+    }
+
+    /// @notice The owner creates a token of the exchange's owner: the standard tokens of the world (USDT, BTC,
+    /// ETH…) that only the owner issues and a bridge mints later. The `factory` (the exchange's TokenFactory of this root — it takes the call
+    /// only from it) deploys a simple token owned by the owner's multisig: nothing minted, minting open (the owner and
+    /// later the bridge mint), burning on others' wallets closed. Its symbol is reserved at the launchpad and then at the
+    /// factory (_reserveThen): neither creates it for anyone else. The white and the reserved lists take the token by
+    /// updateTokenList. Every input is checked here, before the launchpad reserves the symbol, so the factory refuses only
+    /// a symbol reserved already; the gas left comes back to the owner
+    function createOwnerToken(address factory, string name, string symbol, uint8 decimals) external view onlyOwner {
+        require(TokenSymbol.validName(name), DexErrors.INVALID_AMOUNT);
+        require(TokenSymbol.valid(symbol), DexErrors.INVALID_AMOUNT);
+        require(decimals <= DexConstants.OWNER_TOKEN_MAX_DECIMALS, DexErrors.INVALID_DECIMALS);
+        require(msg.value >= DexGas.ownerTokenValue(name, symbol), DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        _reserveThen([symbol], true, abi.encode(true, factory, abi.encode(name, symbol, decimals, msg.sender)));
+    }
+
+    /// @notice The launchpad reserves (`isReserved`) or frees `symbols` first, and only then the root goes on at the
+    /// factory with `factoryCall` (a chain, not two messages at once): a refusal of the launchpad
+    /// bounces here (ReservedSymbolsRefused), and the factory is not asked. Without a launchpad the factory is asked at once
+    function _reserveThen(string[] symbols, bool isReserved, TvmCell factoryCall) private view {
+        if (_noLaunchpad()) {
+            _callFactory(factoryCall);
+            return;
+        }
+        ILaunchpadAdmin(launchpad).setReserved{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(symbols, isReserved, factoryCall);
+    }
+
+    /// @notice The launchpad has reserved the symbols: the factory's part of createOwnerToken or setReservedSymbols
+    function onSymbolsReserved(TvmCell factoryCall) external view {
+        require(msg.sender == launchpad && !_noLaunchpad(), DexErrors.NOT_AUTHORIZED);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        _callFactory(factoryCall);
+    }
+
+    /// @notice The factory's part: an owner's token (name, symbol, decimals) or a reservation of symbols, its gas left to
+    /// `sendGasTo`
+    function _callFactory(TvmCell factoryCall) private view {
+        (bool ownerToken, address factory, TvmCell args) = abi.decode(factoryCall, (bool, address, TvmCell));
+        if (ownerToken) {
+            (string name, string symbol, uint8 decimals, address gasTo) = abi.decode(args, (string, string, uint8, address));
+            ITokenFactoryOwner(factory).createOwnerToken{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: true }(
+                name, symbol, decimals, owner, gasTo
+            );
+            return;
+        }
+        (string[] symbols, bool isReserved, address sendGasTo) = abi.decode(args, (string[], bool, address));
+        ITokenFactoryOwner(factory).setReserved{ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false }(symbols, isReserved, sendGasTo);
+    }
+
+    /// @notice The owner reserves (`isReserved`) or frees 1..MAX_RESERVED_SYMBOLS symbols at the launchpad and then at
+    /// the `factory` (_reserveThen): a symbol of the owner without a token of its own (TON next to GRAM). Exactly these
+    /// bytes: «USDT» and «usdt» are different symbols
+    function setReservedSymbols(address factory, string[] symbols, bool isReserved) external view onlyOwner {
+        require(symbols.length > 0 && symbols.length <= DexConstants.MAX_RESERVED_SYMBOLS, DexErrors.INVALID_AMOUNT);
+        // length only: a reserved symbol with a space is harmless — no one creates such a token — and checking 50 symbols
+        // byte by byte would cost up to a whole transaction's gas (TokenSymbol.valid: about 350 gas an ASCII byte, up to about 4 000 a character beyond ASCII)
+        for (string symbol : symbols) {
+            require(symbol.byteLength() > 0 && symbol.byteLength() <= DexConstants.TOKEN_SYMBOL_MAX_BYTES, DexErrors.INVALID_AMOUNT);
+        }
+        require(msg.value >= DexGas.reservedSymbolsValue(symbols.length), DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        _reserveThen(symbols, isReserved, abi.encode(false, factory, abi.encode(symbols, isReserved, msg.sender)));
+    }
+
+    /// @notice Users' tokens at the `factory` stop (the owner or the manager) or go on (the owner only); the owner's tokens
+    /// go on. The factory starts paused and takes the call only from this root
+    function setFactoryPaused(address factory, bool _paused) external view {
+        _requireStopRights(_paused);
+        ITokenFactoryOwner(factory).setPaused{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_paused, msg.sender);
+    }
+
+    /// @notice While a pair or a vault is stopped (frozen or upgrading), the owner may let users take their funds out of
+    /// it (and take that back); the end of the stop takes it back by itself. The owner only: it lifts part of a stop
+    function setChildWithdrawals(address target, bool allowed) external view onlyOwner {
+        _requireAdminGas();
+        IDexStoppable(target).setWithdrawalsAllowed{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(allowed, msg.sender);
+    }
+
+    /// @notice The owner sets the beneficiary of a pair's fees (a standard address of workchain 0)
+    function setPairBeneficiary(address pair, address _beneficiary) external view onlyOwner {
+        require(_isStd0(_beneficiary), DexErrors.INVALID_AMOUNT);
+        _requireAdminGas();
+        IDexPairAdmin(pair).setBeneficiary{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_beneficiary, msg.sender);
+    }
+
+    /// @notice The owner proposes a fee of an existing pair. Any fee change of an existing pair waits
+    /// DexConstants.NEW_PAIR_FEE_INCREASE_DELAY and then applyPairFee, a decrease too; the pair of a
+    /// launch token refuses a lower beneficiary part (DexPairGovernance.proposeFee). The root's own fees (setFees) are
+    /// those of new pairs only
+    function setPairFee(address pair, uint128 _poolNumerator, uint128 _beneficiaryNumerator) external view onlyOwner {
+        _requireAdminGas();
+        _requireValidFee(_poolNumerator, _beneficiaryNumerator);
+        IDexPairAdmin(pair).proposeFee{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_poolNumerator, _beneficiaryNumerator, msg.sender);
+    }
+
+    /// @notice The owner applies the proposed fee of a pair after its delay
+    function applyPairFee(address pair) external view onlyOwner {
+        _requireAdminGas();
+        IDexPairAdmin(pair).applyFee{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    /// @notice The owner proposes one fee to up to DexConstants.MAX_ADMIN_BATCH_TARGETS pairs with one call, as setPairFee each
+    function setPairsFee(address[] pairs, uint128 _poolNumerator, uint128 _beneficiaryNumerator) external view onlyOwner {
+        _requireValidFee(_poolNumerator, _beneficiaryNumerator);
+        uint128 childValue = _reserveForBatch(pairs.length, DexGas.BATCH_CHILD, 0, 0);
+        for (address pair : pairs) {
+            IDexPairAdmin(pair).proposeFee{ value: varuint16(childValue), flag: 0, bounce: false }(_poolNumerator, _beneficiaryNumerator, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner applies the proposed fees of up to DexConstants.MAX_ADMIN_BATCH_TARGETS pairs with one call, as applyPairFee each
+    function applyPairsFee(address[] pairs) external view onlyOwner {
+        uint128 childValue = _reserveForBatch(pairs.length, DexGas.BATCH_CHILD, 0, 0);
+        for (address pair : pairs) {
+            IDexPairAdmin(pair).applyFee{ value: varuint16(childValue), flag: 0, bounce: false }(msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner changes A of a stable pair smoothly: the pair records the first call and starts the change on the
+    /// same call after its timelock (DexPairGovernance.setAmplification)
+    function setPairAmplification(address pair, uint32 target, uint32 duration) external view onlyOwner {
+        _requireAdminGas();
+        require(PairQuotes.isAmplificationInRange(target), DexErrors.INVALID_AMPLIFICATION);
+        IDexPairAdmin(pair).setAmplification{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(target, duration, msg.sender);
+    }
+
+    /// @notice The owner moves EVER settled on the LP root of a pair to the pair (they do not leave the exchange), then
+    /// withdraws them as the pair's EVER surplus
+    function collectLpRootSurplus(address pair) external view onlyOwner {
+        _requireAdminGas();
+        IDexPairAdmin(pair).collectLpRootSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    /// @notice EVER that belong to nobody on `target` — the root itself, a pair or a vault (EverSurplus): the owner
+    /// announces their withdrawal with `reason` for the exchange's log, runs it with withdrawEverSurplus not before
+    /// 2 days, and only within what `target` holds above what it keeps (its reserve and all it owes)
+    function announceEverSurplus(address target, uint128 amount, address recipient, string reason) external onlyOwner {
+        _requireAdminGas();
+        if (target == address(this)) {
+            _announceEverSurplus(amount, recipient, reason, msg.sender);
+            return;
+        }
+        IEverSurplusAdmin(target).announceEverSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            amount, recipient, reason, msg.sender
+        );
+    }
+
+    /// @notice The owner cancels the announced EVER surplus withdrawal of `target`
+    function cancelEverSurplus(address target) external onlyOwner {
+        _requireAdminGas();
+        if (target == address(this)) {
+            _cancelEverSurplus(msg.sender);
+            return;
+        }
+        IEverSurplusAdmin(target).cancelEverSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    /// @notice The owner runs the announced EVER surplus withdrawal of `target`
+    function withdrawEverSurplus(address target) external onlyOwner {
+        _requireAdminGas();
+        if (target == address(this)) {
+            _withdrawEverSurplus(msg.sender);
+            return;
+        }
+        IEverSurplusAdmin(target).withdrawEverSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    /// @notice The root keeps ROOT_MIN_BALANCE for the storage of all the codes; it owes nobody EVER (a bounced deploy
+    /// returns the bounced value itself)
+    function _everKept() internal view override returns (uint128) {
+        return DexGas.ROOT_MIN_BALANCE;
+    }
+
+    /// @notice The root has no freeze: a paused root (active = false) stops deploys only
+    function _everSurplusFrozen() internal view override returns (bool) {
+        return false;
+    }
+
+    /// @notice Tokens that came to a token vault without a notification (surplus tokens, unrecorded in accounting):
+    /// the owner announces their withdrawal with a reason for the exchange's log, runs it with withdrawTokenSurplus
+    /// not before 2 days, and only within what the vault holds above what it owes
+    function announceTokenSurplus(address tokenRoot, uint128 amount, address recipient, string reason) external view onlyOwner {
+        _requireAdminGas();
+        IDexTokenVaultAdmin(getVaultAddress(tokenRoot)).announceTokenSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            amount, recipient, reason, msg.sender
+        );
+    }
+
+    /// @notice The owner cancels the announced token surplus withdrawal of the vault of `tokenRoot`
+    function cancelTokenSurplus(address tokenRoot) external view onlyOwner {
+        _requireAdminGas();
+        IDexTokenVaultAdmin(getVaultAddress(tokenRoot)).cancelTokenSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    /// @notice The owner runs the announced token surplus withdrawal of the vault of `tokenRoot`
+    function withdrawTokenSurplus(address tokenRoot) external view onlyOwner {
+        _requireAdminGas();
+        IDexTokenVaultAdmin(getVaultAddress(tokenRoot)).withdrawTokenSurplus{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(msg.sender);
+    }
+
+    // ==========================================
+    // Code upgrade
+    // ==========================================
+
+    /// @notice The upgrader proposes a code of `kind` (until upgrades are renounced); it waits codeDelay. A new
+    /// proposal replaces the pending one: the replaced is cancelled (CodeCancelled), so a watcher of the
+    /// events does not take its hash for still pending. Empty code is refused
+    function proposeCode(uint8 kind, TvmCell code) external onlyUpgrades {
+        require(kind >= DexConstants.CODE_KIND_PAIR && kind <= DexConstants.CODE_KIND_HUB, DexErrors.INVALID_CODE_KIND);
+        require(!code.toSlice().empty(), DexErrors.INVALID_CODE_KIND);
+        // the token codes: exactly the two codes and nothing else, or applyCode could not take them apart
+        require(kind != DexConstants.CODE_KIND_TOKEN || code.toSlice().bits() == 0 && code.toSlice().refs() == 2, DexErrors.INVALID_CODE_KIND);
+        if (pendingCodeKind != 0) {
+            emit CodeCancelled(pendingCodeKind);
+        }
+        pendingCodeKind = kind;
+        pendingCode = code;
+        pendingCodeAvailableAt = uint32(block.timestamp) + codeDelay;
+        emit CodeProposed(kind, tvm.hash(code), pendingCodeAvailableAt, pendingCodeAvailableAt + DexConstants.ROOT_PROPOSAL_APPLY_WINDOW);
+    }
+
+    /// @notice The upgrader cancels the proposed code, or the owner vetoes it
+    function cancelCode() external onlyUpgraderOrOwner {
+        require(pendingCodeKind != 0, DexErrors.NO_PENDING);
+        emit CodeCancelled(pendingCodeKind);
+        _clearPendingCode();
+    }
+
+    /// @notice Installs the proposed code after codeDelay, within DexConstants.ROOT_PROPOSAL_APPLY_WINDOW: the version of its kind grows
+    /// by one. Pairs and vaults move to it by upgradePair / upgradeVault; the root moves at once, and only closed (ROOT_ACTIVE).
+    /// The owner installs it, naming the kind and the hash of the code it approves: the upgrader proposes and moves, but
+    /// the owner must approve the installation. Not after renounceUpgrades
+    function applyCode(uint8 expectedKind, uint256 expectedCodeHash) external onlyOwner {
+        require(!upgradesRenounced, DexErrors.NOT_AUTHORIZED);
+        require(pendingCodeKind != 0, DexErrors.NO_PENDING);
+        require(pendingCodeKind == expectedKind && tvm.hash(pendingCode) == expectedCodeHash, DexErrors.NOT_AUTHORIZED);
+        // the root's own code only on a closed root: answers of the deploy registry already on
+        // their way would meet the new code, and an address could stay taken in the registry without a contract
+        require(pendingCodeKind != DexConstants.CODE_KIND_ROOT || !active, DexErrors.ROOT_ACTIVE);
+        require(uint32(block.timestamp) >= pendingCodeAvailableAt, DexErrors.TIMELOCK_ACTIVE);
+        require(uint32(block.timestamp) <= pendingCodeAvailableAt + DexConstants.ROOT_PROPOSAL_APPLY_WINDOW, DexErrors.EXPIRED);
+        uint8 kind = pendingCodeKind;
+        TvmCell code = pendingCode;
+        _clearPendingCode();
+        if (kind == DexConstants.CODE_KIND_PAIR) {
+            pairCode = code;
+            pairVersion++;
+            emit CodeApplied(kind, pairVersion);
+        } else if (kind == DexConstants.CODE_KIND_TOKEN_VAULT) {
+            vaultCode = code;
+            vaultVersion++;
+            emit CodeApplied(kind, vaultVersion);
+        } else if (kind == DexConstants.CODE_KIND_NATIVE_VAULT) {
+            nativeVaultCode = code;
+            nativeVaultVersion++;
+            emit CodeApplied(kind, nativeVaultVersion);
+        } else if (kind == DexConstants.CODE_KIND_LP_ACCOUNT) {
+            lpAccountCode = code;
+            lpAccountVersion++;
+            emit CodeApplied(kind, lpAccountVersion);
+        } else if (kind == DexConstants.CODE_KIND_REGISTRY) {
+            registryCode = code;
+            registryVersion++;
+            emit CodeApplied(kind, registryVersion);
+        } else if (kind == DexConstants.CODE_KIND_HUB) {
+            hubCode = code;
+            hubVersion++;
+            emit CodeApplied(kind, hubVersion);
+        } else if (kind != DexConstants.CODE_KIND_ROOT) {
+            // the instances start at version 1: the first installed code is version 2
+            uint32 version = (installedCodes.exists(kind) ? installedCodes[kind].version : 1) + 1;
+            installedCodes[kind] = InstalledCode(code, version);
+            // the LP tokens of new pairs take the new token codes at once; the deployed pairs keep theirs
+            if (kind == DexConstants.CODE_KIND_TOKEN) {
+                (lpRootCode, lpWalletCode) = abi.decode(code, (TvmCell, TvmCell));
+            }
+            emit CodeApplied(kind, version);
+        } else {
+            emit CodeApplied(kind, rootVersion + 1);
+            _upgradeRoot(code);
+        }
+    }
+
+    function _clearPendingCode() private {
+        TvmCell empty;
+        pendingCodeKind = 0;
+        pendingCode = empty;
+        pendingCodeAvailableAt = 0;
+    }
+
+    /// @notice Moves a pair to the installed pair code (the upgrader only);
+    /// the pair refuses an older version
+    function upgradePair(address tokenA, address tokenB, bool isStable) external view onlyUpgrader {
+        _requireAdminGas();
+        IDexUpgradable(getPairAddress(tokenA, tokenB, isStable)).upgrade{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            pairCode, pairVersion, msg.sender
+        );
+    }
+
+    /// @notice Moves the vault of `tokenRoot` (0 — the native vault) to the installed code (the upgrader only)
+    function upgradeVault(address tokenRoot) external view onlyUpgrader {
+        _requireAdminGas();
+        bool native = tokenRoot == address(0);
+        IDexUpgradable(native ? getNativeVaultAddress() : getVaultAddress(tokenRoot)).upgrade{
+            value: 0,
+            flag: MsgFlag.REMAINING_GAS,
+            bounce: false
+        }(native ? nativeVaultCode : vaultCode, native ? nativeVaultVersion : vaultVersion, msg.sender);
+    }
+
+    /// @notice The upgrader moves up to DexConstants.MAX_PAIR_UPGRADE_BATCH pairs to the installed pair code with one call, as upgradePair
+    /// each. The pairs are named by their tokens: the root computes their addresses, so the pair code never goes to
+    /// another contract. A pair on the installed version already refuses and returns its gas, as the rest of the value
+    /// comes back to the upgrader
+    function upgradePairs(PairKey[] pairs) external view onlyUpgrader {
+        require(pairs.length <= DexConstants.MAX_PAIR_UPGRADE_BATCH, DexErrors.INVALID_AMOUNT);
+        uint128 childValue = _reserveForBatch(pairs.length, DexGas.BATCH_UPGRADE, DexGas.PAIR_FORWARD, DexGas.BATCH_UPGRADE_ROOT);
+        for (PairKey key : pairs) {
+            IDexUpgradable(getPairAddress(key.tokenA, key.tokenB, key.isStable)).upgrade{
+                value: varuint16(childValue),
+                flag: 0,
+                bounce: false
+            }(pairCode, pairVersion, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The same for vaults, named by their tokens (0 — the native vault), as upgradeVault each
+    function upgradeVaults(address[] tokenRoots) external view onlyUpgrader {
+        require(tokenRoots.length <= DexConstants.MAX_VAULT_UPGRADE_BATCH, DexErrors.INVALID_AMOUNT);
+        uint128 childValue = _reserveForBatch(tokenRoots.length, DexGas.BATCH_UPGRADE, DexGas.VAULT_FORWARD, DexGas.BATCH_UPGRADE_ROOT);
+        for (address tokenRoot : tokenRoots) {
+            bool native = tokenRoot == address(0);
+            IDexUpgradable(native ? getNativeVaultAddress() : getVaultAddress(tokenRoot)).upgrade{
+                value: varuint16(childValue),
+                flag: 0,
+                bounce: false
+            }(native ? nativeVaultCode : vaultCode, native ? nativeVaultVersion : vaultVersion, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The upgrader moves an instance of `kind` (a token list, the token factory, the launchpad) at `target` to the installed code of that kind.
+    /// The root does not know these instances: the target takes the code only from its own root, only of its own kind
+    /// and only a newer version, anything else gives the gas back
+    function upgradeContract(uint8 kind, address target) external view onlyUpgrader {
+        _requireAdminGas();
+        optional(InstalledCode) installed = installedCodes.fetch(kind);
+        require(installed.hasValue(), DexErrors.NO_PENDING);
+        IDexUpgradableInstance(target).upgrade{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            kind, installed.get().code, installed.get().version, msg.sender
+        );
+    }
+
+    /// @notice The upgrader hands the installed token codes (kind DexConstants.CODE_KIND_TOKEN) to the token factory or the
+    /// launchpad at `target`: their new tokens are deployed with them. The target takes them only from its own root and
+    /// only of a newer version (the launchpad only while it stands with no launch on its way); anything else gives the gas back
+    function setTokenCode(address target) external view onlyUpgrader {
+        _requireAdminGas();
+        optional(InstalledCode) installed = installedCodes.fetch(DexConstants.CODE_KIND_TOKEN);
+        require(installed.hasValue(), DexErrors.NO_PENDING);
+        (TvmCell rootCode, TvmCell walletCode) = abi.decode(installed.get().code, (TvmCell, TvmCell));
+        ITokenCodeHolder(target).setTokenCode{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            rootCode, walletCode, installed.get().version, msg.sender
+        );
+    }
+
+    /// @notice The upgrader hands the installed curve code (kind DexConstants.CODE_KIND_LAUNCH_CURVE) to the launchpad: new
+    /// curves are deployed with it, the deployed ones move to it with upgradeLaunches
+    function setLaunchCurveCode() external view onlyUpgrader {
+        _requireAdminGas();
+        optional(InstalledCode) installed = installedCodes.fetch(DexConstants.CODE_KIND_LAUNCH_CURVE);
+        require(installed.hasValue(), DexErrors.NO_PENDING);
+        ILaunchpadAdmin(_activeLaunchpad()).setCurveCode{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(
+            installed.get().code, installed.get().version, msg.sender
+        );
+    }
+
+    /// @notice The upgrader moves up to DexConstants.MAX_ADMIN_BATCH_TARGETS curves to the launchpad's curve code, by
+    /// their numbers (two hops: the launchpad and the curve, which forwards the code). A curve on that version already
+    /// gives its gas back
+    function upgradeLaunches(uint64[] nonces) external view onlyUpgrader {
+        address launchpad_ = _activeLaunchpad();
+        uint128 childValue = _reserveForBatch(nonces.length, DexGas.BATCH_CURVE_UPGRADE, DexGas.CURVE_CODE_FORWARD, 0);
+        for (uint64 nonce : nonces) {
+            ILaunchpadAdmin(launchpad_).upgradeCurve{ value: varuint16(childValue), flag: 0, bounce: false }(nonce, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The upgrader's stop of up to DexConstants.MAX_ADMIN_BATCH_TARGETS curves for a move to a new code (the
+    /// rights of setPairsUpgrading): no new operation starts at them, the answers on their way are taken
+    function setLaunchesUpgrading(uint64[] nonces, bool _upgrading) external view {
+        _requireUpgradingRights(_upgrading);
+        address launchpad_ = _activeLaunchpad();
+        uint128 childValue = _reserveForBatch(nonces.length, DexGas.BATCH_CURVE, DexGas.BATCH_CURVE_FORWARD, 0);
+        for (uint64 nonce : nonces) {
+            ILaunchpadAdmin(launchpad_).setCurveUpgrading{ value: varuint16(childValue), flag: 0, bounce: false }(nonce, _upgrading, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The upgrader's stop of new launches for a move of the launchpad to a new code (the rights of
+    /// setPairsUpgrading); the launchpad moves only while it stands and no launch is on its way
+    function setLaunchpadUpgrading(bool _upgrading) external view {
+        _requireUpgradingRights(_upgrading);
+        _requireAdminGas();
+        ILaunchpadAdmin(_activeLaunchpad()).setUpgrading{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_upgrading, msg.sender);
+    }
+
+    /// @notice The upgrader hands the installed LpAccount code to up to DexConstants.MAX_ADMIN_BATCH_TARGETS pairs, named by
+    /// their tokens: a pair carries it to every LpAccount of its depositors with their next deposit, and the account
+    /// moves to it (LpAccount.fallback). A pair with that version already ignores it. Stop the
+    /// pairs first when the new code talks to them otherwise (setPairsUpgrading)
+    function setPairsLpAccountCode(PairKey[] pairs) external view onlyUpgrader {
+        uint128 childValue = _reserveForBatch(pairs.length, DexGas.BATCH_CHILD, DexGas.LP_ACCOUNT_FORWARD, DexGas.BATCH_UPGRADE_ROOT);
+        for (PairKey key : pairs) {
+            IDexPairAdmin(getPairAddress(key.tokenA, key.tokenB, key.isStable)).setLpAccountCode{
+                value: varuint16(childValue),
+                flag: 0,
+                bounce: false
+            }(lpAccountCode, lpAccountVersion, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The stop for an upgrade: the upgrader sets and lifts it until the upgrades are
+    /// renounced, the owner lifts it (one left by an upgrader that lost its keys or renounced). Apart from the freeze
+    function _requireUpgradingRights(bool stopping) private view {
+        bool upgrades = msg.sender == upgrader && !upgradesRenounced;
+        require(stopping ? upgrades && !upgraderStopsDisabled : upgrades || msg.sender == owner, DexErrors.NOT_AUTHORIZED);
+    }
+
+    /// @notice The owner takes from the upgrader the right to stop pairs and vaults for an upgrade, or gives it back.
+    /// The upgrader still proposes code (the owner's veto stays) and lifts its stops
+    function setUpgraderStops(bool allowed) external onlyOwner {
+        upgraderStopsDisabled = !allowed;
+        emit UpgraderStopsAllowed(allowed);
+    }
+
+    /// @notice Stops (or lets go) up to DexConstants.MAX_ADMIN_BATCH_TARGETS pairs for a move to a code with other
+    /// messages: what was on its way to them is refused as by a freeze, not run by the new code. Named by their tokens,
+    /// as upgradePairs: the root computes the addresses. The rest of the value comes back to the caller
+    function setPairsUpgrading(PairKey[] pairs, bool _upgrading) external view {
+        _requireUpgradingRights(_upgrading);
+        uint128 childValue = _reserveForBatch(pairs.length, DexGas.BATCH_CHILD, 0, DexGas.BATCH_UPGRADE_ROOT);
+        for (PairKey key : pairs) {
+            IDexStoppable(getPairAddress(key.tokenA, key.tokenB, key.isStable)).setUpgrading{
+                value: varuint16(childValue),
+                flag: 0,
+                bounce: false
+            }(_upgrading, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The same for registry shards, named by their indexes (the rights of setPairsUpgrading)
+    function setRegistriesUpgrading(uint8[] indexes, bool _upgrading) external view {
+        _requireUpgradingRights(_upgrading);
+        uint128 childValue = _reserveForBatch(indexes.length, DexGas.BATCH_CHILD, 0, DexGas.BATCH_UPGRADE_ROOT);
+        for (uint8 index : indexes) {
+            IDexStoppable(getRegistryAddress(index)).setUpgrading{ value: varuint16(childValue), flag: 0, bounce: false }(_upgrading, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Moves registry shards (by index, up to DexConstants.MAX_ADMIN_BATCH_TARGETS) to the installed shard code, as
+    /// upgradeVaults; a shard moves only stopped
+    function upgradeRegistries(uint8[] indexes) external view onlyUpgrader {
+        uint128 childValue = _reserveForBatch(indexes.length, DexGas.BATCH_UPGRADE, DexGas.REGISTRY_FORWARD, DexGas.BATCH_UPGRADE_ROOT);
+        for (uint8 index : indexes) {
+            IDexUpgradable(getRegistryAddress(index)).upgrade{ value: varuint16(childValue), flag: 0, bounce: false }(registryCode, registryVersion, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Deploys the registry shards `first`…`first + count - 1` not sent yet (up to
+    /// DexConstants.MAX_ADMIN_BATCH_TARGETS a call; a shard's address does not depend on who deploys it): anyone pays
+    /// deployRegistryValue for each, the rest comes back (a shard sends what its deploy did not use too, a bounced deploy
+    /// its value). Done at the exchange's deploy, before the owner opens it
+    function deployRegistries(uint8 first, uint8 count) external {
+        require(count > 0 && count <= DexConstants.MAX_ADMIN_BATCH_TARGETS && uint16(first) + count <= DexConstants.REGISTRY_SHARDS, DexErrors.INVALID_AMOUNT);
+        uint128 each = DexGas.deployRegistryValue();
+        require(msg.value >= uint128(count) * each + DexGas.gasValue(DexGas.BATCH_UPGRADE_ROOT * count), DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        TvmCell empty;
+        for (uint16 i = first; i < uint16(first) + count; i++) {
+            uint256 bit = uint256(1) << i;
+            if (registriesSent & bit != 0) {
+                continue;
+            }
+            registriesSent |= bit;
+            TvmCell params = _registryParams(uint8(i));
+            address shard = new DexPlatform{
+                stateInit: getPlatformStateInit(DexConstants.PLATFORM_TYPE_REGISTRY, params),
+                value: varuint16(each),
+                flag: 0,
+                bounce: true
+            }(registryCode, registryVersion, msg.sender, empty);
+            registriesDeploying[shard] = PendingDeploy(uint8(i), msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice A registry shard reports its deploy (only the shard itself); the value left goes to `sendGasTo`
+    function onRegistryDeployed(uint8 index, address sendGasTo) external {
+        require(msg.sender == getRegistryAddress(index), DexErrors.NOT_AUTHORIZED);
+        // the gas of the mark is the shard deployer's: what is left goes back to them, not into the root
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        delete registriesDeploying[msg.sender];
+        registriesReady |= uint256(1) << index;
+        emit RegistryDeployed(index, msg.sender);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Moves event hubs (by number family × HUBS_PER_FAMILY + index, up to DexConstants.MAX_ADMIN_BATCH_TARGETS) to
+    /// the installed hub code; a hub has no state to stop for, it moves at once
+    function upgradeHubs(uint8[] numbers) external view onlyUpgrader {
+        uint128 childValue = _reserveForBatch(numbers.length, DexGas.BATCH_UPGRADE, DexGas.HUB_FORWARD, DexGas.BATCH_UPGRADE_ROOT);
+        for (uint8 number : numbers) {
+            require(number < DexConstants.HUB_FAMILIES * DexConstants.HUBS_PER_FAMILY, DexErrors.INVALID_AMOUNT);
+            IDexUpgradable(getHubAddress(number / DexConstants.HUBS_PER_FAMILY, number % DexConstants.HUBS_PER_FAMILY)).upgrade{
+                value: varuint16(childValue), flag: 0, bounce: false
+            }(hubCode, hubVersion, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Deploys the event hubs `first`…`first + count - 1` (numbers family × HUBS_PER_FAMILY + index) not sent yet,
+    /// as deployRegistries: anyone pays deployHubValue for each, the rest comes back. Done at the exchange's deploy
+    function deployHubs(uint8 first, uint8 count) external {
+        uint8 total = DexConstants.HUB_FAMILIES * DexConstants.HUBS_PER_FAMILY;
+        require(count > 0 && count <= DexConstants.MAX_ADMIN_BATCH_TARGETS && uint16(first) + count <= total, DexErrors.INVALID_AMOUNT);
+        uint128 each = DexGas.deployHubValue();
+        require(msg.value >= uint128(count) * each + DexGas.gasValue(DexGas.BATCH_UPGRADE_ROOT * count), DexErrors.NOT_ENOUGH_GAS);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        TvmCell empty;
+        for (uint8 number = first; number < first + count; number++) {
+            uint64 bit = uint64(1) << number;
+            if (hubsSent & bit != 0) {
+                continue;
+            }
+            hubsSent |= bit;
+            TvmBuilder params;
+            params.store(number / DexConstants.HUBS_PER_FAMILY, number % DexConstants.HUBS_PER_FAMILY);
+            address hub = new DexPlatform{
+                stateInit: getPlatformStateInit(DexConstants.PLATFORM_TYPE_HUB, params.toCell()),
+                value: varuint16(each),
+                flag: 0,
+                bounce: true
+            }(hubCode, hubVersion, msg.sender, empty);
+            hubsDeploying[hub] = PendingDeploy(number, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice An event hub reports its deploy (only the hub itself); the value left goes to `sendGasTo`
+    function onHubDeployed(uint8 family, uint8 index, address sendGasTo) external {
+        require(msg.sender == getHubAddress(family, index), DexErrors.NOT_AUTHORIZED);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        delete hubsDeploying[msg.sender];
+        hubsReady |= uint64(1) << (family * DexConstants.HUBS_PER_FAMILY + index);
+        emit HubDeployed(family, index, msg.sender);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The hub code's version and the hubs sent and deployed (a bit by number)
+    function getHubData() internalMsg externalMsg external view returns (uint32 _version, uint64 _sent, uint64 _ready) {
+        return (hubVersion, hubsSent, hubsReady);
+    }
+
+    /// @notice The shard code's version and the shards sent and deployed (a bit by index)
+    function getRegistryData() internalMsg externalMsg external view returns (uint32 _version, uint256 _sent, uint256 _ready) {
+        return (registryVersion, registriesSent, registriesReady);
+    }
+
+    /// @notice The same for vaults, named by their tokens (0 — the native vault; the rights of setPairsUpgrading)
+    function setVaultsUpgrading(address[] tokenRoots, bool _upgrading) external view {
+        _requireUpgradingRights(_upgrading);
+        uint128 childValue = _reserveForBatch(tokenRoots.length, DexGas.BATCH_CHILD, 0, DexGas.BATCH_UPGRADE_ROOT);
+        for (address tokenRoot : tokenRoots) {
+            IDexStoppable(tokenRoot == address(0) ? getNativeVaultAddress() : getVaultAddress(tokenRoot)).setUpgrading{
+                value: varuint16(childValue),
+                flag: 0,
+                bounce: false
+            }(_upgrading, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The root's own state goes to its new code as a whole (Upgrade.tsol)
+    function _upgradeRoot(TvmCell code) private {
+        TvmCell codes = abi.encode(platformCode, vaultCode, nativeVaultCode, pairCode, lpAccountCode, lpRootCode, lpWalletCode);
+        TvmCell versions = abi.encode(platformVersion, vaultVersion, nativeVaultVersion, pairVersion, lpAccountVersion, rootVersion);
+        TvmCell fees = abi.encode(
+            poolNumerator, beneficiaryNumerator, beneficiary,
+            pendingFeeAvailableAt, pendingPoolNumerator, pendingBeneficiaryNumerator
+        );
+        TvmCell launch = abi.encode(launchpad, launchCurves);
+        TvmCell pairs = abi.encode(reservedPairList, pairRequests, pairRequestNonce);
+        TvmCell upgrades = abi.encode(upgrader, pendingUpgrader, upgradesRenounced, upgraderStopsDisabled, installedCodes, codeDelay);
+        TvmCell registry = abi.encode(registryCode, registryVersion, registriesSent, registriesReady, registriesDeploying);
+        TvmCell hubs = abi.encode(hubCode, hubVersion, hubsSent, hubsReady, hubsDeploying);
+        TvmCell state = abi.encode(owner, pendingOwner, manager, active, codes, versions, fees, registry, everSurplusRequest, launch, upgrades, pairs, hubs);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(_stateLayout(), rootVersion, rootVersion + 1, msg.sender, state));
+    }
+
+    /// @notice Layout of the state this code packs for its next code (Upgrade.tsol)
+    function _stateLayout() internal pure virtual returns (uint16) {
+        return DexConstants.ROOT_STATE_LAYOUT;
+    }
+
+    function onCodeUpgrade(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // layout 5 kept no payer of a shard's or a hub's deploy on its way: the owner gets a bounced one
+        require(layout == DexConstants.ROOT_STATE_LAYOUT || layout == DexConstants.ROOT_STATE_LAYOUT_5, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        TvmCell codes;
+        TvmCell versions;
+        TvmCell fees;
+        TvmCell launch;
+        TvmCell upgrades;
+        TvmCell pairs;
+        TvmCell registry;
+        TvmCell hubs;
+        (owner, pendingOwner, manager, active, codes, versions, fees, registry, everSurplusRequest, launch, upgrades, pairs, hubs) = abi.decode(
+            state,
+            (address, address, address, bool, TvmCell, TvmCell, TvmCell, TvmCell, optional(EverSurplusRequest), TvmCell, TvmCell, TvmCell, TvmCell)
+        );
+        if (layout == DexConstants.ROOT_STATE_LAYOUT) {
+            (hubCode, hubVersion, hubsSent, hubsReady, hubsDeploying) = abi.decode(
+                hubs, (TvmCell, uint32, uint64, uint64, mapping(address => PendingDeploy))
+            );
+            (registryCode, registryVersion, registriesSent, registriesReady, registriesDeploying) = abi.decode(
+                registry, (TvmCell, uint32, uint256, uint256, mapping(address => PendingDeploy))
+            );
+        } else {
+            mapping(address => uint8) hubNumbers;
+            mapping(address => uint8) shardIndexes;
+            (hubCode, hubVersion, hubsSent, hubsReady, hubNumbers) = abi.decode(hubs, (TvmCell, uint32, uint64, uint64, mapping(address => uint8)));
+            (registryCode, registryVersion, registriesSent, registriesReady, shardIndexes) = abi.decode(
+                registry, (TvmCell, uint32, uint256, uint256, mapping(address => uint8))
+            );
+            hubsDeploying = _paidByOwner(hubNumbers);
+            registriesDeploying = _paidByOwner(shardIndexes);
+        }
+        (launchpad, launchCurves) = abi.decode(launch, (address, mapping(address => address)));
+        (reservedPairList, pairRequests, pairRequestNonce) = abi.decode(pairs, (address, mapping(uint64 => PairRequest), uint64));
+        (upgrader, pendingUpgrader, upgradesRenounced, upgraderStopsDisabled, installedCodes, codeDelay) = abi.decode(
+            upgrades,
+            (address, address, bool, bool, mapping(uint8 => InstalledCode), uint32)
+        );
+        (platformCode, vaultCode, nativeVaultCode, pairCode, lpAccountCode, lpRootCode, lpWalletCode) = abi.decode(
+            codes,
+            (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell, TvmCell, TvmCell)
+        );
+        (platformVersion, vaultVersion, nativeVaultVersion, pairVersion, lpAccountVersion, rootVersion) = abi.decode(
+            versions,
+            (uint32, uint32, uint32, uint32, uint32, uint32)
+        );
+        (
+            poolNumerator, beneficiaryNumerator, beneficiary,
+            pendingFeeAvailableAt, pendingPoolNumerator, pendingBeneficiaryNumerator
+        ) = abi.decode(fees, (uint128, uint128, address, uint32, uint128, uint128));
+        rootVersion = newVersion;
+        emit CodeUpgraded(oldVersion, rootVersion);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Deploys on their way of a layout-5 state, the owner as their payer
+    function _paidByOwner(mapping(address => uint8) numbers) private view returns (mapping(address => PendingDeploy) pending) {
+        for ((address target, uint8 number) : numbers) {
+            pending[target] = PendingDeploy(number, owner);
+        }
+    }
+
+    /// @notice Code versions and the proposed code (kind, hash, availability window)
+    function getCodeData() internalMsg externalMsg external view returns (
+        uint32 _rootVersion,
+        uint32 _pairVersion,
+        uint32 _vaultVersion,
+        uint32 _nativeVaultVersion,
+        uint8 _pendingKind,
+        uint256 _pendingHash,
+        uint32 _pendingAvailableAt,
+        uint32 _pendingExpiresAt
+    ) {
+        return (
+            rootVersion,
+            pairVersion,
+            vaultVersion,
+            nativeVaultVersion,
+            pendingCodeKind,
+            pendingCodeKind == 0 ? 0 : tvm.hash(pendingCode),
+            pendingCodeAvailableAt,
+            pendingCodeKind == 0 ? 0 : pendingCodeAvailableAt + DexConstants.ROOT_PROPOSAL_APPLY_WINDOW
+        );
+    }
+
+    /// @notice The root's roles, status, code versions and fees of new pairs
+    function getRootData() internalMsg externalMsg external view returns (
+        address _owner,
+        address _pendingOwner,
+        address _manager,
+        bool _active,
+        uint32 _vaultVersion,
+        uint32 _pairVersion,
+        uint32 _nativeVaultVersion,
+        uint128 _poolNumerator,
+        uint128 _beneficiaryNumerator,
+        uint128 _feeDenominator
+    ) {
+        return (
+            owner,
+            pendingOwner,
+            manager,
+            active,
+            vaultVersion,
+            pairVersion,
+            nativeVaultVersion,
+            poolNumerator,
+            beneficiaryNumerator,
+            DexConstants.PAIR_FEE_DENOMINATOR
+        );
+    }
+}

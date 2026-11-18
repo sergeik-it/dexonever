@@ -1,0 +1,448 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./libraries/VaultOps.tsol";
+import "./libraries/Upgrade.tsol";
+import "./libraries/Hubs.tsol";
+import "./DexPlatform.tsol";
+import "./VaultJournal.tsol";
+import "./EverSurplus.tsol";
+
+/// @title DexNativeVault - native EVER custody with strict held balance accounting
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract DexNativeVault is VaultJournal, EverSurplus {
+
+    address public root;
+    TvmCell public platformCode;
+    // the event hub this vault rings (DexHub): from the root, the platform code and the vault's own address, so it is not
+    // in the state the vault packs for a new code — the new code computes it again
+    address public hub;
+    uint32 public version;
+
+    bool public paused;
+    bool public frozen;
+    // The upgrader's own stop for a move to a code with other messages: it stops what the
+    // freeze stops, so a step of an operation begun on the old code is refused, not run by the new one. Apart from
+    // `frozen`: the upgrader never lifts the freeze of the owner or the manager. Lifted by the upgrader or the owner
+    bool public upgrading;
+    // While stopped (frozen or upgrading), the owner may let users take their funds out: payouts go out instead of into
+    // unclaimed, claimFor and claimBounced work; new operations and the owner's withdrawals stay stopped. Cleared once
+    // neither stop is left
+    bool public withdrawalsAllowed;
+    uint128 public held;
+
+    // Payouts that came while the vault was frozen (still part of held), claimable after the unfreeze
+    mapping(address => uint128) unclaimed;
+
+    /// A payout of a frozen vault is kept: `amount` — all that waits for `owner` now
+    event Unclaimed(address owner, uint128 amount);
+    event Claimed(address owner, uint128 amount);
+    event VaultStatus(bool paused, bool frozen);
+    /// The upgrader stopped the vault for a move to a new code, or the stop was lifted
+    event UpgradeStatus(bool upgrading);
+    /// The owner let users take their funds out of the frozen vault (payouts, unclaimed and bounced claims) or took
+    /// it back; the unfreeze takes it back by itself
+    event WithdrawalsAllowed(bool allowed);
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+
+    modifier onlyRoot() {
+        require(msg.sender == root, DexErrors.NOT_AUTHORIZED);
+        _;
+    }
+
+    modifier notPaused() {
+        require(!paused && !_stopped(), DexErrors.PAUSED);
+        _;
+    }
+
+    /// @notice Only the root: moves the vault to its installed code: only a newer version; the state goes over as a
+    /// whole (Upgrade.tsol). Only a stopped vault moves (DexRoot.setVaultsUpgrading), so no
+    /// step begun on the old code meets the new one. An older or equal version or a vault not stopped is refused, the gas goes back
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external onlyRoot {
+        if (newVersion <= version || !upgrading) {
+            _returnExcess(sendGasTo);
+            return;
+        }
+        TvmCell state = abi.encode(root, platformCode, paused, frozen, upgrading, withdrawalsAllowed, held, unclaimed, nextOpId, pendingCount, pendingOps, everSurplusRequest);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(_stateLayout(), version, newVersion, sendGasTo, state));
+    }
+
+    /// @notice Layout of the state this code packs for its next code (Upgrade.tsol)
+    function _stateLayout() internal pure virtual returns (uint16) {
+        return DexConstants.NATIVE_VAULT_STATE_LAYOUT;
+    }
+
+    function _upgradeFrom(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        // the only layout so far; a code that changes the layout unpacks this one too
+        require(layout == DexConstants.NATIVE_VAULT_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        tvm.resetStorage();
+        (root, platformCode, paused, frozen, upgrading, withdrawalsAllowed, held, unclaimed, nextOpId, pendingCount, pendingOps, everSurplusRequest) = abi.decode(
+            state,
+            (address, TvmCell, bool, bool, bool, bool, uint128, mapping(address => uint128), uint64, uint32, mapping(uint64 => VaultOps.PendingOp),
+                optional(EverSurplusRequest))
+        );
+        version = newVersion;
+        hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_VAULT, address(this));
+        emit CodeUpgraded(oldVersion, version);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice A bell at the vault's event hub in every transaction that emits an event (EventBell)
+    function _ring() internal override {
+        Hubs.ring(hub);
+    }
+
+    /// @notice Initialize from DexPlatform, or take over the state of the previous code (upgrade)
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            _upgradeFrom(data);
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        root = s.load(address);
+        s.load(uint8); // type_id
+        version = s.load(uint32);
+        address sendGasTo = s.load(address);
+        platformCode = s.loadRef();
+        hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_VAULT, address(this));
+
+        tvm.rawReserve(varuint16(DexGas.VAULT_MIN_BALANCE), 0);
+        sendGasTo.transfer({
+            value: varuint16(0),
+            flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS,
+            bounce: false
+        });
+    }
+
+    /// @notice The address of the pair of `tokenA` and `tokenB` (the root's platform), used to authenticate pairs
+    function computePairAddress(
+        address tokenA,
+        address tokenB,
+        bool _isStable
+    ) public view returns (address) {
+        (address left, address right) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+
+        TvmBuilder b;
+        b.store(left);
+        b.store(right);
+        b.store(_isStable);
+
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: {
+                root: root,
+                type_id: DexConstants.PLATFORM_TYPE_PAIR,
+                params: b.toCell()
+            },
+            code: platformCode
+        });
+        return address(tvm.hash(stateInit));
+    }
+
+    /// @notice Anyone: deposits `amount` of native EVER into the pair named by `pairRef`
+    function depositNative(uint128 amount, TvmCell pairRef, TvmCell payload) external notPaused {
+        _forward(DexConstants.VAULT_OP_DEPOSIT, amount, pairRef, payload);
+    }
+
+    /// @notice Anyone: swaps `amount` of native EVER through the pair named by `pairRef`
+    function swapNative(uint128 amount, TvmCell pairRef, TvmCell payload) external notPaused {
+        _forward(DexConstants.VAULT_OP_SWAP, amount, pairRef, payload);
+    }
+
+    /// @notice Anyone: half of a two-sided deposit of native EVER (as operation 3 of a token vault)
+    function lpDepositNative(uint128 amount, TvmCell pairRef, TvmCell payload) external notPaused {
+        _forward(DexConstants.VAULT_OP_LP_DEPOSIT, amount, pairRef, payload);
+    }
+
+    /// @notice Sends the operation to the pair computed from `pairRef` and records it in the journal.
+    /// A wrong pair reference is refused at once (this is a direct call, so its value bounces back).
+    function _forward(uint8 op, uint128 amount, TvmCell pairRef, TvmCell payload) private {
+        (bool refOk, VaultOps.PairRef ref) = VaultOps.parsePairRef(pairRef);
+        require(refOk && (ref.tokenA == address(0) || ref.tokenB == address(0)), DexErrors.INVALID_TOKEN);
+        _acceptNative(amount);
+        _sendOperation(op, msg.sender, amount, computePairAddress(ref.tokenA, ref.tokenB, ref.isStable), payload);
+    }
+
+    /// @notice Only the previous pair: a step of a swap route; the pair (EVER, prevOther, prevStable) gave `amount` EVER (already in held)
+    /// for the route's `sender` and hands the next step over; it goes to its pair like a user swap, journalled and
+    /// refunded on a bounce. A refused step (paused or frozen vault, wrong pair reference) pays the amount to the
+    /// sender, kept in unclaimed if the vault is frozen
+    function routeSwap(
+        uint128 amount,
+        address sender,
+        address prevOther,
+        bool prevStable,
+        TvmCell pairRef,
+        TvmCell routePayload
+    ) external {
+        require(msg.sender == computePairAddress(address(0), prevOther, prevStable), DexErrors.NOT_AUTHORIZED);
+        (bool refOk, VaultOps.PairRef ref) = VaultOps.parsePairRef(pairRef);
+        bool ours = refOk && (ref.tokenA == address(0) || ref.tokenB == address(0));
+        if (amount == 0) {
+            _reserve(_ownBalance());
+            sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        if (paused || _stopped() || !ours) {
+            _payTo(sender, amount);
+            return;
+        }
+        _reserve(_ownBalance());
+        _sendOperation(DexConstants.VAULT_OP_SWAP, sender, amount, computePairAddress(ref.tokenA, ref.tokenB, ref.isStable), routePayload);
+    }
+
+    /// @notice The journal's hooks (VaultJournal): the vault keeps its own balance, a bounced operation's EVER
+    /// leave held and go back to its sender with the gas left
+    function _reserveOwnFunds() internal override {
+        _reserve(_ownBalance());
+    }
+
+    function _refundBounced(VaultOps.PendingOp pending) internal override {
+        held -= pending.amount;
+        _reserve(_ownBalanceWithout(pending.amount));
+        pending.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false });
+    }
+
+    /// @notice Takes `amount` of the incoming value into held and keeps the vault's own balance: everything
+    /// the vault had before plus `amount` stays, only the caller's gas goes on (no surplus leaks out)
+    function _acceptNative(uint128 amount) private {
+        require(amount > 0, DexErrors.INVALID_AMOUNT);
+        // the deepest path (LpAccount, payouts, LP wallet question and mint) needs the same gas as a token vault
+        require(msg.value >= amount + DexGas.vaultOperationMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        held += amount;
+        _reserve(_ownBalance() + amount);
+    }
+
+    /// @notice Keeps `keep` but never less than held + VAULT_MIN_BALANCE: a reserve worn down by storage fees
+    /// is topped up from the incoming gas. Mode 2: at most what the vault has. Call once per transaction.
+    function _reserve(uint128 keep) private view {
+        tvm.rawReserve(math.max(keep, held + DexGas.VAULT_MIN_BALANCE), 2);
+    }
+
+    /// @notice The vault cannot pay out whole now: with this message's gas it has less than held and the fees of a payout —
+    /// storage fees ate past its own reserve into the users' EVER
+    function _reserveShort() private view returns (bool) {
+        return address(this).balance < held + DexGas.gasValue(DexGas.PAYOUT);
+    }
+
+    /// @notice Pays `amount` of held to `recipient` whole, with the gas left (call only when !_reserveShort()). The vault
+    /// keeps what it had less `amount`, topped up to held + VAULT_MIN_BALANCE out of the gas only as far as the gas goes —
+    /// never out of the amount.
+    /// The answer onPayoutTaken (CONFIRM) leaves before the payout out of this margin of PAYOUT gas: the recipient still gets
+    /// the amount whole, only less gas left
+    function _payOut(address recipient, uint128 amount) private {
+        held -= amount;
+        uint128 wanted = math.max(_ownBalanceWithout(amount), held + DexGas.VAULT_MIN_BALANCE);
+        uint128 room = uint128(address(this).balance) - amount - DexGas.gasValue(DexGas.PAYOUT);
+        tvm.rawReserve(math.min(wanted, room), 2);
+        // the amount and the gas left come in one message; its fees are paid from the gas
+        recipient.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED, bounce: false });
+    }
+
+    /// @notice What the vault had before this message
+    function _ownBalance() private pure returns (uint128) {
+        return uint128(address(this).balance - msg.value);
+    }
+
+    /// @notice What the vault had before this message less `amount` that leaves now; 0 if storage fees wore the
+    /// balance below it (_reserve still keeps held + VAULT_MIN_BALANCE then, as far as the balance goes)
+    function _ownBalanceWithout(uint128 amount) private pure returns (uint128) {
+        uint128 own = _ownBalance();
+        return own > amount ? own - amount : 0;
+    }
+
+    /// @notice Only a pair holding EVER: pays `amount` of native EVER to `recipient`.
+    /// The vault answers the pair that it took the payout over; a refusal bounces to the pair,
+    /// which keeps the amount for the recipient
+    function payout(
+        uint64 opId,
+        address recipient,
+        uint128 amount,
+        address tokenA,
+        address tokenB,
+        bool _isStable
+    ) external {
+        address expected = computePairAddress(tokenA, tokenB, _isStable);
+        // a pair pays out EVER only if it holds EVER: a defect of a future pair code cannot reach this vault
+        require(msg.sender == expected && (tokenA == address(0) || tokenB == address(0)), DexErrors.NOT_AUTHORIZED);
+        require(held >= amount, DexErrors.INVALID_AMOUNT);
+        uint128 answer = DexGas.confirmValue();
+        // the answer leaves first: without gas for it and the payout it would be paid out of held; refused, the order bounces and the pair keeps the amount for the recipient
+        require(msg.value >= answer + DexGas.gasValue(DexGas.NATIVE_PAYOUT_WORK), DexErrors.NOT_ENOUGH_GAS);
+        IDexPairPayoutTaken(msg.sender).onPayoutTaken{ value: varuint16(answer), flag: 0, bounce: false }(opId);
+        _payTo(recipient, amount);
+    }
+
+    /// @notice Pays `amount` of held to `recipient` with the gas left. A frozen vault pays nothing out: the pair
+    /// has already taken the amount off its reserves, so it is kept for the recipient (still in held) and claimed
+    /// after the unfreeze. So does a vault that storage fees wore past its own reserve into the users' EVER (_reserveShort):
+    /// claimFor pays once it is topped up
+    function _payTo(address recipient, uint128 amount) private {
+        if (_withdrawalsBlocked() || _reserveShort()) {
+            unclaimed[recipient] += amount;
+            emit Unclaimed(recipient, unclaimed[recipient]);
+            _reserve(_ownBalance());
+            _ring();
+            recipient.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+
+        _payOut(recipient, amount);
+    }
+
+    /// @notice Pays out EVER kept for `owner` while the vault was frozen. Anyone may call it and pays the
+    /// gas (a contract owner may be unable to call); the EVER can only go to `owner`.
+    function claimFor(address owner) external {
+        require(!_withdrawalsBlocked(), DexErrors.FROZEN);
+        require(!_reserveShort(), DexErrors.NOT_READY);
+        uint128 amount = unclaimed[owner];
+        require(amount > 0, DexErrors.INVALID_AMOUNT);
+        require(msg.value >= DexGas.claimMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        delete unclaimed[owner];
+        emit Claimed(owner, amount);
+        _ring();
+        _payOut(owner, amount);
+    }
+
+    /// @notice EVER kept for `owner` while the vault was frozen; anyone may call
+    function getUnclaimed(address owner) internalMsg externalMsg external view returns (uint128) {
+        return unclaimed[owner];
+    }
+
+    // Admin calls come from the root with the caller's gas; the gas left goes back to the caller (sendGasTo)
+
+    /// @notice EVER above held and VAULT_MIN_BALANCE belong to nobody: the owner withdraws them announced
+    /// (EverSurplus). Only the root
+    function announceEverSurplus(uint128 amount, address recipient, string reason, address sendGasTo) external onlyRoot {
+        _announceEverSurplus(amount, recipient, reason, sendGasTo);
+    }
+
+    /// @notice Only the root: cancels the announced EVER surplus withdrawal
+    function cancelEverSurplus(address sendGasTo) external onlyRoot {
+        _cancelEverSurplus(sendGasTo);
+    }
+
+    /// @notice Only the root: runs the announced EVER surplus withdrawal once its delay passed
+    function withdrawEverSurplus(address sendGasTo) external onlyRoot {
+        _withdrawEverSurplus(sendGasTo);
+    }
+
+    function _everKept() internal view override returns (uint128) {
+        return held + DexGas.VAULT_MIN_BALANCE;
+    }
+
+    function _everSurplusFrozen() internal view override returns (bool) {
+        return _stopped();
+    }
+
+    /// @notice Only the root: pauses or resumes new operations
+    function setPaused(bool _paused, address sendGasTo) external onlyRoot {
+        paused = _paused;
+        emit VaultStatus(paused, frozen);
+        _ring();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Only the root: freezes or unfreezes the vault (operations and payouts stop)
+    function setFrozen(bool _frozen, address sendGasTo) external onlyRoot {
+        frozen = _frozen;
+        emit VaultStatus(paused, frozen);
+        _ring();
+        _dropWithdrawalsIfRunning();
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Only the root: sets or lifts the upgrade stop. The upgrade stop starts with withdrawals stopped, even those the owner let out under a freeze: steps of a
+    /// withdrawal must not cross to the new code. The owner may let them out again knowingly
+    function setUpgrading(bool _upgrading, address sendGasTo) external onlyRoot {
+        upgrading = _upgrading;
+        emit UpgradeStatus(upgrading);
+        _ring();
+        if (_upgrading) {
+            _dropWithdrawals();
+        } else {
+            _dropWithdrawalsIfRunning();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Frozen or stopped for an upgrade: everything stops, withdrawals and payouts included
+    function _stopped() private view returns (bool) {
+        return frozen || upgrading;
+    }
+
+    /// @notice Once neither stop is left, the allowed withdrawals go: the next stop starts with them stopped
+    function _dropWithdrawalsIfRunning() private {
+        if (!_stopped()) {
+            _dropWithdrawals();
+        }
+    }
+
+    function _dropWithdrawals() private {
+        if (withdrawalsAllowed) {
+            withdrawalsAllowed = false;
+            emit WithdrawalsAllowed(false);
+            _ring();
+        }
+    }
+
+    /// @notice Only the root: users' withdrawals from a stopped vault, allowed or taken back by the owner. Allowing them for a vault
+    /// that is not stopped is refused (they work anyway, and the flag would outlive no stop)
+    function setWithdrawalsAllowed(bool allowed, address sendGasTo) external onlyRoot {
+        if (!allowed || _stopped()) {
+            withdrawalsAllowed = allowed;
+            emit WithdrawalsAllowed(allowed);
+            _ring();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Users' funds stay in: stopped, and the owner did not let them out
+    function _withdrawalsBlocked() private view returns (bool) {
+        return _stopped() && !withdrawalsAllowed;
+    }
+
+    function _returnExcess(address to) private view {
+        _reserve(_ownBalance());
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The vault's data: root, version, active (not paused), stopped, held and surplus; anyone may call
+    function getNativeVaultData() internalMsg externalMsg external view returns (
+        address _root,
+        uint32 _version,
+        bool _active,
+        bool _frozen,
+        uint128 _held,
+        uint128 _surplus
+    ) {
+        uint128 currentBal = uint128(address(this).balance);
+        uint128 reserved = held + DexGas.VAULT_MIN_BALANCE;
+        uint128 surplus = currentBal > reserved ? currentBal - reserved : 0;
+        return (root, version, !paused, _stopped(), held, surplus);
+    }
+
+    /// @notice The vault's state: root, version, paused, stopped, held and surplus; anyone may call
+    function getDetails() internalMsg externalMsg external view returns (
+        address _root,
+        uint32 _version,
+        bool _paused,
+        bool _frozen,
+        uint128 _held,
+        uint128 _surplus
+    ) {
+        uint128 currentBal = uint128(address(this).balance);
+        uint128 reserved = held + DexGas.VAULT_MIN_BALANCE;
+        uint128 surplus = currentBal > reserved ? currentBal - reserved : 0;
+        return (root, version, paused, _stopped(), held, surplus);
+    }
+}

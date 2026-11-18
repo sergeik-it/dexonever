@@ -1,0 +1,12 @@
+pragma tvm-solidity >= 0.79.0;
+
+/**
+ * @title Destroyable contract
+ */
+interface IDestroyable {
+    /**
+     * @notice Destroys the contract.
+     * @param remainingGasTo The address that receives the remaining balance.
+     */
+    function destroy(address remainingGasTo) external;
+}

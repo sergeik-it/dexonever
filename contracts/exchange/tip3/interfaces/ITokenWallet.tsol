@@ -1,0 +1,52 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./TIP3TokenWallet.tsol";
+import "./../additional/SID.tsol";
+
+/**
+ * @title TokenWallet interface
+ * @notice Minimal required TokenWallet functionality of TIP-3, plus interface
+ * detection by {SID} (TIP-6.1).
+ */
+interface ITokenWallet is TIP3TokenWallet, SID {
+
+    /**
+     * @notice Returns the owner of the wallet.
+     */
+    function owner() internalMsg externalMsg external view responsible returns (address);
+
+    /**
+     * @notice Transfers tokens to the wallet of `recipient`; only the wallet owner.
+     * @dev With `deployWalletValue` > 0 the recipient's wallet is deployed first, using that value.
+     * @param amount The amount of tokens to transfer.
+     * @param recipient The owner of the receiving token wallet.
+     * @param deployWalletValue Value (nanoevers) attached to deploy the recipient's wallet; 0 means no deploy.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param notify If `true`, the receiving wallet notifies its owner.
+     * @param payload Data delivered with the notification.
+    */
+    function transfer(
+        uint128 amount,
+        address recipient,
+        uint128 deployWalletValue,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    ) external;
+
+    /**
+     * @notice Transfers tokens to an already deployed token wallet; only the wallet owner.
+     * @param amount The amount of tokens to transfer.
+     * @param recipientTokenWallet The receiving token wallet.
+     * @param remainingGasTo The address that receives the remaining gas.
+     * @param notify If `true`, the receiving wallet notifies its owner.
+     * @param payload Data delivered with the notification.
+    */
+    function transferToWallet(
+        uint128 amount,
+        address recipientTokenWallet,
+        address remainingGasTo,
+        bool notify,
+        TvmCell payload
+    ) external;
+}

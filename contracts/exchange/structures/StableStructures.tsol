@@ -1,0 +1,55 @@
+pragma tvm-solidity >= 0.79.0;
+
+interface StableStructures {
+    struct Amplification {
+        uint128 value;
+        uint128 precision;
+    }
+
+    struct StableRates {
+        uint128 precision;
+        uint128 rate0;
+        uint128 rate1;
+    }
+
+    struct StableExchangeResult {
+        uint128 amount;
+        uint128 poolFee;
+        uint128 beneficiaryFee;
+    }
+
+    struct StableDepositResult {
+        uint128 lpReward;
+        uint128 resultBalance0;
+        uint128 resultBalance1;
+        uint128 invariant;
+        uint128 difference0;
+        uint128 difference1;
+        bool sell0;
+        bool sell1;
+        uint128 poolFee0;
+        uint128 poolFee1;
+        uint128 beneficiaryFee0;
+        uint128 beneficiaryFee1;
+    }
+
+    /// @notice StableSwap parameters of a pair: rates from decimals.
+    /// A × A_PRECISION changes linearly from aFrom at rampStart to aTo at rampEnd, then stays aTo
+    struct StableConfig {
+        uint8 decimalsLeft;
+        uint8 decimalsRight;
+        StableRates rates;
+        uint32 aFrom;
+        uint32 aTo;
+        uint32 rampStart;
+        uint32 rampEnd;
+    }
+
+    /// @notice A proposed change of A: applied not before readyAt and not after expiresAt
+    struct PendingAmplification {
+        uint32 target;      // A × A_PRECISION
+        uint32 duration;    // seconds for A to reach target
+        uint32 readyAt;
+        uint32 expiresAt;
+    }
+}

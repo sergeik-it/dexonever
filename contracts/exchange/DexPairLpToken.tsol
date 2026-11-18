@@ -1,0 +1,262 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "./libraries/DexConstants.tsol";
+import "./libraries/DexErrors.tsol";
+import "./libraries/DexGas.tsol";
+import "./libraries/MsgFlag.tsol";
+import "./EventBell.tsol";
+import "./tip3/TokenRoot.tsol";
+import "./tip3/TokenWallet.tsol";
+import "./tip3/interfaces/ITokenRoot.tsol";
+import "./tip3/interfaces/ITokenWallet.tsol";
+import "./tip3/interfaces/IBurnableTokenWallet.tsol";
+import "./tip3/interfaces/IBounceTokensBurnCallback.tsol";
+import "./tip3/interfaces/IBounceTokensTransferCallback.tsol";
+
+/// @title DexPairLpToken - the LP token of a pair: its TIP-3 root, the pair's own LP wallet and the mint
+/// that deploys a depositor's LP wallet only when it is missing. A refused burn is kept and burnt with the next
+/// withdrawal. LP sent to the pair's wallet without notify or with too little gas, and LP returned to a wallet its owner
+/// destroyed meanwhile, stay on the pair's wallet for good
+abstract contract DexPairLpToken is EventBell, IBounceTokensBurnCallback, IBounceTokensTransferCallback {
+
+    // LP token: TIP-3 root owned by the pair and the pair's own LP wallet that receives LP for withdrawal
+    address public lpRoot;
+    address public lpWallet;
+
+    // Code of LP wallets: the pair computes a depositor's LP wallet address with it
+    TvmCell lpWalletCode;
+
+    // LP waiting for the answer of the depositor's LP wallet: does it exist?
+    // Keyed by the wallet address; an entry lives only until the wallet answers or bounces.
+    struct PendingMint {
+        address owner;
+        uint128 amount;
+        uint16 queries;
+    }
+    mapping(address => PendingMint) pendingMints;
+
+    // LP of withdrawals whose burn came back: lpSupply is already without them, they belong to nobody and burn
+    // with the next withdrawal
+    uint128 lpToBurn;
+    /// An answer without gas for the mint: `amount` LP of `owner` wait in pendingMints for retryMint
+    event LpMintKept(address owner, address wallet, uint128 amount);
+    /// A burn of `amount` LP came back: they wait in lpToBurn for the next withdrawal
+    event LpBurnBounced(uint128 amount);
+    /// LP returned to `wallet` came back (its owner destroyed it): `amount` LP stay on the pair's wallet for good
+    event LpTransferBounced(address wallet, uint128 amount);
+
+    /// @notice Deploys the LP TokenRoot (owner and deployer = this pair) and the pair's LP wallet
+    function _deployLpToken(TvmCell lpRootCode, TvmCell _lpWalletCode) internal {
+        lpWalletCode = _lpWalletCode;
+        TvmCell rootStateInit = abi.encodeStateInit({
+            contr: TokenRoot,
+            varInit: {
+                randomNonce_: 0,
+                deployer_: address(this),
+                name_: "DEXonEVER LP",
+                symbol_: "DEXLP",
+                decimals_: DexConstants.LP_TOKEN_DECIMALS,
+                rootOwner_: address(this),
+                walletCode_: _lpWalletCode
+            },
+            pubkey: 0,
+            code: lpRootCode
+        });
+        lpRoot = new TokenRoot{
+            stateInit: rootStateInit,
+            value: varuint16(DexGas.deployLpRootValue()),
+            flag: 0,
+            bounce: false
+        }(address(0), 0, 0, false, false, false, address(this), "", "", address(0));
+
+        lpWallet = _lpWalletOf(address(this));
+
+        ITokenRoot(lpRoot).deployWallet{
+            value: varuint16(DexGas.deployWalletCallValue()),
+            flag: 0,
+            bounce: false,
+            callback: DexPairLpToken.onLpWallet
+        }(address(this), DexGas.deployWalletValue());
+    }
+
+    /// @notice Answer of LP TokenRoot.deployWallet; the address is already known, so only check it. Only the LP root
+    function onLpWallet(address wallet) external view {
+        require(msg.sender == lpRoot && wallet == lpWallet, DexErrors.NOT_AUTHORIZED);
+    }
+
+    /// @notice LP wallet address of `owner`, as the LP root computes it
+    function _lpWalletOf(address owner) internal view returns (address) {
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: TokenWallet,
+            varInit: {
+                root_: lpRoot,
+                owner_: owner
+            },
+            pubkey: 0,
+            code: lpWalletCode
+        });
+        return address(tvm.hash(stateInit));
+    }
+
+    /// @notice LP root and the pair's LP wallet. Anyone (getter)
+    function getLpTokens() internalMsg externalMsg external view returns (address _lpRoot, address _lpWallet) {
+        return (lpRoot, lpWallet);
+    }
+
+    /// @notice LP waiting for the wallet of `wallet`: an answer without gas for the mint keeps them here for retryMint. Anyone (getter)
+    function getPendingMint(address wallet) internalMsg externalMsg external view returns (optional(PendingMint)) {
+        return pendingMints.fetch(wallet);
+    }
+
+    /// @notice Mints LP to `recipient` in two steps, so that a wallet is deployed only when it is missing.
+    /// A TIP-3 wallet deploy to an existing wallet fails and its value stays in the LP root, and a mint
+    /// without a deploy to a missing wallet bounces and burns the LP. So the pair first asks the wallet
+    /// for its balance (bounceable) with all gas left after its reserve: an answer means the wallet exists,
+    /// a bounce means it does not; the mint follows in onLpWalletBalance or onBounce.
+    /// The caller must have called _reserveOwnBalance() once before: reserves add up within a transaction.
+    function _mintLp(uint128 amount, address recipient) internal {
+        address wallet = _lpWalletOf(recipient);
+        PendingMint pending = pendingMints.fetch(wallet).getOr(PendingMint(recipient, 0, 0));
+        pending.amount += amount;
+        pending.queries += 1;
+        pendingMints[wallet] = pending;
+
+        ITokenWallet(wallet).balance{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: true,
+            callback: DexPairLpToken.onLpWalletBalance
+        }();
+    }
+
+    /// @notice The depositor's LP wallet exists: mint without a wallet deploy. Only a wallet the pair asked can
+    /// answer here: an answer of a responsible function goes to the caller, and the entry is found by its address
+    function onLpWalletBalance(uint128 /* balance */) external {
+        _finishMint(msg.sender, 0);
+    }
+
+    /// @notice Asks the LP wallet again for LP kept after an answer without gas for the mint. Anyone may call it
+    /// and pays the question; the LP go only to the owner of the entry. Also while a question is counted on its way:
+    /// whichever answer comes first mints the whole sum and the other finds nothing, so a question lost for lack of gas
+    /// does not lock the LP
+    function retryMint(address wallet) external {
+        optional(PendingMint) found = pendingMints.fetch(wallet);
+        require(found.hasValue() && found.get().amount > 0, DexErrors.INVALID_AMOUNT);
+        require(msg.value >= DexGas.retryMintMinValue(), DexErrors.NOT_ENOUGH_GAS);
+        _reserveOwnBalance();
+        PendingMint pending = found.get();
+        pending.queries += 1;
+        pendingMints[wallet] = pending;
+        ITokenWallet(wallet).balance{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: true,
+            callback: DexPairLpToken.onLpWalletBalance
+        }();
+    }
+
+    /// @notice The balance query bounced: the LP wallet does not exist yet, so the mint deploys it
+    /// A burn the pair's wallet did not take bounces too: the LP stay on the wallet and burn later
+    onBounce(TvmSlice body) external {
+        uint32 functionId = body.load(uint32);
+        if (functionId == abi.functionId(TIP3TokenWallet.balance)) {
+            _finishMint(msg.sender, DexGas.deployWalletValue());
+        } else if (functionId == abi.functionId(IBurnableTokenWallet.burn) && msg.sender == lpWallet) {
+            _keepToBurn(body.load(uint128));
+        } else {
+            _onOtherBounce(functionId, body);
+        }
+    }
+
+    /// @notice Bounces of the pair's own messages (DexPair: a refused payout)
+    function _onOtherBounce(uint32 functionId, TvmSlice body) internal virtual {}
+
+    /// @notice The LP root refused a burn: the pair's wallet has the LP back and tells the pair. Only the pair's LP wallet
+    function onBounceTokensBurn(address /* tokenRoot */, uint128 amount) external override {
+        require(msg.sender == lpWallet, DexErrors.NOT_AUTHORIZED);
+        _keepToBurn(amount);
+    }
+
+    function _keepToBurn(uint128 amount) private {
+        lpToBurn += amount;
+        emit LpBurnBounced(amount);
+        _ring();
+    }
+
+    /// @notice LP the pair's wallet returned were rejected by the recipient's wallet (`revertedFrom`): it is the wallet
+    /// they had just come from, so its owner destroyed it. The LP stay on the pair's wallet. Only the pair's LP wallet
+    function onBounceTokensTransfer(address /* tokenRoot */, uint128 amount, address revertedFrom) external override {
+        require(msg.sender == lpWallet, DexErrors.NOT_AUTHORIZED);
+        emit LpTransferBounced(revertedFrom, amount);
+        _ring();
+    }
+
+    /// @notice Burns `amount` LP of a withdrawal and everything kept in lpToBurn. The burn bounces: a refused one
+    /// comes back to onBounce, a burn the LP root refuses comes back to onBounceTokensBurn
+    function _burnLp(uint128 amount, address remainingGasTo, uint128 value, uint8 flag) internal {
+        uint128 total = amount + lpToBurn;
+        lpToBurn = 0;
+        TvmCell empty;
+        IBurnableTokenWallet(lpWallet).burn{
+            value: varuint16(value),
+            flag: flag,
+            bounce: true
+        }(total, remainingGasTo, address(0), empty);
+    }
+
+    /// @notice Mints everything pending for `wallet` with the gas of this answer. Several answers for one
+    /// wallet (concurrent deposits) are counted: the first mints the whole sum, the others only return gas.
+    /// An answer without gas for the mint (and the wallet deploy) mints nothing: the LP stay for retryMint, the gas goes
+    /// back to the owner
+    function _finishMint(address wallet, uint128 deployWalletValue) private {
+        optional(PendingMint) found = pendingMints.fetch(wallet);
+        if (!found.hasValue()) {
+            return;
+        }
+        PendingMint pending = found.get();
+        if (pending.amount > 0 && msg.value < DexGas.lpMintValue() + deployWalletValue) {
+            pending.queries -= 1;
+            pendingMints[wallet] = pending;
+            emit LpMintKept(pending.owner, wallet, pending.amount);
+            // the gas of this answer is the depositor's: it goes back to the owner of the entry, not to the pair
+            _reserveOwnBalance();
+            _ring();
+            pending.owner.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        uint128 amount = pending.amount;
+        pending.amount = 0;
+        pending.queries -= 1;
+        if (pending.queries == 0) {
+            delete pendingMints[wallet];
+        } else {
+            pendingMints[wallet] = pending;
+        }
+
+        _reserveOwnBalance();
+        if (amount == 0) {
+            pending.owner.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        TvmCell empty;
+        ITokenRoot(lpRoot).mint{
+            value: 0,
+            flag: MsgFlag.ALL_NOT_RESERVED,
+            bounce: false
+        }(amount, pending.owner, deployWalletValue, pending.owner, false, empty);
+    }
+
+    /// @notice The gas left after the pair's reserve goes back to `to`
+    function _returnExcess(address to) internal pure {
+        _reserveOwnBalance();
+        to.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice Keeps the pair's own balance (at least PAIR_MIN_BALANCE) out of the outgoing gas
+    function _reserveOwnBalance() internal pure {
+        tvm.rawReserve(
+            math.max(varuint16(DexGas.PAIR_MIN_BALANCE), address(this).balance - msg.value),
+            2
+        );
+    }
+}

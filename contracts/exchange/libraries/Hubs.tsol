@@ -1,0 +1,28 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../DexPlatform.tsol";
+import "./DexConstants.tsol";
+import "./DexGas.tsol";
+import "./MsgFlag.tsol";
+
+/// @title Hubs - the address of a contract's event hub (DexHub) and its bell
+library Hubs {
+    /// @notice The hub of family `family` that `target` rings: the root's platform with the family and the first 4 bits
+    /// of `target` (DexRoot.getHubOf computes the same)
+    function addressOf(address root, TvmCell platformCode, uint8 family, address target) internal returns (address) {
+        TvmBuilder params;
+        params.store(family, uint8(target.value >> 252));
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: { root: root, type_id: DexConstants.PLATFORM_TYPE_HUB, params: params.toCell() },
+            code: platformCode
+        });
+        return address(tvm.hash(stateInit));
+    }
+
+    /// @notice A bell: no body, its value out of the operation's gas, no bounce. It never fails the operation (a value
+    /// short of it skips the bell)
+    function ring(address hub) internal {
+        hub.transfer({ value: varuint16(DexGas.hubBellValue()), flag: MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+}

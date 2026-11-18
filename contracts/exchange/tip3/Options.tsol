@@ -1,0 +1,7 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// @title Build options of the token contracts
+library Options {
+    // Multiplier of the target balances in TokenGas
+    uint128 constant STORAGE_FEE_K = 1;
+}
