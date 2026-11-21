@@ -1,0 +1,435 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../../../dexonever/everscale/contracts/contracts/libraries/MsgFlag.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/Upgrade.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/DexGas.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/LaunchParams.tsol";
+import "../../../dexonever/everscale/contracts/contracts/DexPlatform.tsol";
+import "./libraries/MarketConstants.tsol";
+import "./libraries/MarketErrors.tsol";
+import "./libraries/MarketGas.tsol";
+import "./interfaces/IMarketAd.tsol";
+
+/// @title Market - the exchange's ads: takes publications for a fee in EVER, deploys each ad at the address of the
+/// exchange's DexPlatform (root: the market, params: the ad's number), keeps the settings, the code of the ads and the hashes of all its versions, and the collected fees. The owner changes the
+/// settings, stops publications, removes and edits ads and withdraws the fees; the upgrader proposes
+/// codes, the owner applies them after codeDelay, the upgrader moves ads to the new code
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract Market is IMarketAnswers {
+    address public owner;
+    address public pendingOwner;
+    address public upgrader;
+    address public pendingUpgrader;
+    bool public upgradesRenounced;
+    uint32 public codeDelay;
+
+    uint8 public pendingCodeKind;
+    TvmCell pendingCode;
+    uint32 public pendingCodeAvailableAt;
+
+    TvmCell platformCode;
+    TvmCell adCode;
+    uint32 public adVersion;
+    // the hash of every code of the ads, by its version: a deployed ad of any version is recognised by its code
+    mapping(uint32 => uint256) adCodeHashes;
+    uint32 public marketVersion;
+
+    Settings settings;
+    bool public paused;
+    uint64 public adCount;
+
+    event AdPublished(uint64 id, address ad, address author);
+    /// the ad's address with its number: the scanner keeps ads by address
+    event AdEdited(uint64 id, address ad);
+    event AdRemoved(uint64 id, address ad, bool byOwner);
+    event SettingsChanged(Settings settings);
+    event PausedChanged(bool paused);
+    event Withdrawn(uint128 amount, address recipient);
+    event OwnerProposed(address pendingOwner);
+    event OwnerChanged(address owner);
+    event UpgraderProposed(address pendingUpgrader);
+    event UpgraderChanged(address upgrader);
+    event UpgradesRenounced();
+    event CodeProposed(uint8 kind, uint256 codeHash, uint32 availableAt, uint32 expiresAt);
+    event CodeApplied(uint8 kind, uint32 version);
+    event CodeCancelled(uint8 kind);
+    event CodeUpgraded(uint32 fromVersion, uint32 version);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, MarketErrors.NOT_OWNER);
+        _;
+    }
+
+    modifier onlyUpgrader() {
+        require(msg.sender == upgrader, MarketErrors.NOT_UPGRADER);
+        _;
+    }
+
+    /// @notice Deployed by an external message signed by the deploy key, with the settings and the lists checked as the
+    /// owner's changes; publications start open
+    constructor(
+        address _owner,
+        address _upgrader,
+        TvmCell _platformCode,
+        TvmCell _adCode,
+        uint32 _codeDelay,
+        Settings _settings
+    ) externalMsg {
+        require(tvm.pubkey() != 0 && msg.pubkey() == tvm.pubkey(), MarketErrors.NOT_OWNER);
+        tvm.accept();
+        require(_codeDelay <= MarketConstants.MAX_CODE_DELAY, MarketErrors.BAD_DELAY);
+        require(_isStd0(_owner) && _isStd0(_upgrader), MarketErrors.BAD_ADDRESS);
+        require(!_platformCode.toSlice().empty() && !_adCode.toSlice().empty(), MarketErrors.BAD_CODE);
+        _requireValidSettings(_settings);
+        owner = _owner;
+        upgrader = _upgrader;
+        platformCode = _platformCode;
+        adCode = _adCode;
+        adVersion = 1;
+        adCodeHashes[1] = tvm.hash(_adCode);
+        marketVersion = 1;
+        codeDelay = _codeDelay;
+        settings = _settings;
+    }
+
+    // ==========================================
+    // Publications
+    // ==========================================
+
+    /// @notice Publishes an ad of the sender. The value is at least the fee: the ad's deploy, its storage deposit and
+    /// this work are paid of the fee, the rest of the fee stays with the market, the value above the fee goes back to the
+    /// sender. A refused publication bounces the value
+    function publish(AdContent content) external {
+        require(!paused, MarketErrors.PAUSED);
+        require(msg.value >= settings.fee, MarketErrors.LOW_VALUE);
+        _requireValidContent(content);
+        uint128 price = DexGas.gasPrice();
+        uint128 cost = MarketGas.publishCost(price, settings.storageDeposit);
+        // the price of gas may have grown since the fee was set: the market does not pay a publication of its own
+        require(settings.fee >= cost, MarketErrors.FEE_TOO_LOW);
+        uint64 id = adCount;
+        adCount++;
+        // kept: the balance before the call and the fee without what the publication spends
+        tvm.rawReserve(varuint16(address(this).balance - msg.value + settings.fee - cost), 0);
+        TvmCell stateInit = _adStateInit(id);
+        new DexPlatform{ stateInit: stateInit, value: varuint16(MarketGas.deployValue(price, settings.storageDeposit)), flag: 0, bounce: true }(
+            adCode, adVersion, msg.sender, abi.encode(msg.sender, content)
+        );
+        emit AdPublished(id, address(tvm.hash(stateInit)), msg.sender);
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice The owner replaces what an ad says (all its fields, checked as a publication: so photos are removed); the
+    /// ad answers onAdEdited, the rest of the value comes back to the owner
+    function editAd(uint64 id, AdContent content) external view onlyOwner {
+        require(id < adCount, MarketErrors.NO_AD);
+        // the checks are those of a publication
+        require(msg.value >= DexGas.gasValue(MarketGas.PUBLISH + MarketGas.EDIT + MarketGas.ANSWER), MarketErrors.LOW_VALUE);
+        _requireValidContent(content);
+        IAd(adAddress(id)).edit{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: true }(content, msg.sender);
+    }
+
+    /// @notice The owner removes an ad: the ad answers onAdRemoved and is destroyed, its balance goes to the author, the
+    /// rest of the value comes back to the owner
+    function removeAd(uint64 id) external view onlyOwner {
+        require(id < adCount, MarketErrors.NO_AD);
+        require(msg.value >= DexGas.gasValue(MarketGas.ADMIN + MarketGas.REMOVE + MarketGas.ANSWER), MarketErrors.LOW_VALUE);
+        IAd(adAddress(id)).removeByMarket{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: true }(msg.sender);
+    }
+
+    /// @notice An ad was removed (by its author or on the owner's call); only the ad of the number
+    function onAdRemoved(uint64 id, bool byOwner, address sendGasTo) external override {
+        require(msg.sender == adAddress(id), MarketErrors.NOT_AD);
+        emit AdRemoved(id, msg.sender, byOwner);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice An ad was edited on the owner's call; only the ad of the number
+    function onAdEdited(uint64 id, address sendGasTo) external override {
+        require(msg.sender == adAddress(id), MarketErrors.NOT_AD);
+        emit AdEdited(id, msg.sender);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    /// @notice A call to an ad bounced (no ad at the number: removed already): an edit's or a removal's value goes back to
+    /// the owner, a move's to the upgrader; a bounced deploy stays with the market
+    onBounce(TvmSlice body) external view {
+        uint32 functionId = body.load(uint32);
+        if (functionId == abi.functionId(IAd.upgrade)) {
+            upgrader.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+        } else if (functionId == abi.functionId(IAd.edit) || functionId == abi.functionId(IAd.removeByMarket)) {
+            owner.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+        }
+    }
+
+    /// Two capital Latin letters (ISO 3166-1 alpha-2): which code is a country, the site knows
+    function _isCountryCode(string country) private pure returns (bool) {
+        bytes code = bytes(country);
+        if (code.length != MarketConstants.COUNTRY_BYTES) {
+            return false;
+        }
+        for (uint i = 0; i < code.length; i++) {
+            uint8 letter = uint8(code[i]);
+            if (letter < 0x41 || letter > 0x5A) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function _requireValidContent(AdContent content) private view {
+        require(content.title.length > 0 && content.title.length <= settings.titleMaxBytes, MarketErrors.BAD_TITLE);
+        require(content.description.length <= settings.descriptionMaxBytes, MarketErrors.BAD_DESCRIPTION);
+        require(content.photos.length <= settings.photosMax, MarketErrors.BAD_PHOTOS);
+        require(_isCountryCode(content.country), MarketErrors.BAD_COUNTRY);
+        require(content.city.length > 0 && content.city.length <= MarketConstants.MAX_CITY_BYTES, MarketErrors.BAD_CITY);
+        for (string photo : content.photos) {
+            // a photo as a token's picture (ipfs://<CID>), and not empty
+            require(photo.byteLength() > 0 && LaunchParams.validMeta(photo, ""), MarketErrors.BAD_PHOTOS);
+        }
+    }
+
+    // ==========================================
+    // Addresses
+    // ==========================================
+
+    function _adStateInit(uint64 id) private view returns (TvmCell) {
+        TvmBuilder params;
+        params.store(id);
+        return abi.encodeStateInit({
+            contr: DexPlatform,
+            varInit: { root: address(this), type_id: MarketConstants.PLATFORM_TYPE_AD, params: params.toCell() },
+            code: platformCode
+        });
+    }
+
+    /// @notice The address of ad `id`: it follows from the market and the number, not from the ad's code
+    function adAddress(uint64 id) internalMsg externalMsg public view returns (address) {
+        return address(tvm.hash(_adStateInit(id)));
+    }
+
+    // ==========================================
+    // The owner's settings
+    // ==========================================
+
+    /// @notice New settings for the next publications and edits
+    function setSettings(Settings _settings) external onlyOwner {
+        _requireValidSettings(_settings);
+        settings = _settings;
+        emit SettingsChanged(_settings);
+        _returnRest();
+    }
+
+    /// @notice Stops or resumes publications; removals and edits go on
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit PausedChanged(_paused);
+        _returnRest();
+    }
+
+    /// @notice Sends `amount` of the collected fees to `recipient`; the market keeps MARKET_MIN_BALANCE
+    function withdraw(uint128 amount, address recipient) external view onlyOwner {
+        require(_isStd0(recipient), MarketErrors.BAD_ADDRESS);
+        require(amount > 0 && uint128(address(this).balance) >= uint128(msg.value) + amount + MarketConstants.MARKET_MIN_BALANCE, MarketErrors.BAD_AMOUNT);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value - amount), 0);
+        // the recipient gets the whole amount: the forwarding is paid of the call's value
+        recipient.transfer({ value: varuint16(amount), flag: MsgFlag.SENDER_PAYS_FEES, bounce: false });
+        emit Withdrawn(amount, recipient);
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    function _requireValidSettings(Settings s) private pure {
+        require(s.storageDeposit >= MarketConstants.MIN_STORAGE_DEPOSIT && s.storageDeposit <= MarketConstants.MAX_STORAGE_DEPOSIT, MarketErrors.BAD_SETTINGS);
+        require(s.titleMaxBytes >= 1 && s.titleMaxBytes <= MarketConstants.MAX_TITLE_BYTES, MarketErrors.BAD_SETTINGS);
+        require(s.descriptionMaxBytes <= MarketConstants.MAX_DESCRIPTION_BYTES, MarketErrors.BAD_SETTINGS);
+        require(s.photosMax <= MarketConstants.MAX_PHOTOS, MarketErrors.BAD_SETTINGS);
+        require(s.fee >= MarketGas.publishCost(DexGas.gasPrice(), s.storageDeposit), MarketErrors.FEE_TOO_LOW);
+    }
+
+    function _isStd0(address target) private pure returns (bool) {
+        return target.isStdAddrWithoutAnyCast() && target.wid == 0 && !target.isStdZero();
+    }
+
+    /// @notice What an administrative call did not spend goes back to the caller
+    function _returnRest() private pure {
+        msg.sender.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    // ==========================================
+    // Roles
+    // ==========================================
+
+    function transferOwner(address _pendingOwner) external onlyOwner {
+        pendingOwner = _pendingOwner;
+        emit OwnerProposed(_pendingOwner);
+        _returnRest();
+    }
+
+    function acceptOwner() external {
+        require(msg.sender == pendingOwner && !pendingOwner.isStdZero(), MarketErrors.NOT_PENDING);
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnerChanged(owner);
+        _returnRest();
+    }
+
+    function transferUpgrader(address _pendingUpgrader) external onlyUpgrader {
+        pendingUpgrader = _pendingUpgrader;
+        emit UpgraderProposed(_pendingUpgrader);
+        _returnRest();
+    }
+
+    function acceptUpgrader() external {
+        require(msg.sender == pendingUpgrader && !pendingUpgrader.isStdZero(), MarketErrors.NOT_PENDING);
+        upgrader = pendingUpgrader;
+        pendingUpgrader = address(0);
+        emit UpgraderChanged(upgrader);
+        _returnRest();
+    }
+
+    /// @notice The upgrader gives up changing the code, for good: the proposed code is dropped and no code is proposed or
+    /// applied any more; the ads still move to the code applied before (upgradeAds)
+    function renounceUpgrades() external onlyUpgrader {
+        require(!upgradesRenounced, MarketErrors.RENOUNCED);
+        upgradesRenounced = true;
+        if (pendingCodeKind != 0) {
+            emit CodeCancelled(pendingCodeKind);
+            _clearPendingCode();
+        }
+        emit UpgradesRenounced();
+        _returnRest();
+    }
+
+    // ==========================================
+    // Code
+    // ==========================================
+
+    /// @notice The upgrader proposes a code of the market or of the ads; it waits codeDelay. A new proposal replaces the
+    /// pending one (CodeCancelled for it)
+    function proposeCode(uint8 kind, TvmCell code) external onlyUpgrader {
+        require(!upgradesRenounced, MarketErrors.RENOUNCED);
+        require((kind == MarketConstants.CODE_KIND_MARKET || kind == MarketConstants.CODE_KIND_AD) && !code.toSlice().empty(), MarketErrors.BAD_CODE);
+        if (pendingCodeKind != 0) {
+            emit CodeCancelled(pendingCodeKind);
+        }
+        pendingCodeKind = kind;
+        pendingCode = code;
+        pendingCodeAvailableAt = uint32(block.timestamp) + codeDelay;
+        emit CodeProposed(kind, tvm.hash(code), pendingCodeAvailableAt, pendingCodeAvailableAt + MarketConstants.PROPOSAL_APPLY_WINDOW);
+        _returnRest();
+    }
+
+    /// @notice The upgrader cancels the proposed code, or the owner vetoes it
+    function cancelCode() external {
+        require(msg.sender == upgrader || msg.sender == owner, MarketErrors.NOT_OWNER);
+        require(pendingCodeKind != 0, MarketErrors.NO_PENDING);
+        emit CodeCancelled(pendingCodeKind);
+        _clearPendingCode();
+        _returnRest();
+    }
+
+    /// @notice The owner applies the proposed code after codeDelay, within PROPOSAL_APPLY_WINDOW, naming its kind and
+    /// hash. The ads' code: its version grows by one and its hash is kept, new ads take it, the deployed ones move by
+    /// upgradeAds. The market's code: the market moves at once. After renounceUpgrades nothing is pending and nothing is
+    /// proposed any more
+    function applyCode(uint8 expectedKind, uint256 expectedCodeHash) external onlyOwner {
+        require(pendingCodeKind != 0, MarketErrors.NO_PENDING);
+        require(pendingCodeKind == expectedKind && tvm.hash(pendingCode) == expectedCodeHash, MarketErrors.BAD_CODE);
+        require(uint32(block.timestamp) >= pendingCodeAvailableAt, MarketErrors.TOO_EARLY);
+        require(uint32(block.timestamp) <= pendingCodeAvailableAt + MarketConstants.PROPOSAL_APPLY_WINDOW, MarketErrors.EXPIRED);
+        uint8 kind = pendingCodeKind;
+        TvmCell code = pendingCode;
+        _clearPendingCode();
+        if (kind == MarketConstants.CODE_KIND_AD) {
+            adCode = code;
+            adVersion++;
+            adCodeHashes[adVersion] = tvm.hash(code);
+            emit CodeApplied(kind, adVersion);
+            _returnRest();
+        } else {
+            emit CodeApplied(kind, marketVersion + 1);
+            _upgradeMarket(code);
+        }
+    }
+
+    function _clearPendingCode() private {
+        TvmCell empty;
+        pendingCodeKind = 0;
+        pendingCode = empty;
+        pendingCodeAvailableAt = 0;
+    }
+
+    /// @notice The upgrader moves ads to the applied code of the ads (the latest version: an ad is never on a newer one), a
+    /// removed one bounces (the value goes to the owner). Each ad gets its share of the value
+    function upgradeAds(uint64[] ids) external view onlyUpgrader {
+        uint128 each = MarketGas.UPGRADE_FORWARD + DexGas.gasValue(MarketGas.UPGRADE_AD);
+        require(ids.length > 0 && uint128(msg.value) >= uint128(ids.length) * (each + DexGas.gasValue(MarketGas.UPGRADE_BATCH_ITEM)) + DexGas.gasValue(MarketGas.ADMIN), MarketErrors.LOW_VALUE);
+        tvm.rawReserve(varuint16(address(this).balance - msg.value), 0);
+        for (uint64 id : ids) {
+            require(id < adCount, MarketErrors.NO_AD);
+            IAd(adAddress(id)).upgrade{ value: varuint16(each), flag: 0, bounce: true }(adCode, adVersion, msg.sender);
+        }
+        msg.sender.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    function _upgradeMarket(TvmCell code) private {
+        TvmCell roles = abi.encode(owner, pendingOwner, upgrader, pendingUpgrader, upgradesRenounced, codeDelay);
+        TvmCell codes = abi.encode(platformCode, adCode, adVersion, adCodeHashes);
+        TvmCell market = abi.encode(settings, paused, adCount);
+        TvmCell state = abi.encode(roles, codes, market);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(MarketConstants.MARKET_STATE_LAYOUT, marketVersion, marketVersion + 1, msg.sender, state));
+    }
+
+    /// @notice The state of the old code (Upgrade.tsol); an unknown layout is refused, so the whole move rolls back
+    function onCodeUpgrade(TvmCell data) private {
+        (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+        require(layout == MarketConstants.MARKET_STATE_LAYOUT, MarketErrors.UNKNOWN_LAYOUT);
+        tvm.resetStorage();
+        (TvmCell roles, TvmCell codes, TvmCell market) = abi.decode(state, (TvmCell, TvmCell, TvmCell));
+        (owner, pendingOwner, upgrader, pendingUpgrader, upgradesRenounced, codeDelay) = abi.decode(roles, (address, address, address, address, bool, uint32));
+        (platformCode, adCode, adVersion, adCodeHashes) = abi.decode(codes, (TvmCell, TvmCell, uint32, mapping(uint32 => uint256)));
+        (settings, paused, adCount) = abi.decode(market, (Settings, bool, uint64));
+        marketVersion = newVersion;
+        emit CodeUpgraded(oldVersion, newVersion);
+        sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+    }
+
+    // ==========================================
+    // Getters
+    // ==========================================
+
+    /// @notice The roles, the delay of a code, whether publications are stopped and how many ads were published
+    function getDetails() internalMsg externalMsg external view returns (
+        address _owner,
+        address _pendingOwner,
+        address _upgrader,
+        address _pendingUpgrader,
+        bool _upgradesRenounced,
+        uint32 _codeDelay,
+        bool _paused,
+        uint64 _adCount
+    ) {
+        return (owner, pendingOwner, upgrader, pendingUpgrader, upgradesRenounced, codeDelay, paused, adCount);
+    }
+
+    function getSettings() internalMsg externalMsg external view returns (Settings) {
+        return settings;
+    }
+
+    function getCodeData() internalMsg externalMsg external view returns (
+        uint32 _marketVersion,
+        uint32 _adVersion,
+        uint256 _adCodeHash,
+        mapping(uint32 => uint256) _adCodeHashes,
+        uint256 _platformCodeHash,
+        uint8 _pendingCodeKind,
+        uint256 _pendingCodeHash,
+        uint32 _pendingCodeAvailableAt
+    ) {
+        return (marketVersion, adVersion, tvm.hash(adCode), adCodeHashes, tvm.hash(platformCode), pendingCodeKind,
+            pendingCodeKind == 0 ? 0 : tvm.hash(pendingCode), pendingCodeAvailableAt);
+    }
+}

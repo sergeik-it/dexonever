@@ -1,0 +1,30 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// Exit codes of the market and its ads
+library MarketErrors {
+    uint16 constant NOT_OWNER = 300;
+    uint16 constant NOT_UPGRADER = 301;
+    uint16 constant NOT_MARKET = 302;
+    uint16 constant NOT_AUTHOR = 303;
+    uint16 constant NOT_AD = 304;
+    uint16 constant NOT_PENDING = 305;
+    uint16 constant PAUSED = 306;
+    uint16 constant LOW_VALUE = 307;
+    uint16 constant BAD_TITLE = 311;
+    uint16 constant BAD_DESCRIPTION = 312;
+    uint16 constant BAD_PHOTOS = 313;
+    uint16 constant BAD_SETTINGS = 314;
+    uint16 constant FEE_TOO_LOW = 315;
+    uint16 constant BAD_CODE = 316;
+    uint16 constant NO_PENDING = 317;
+    uint16 constant TOO_EARLY = 318;
+    uint16 constant EXPIRED = 319;
+    uint16 constant RENOUNCED = 320;
+    uint16 constant UNKNOWN_LAYOUT = 321;
+    uint16 constant BAD_AMOUNT = 322;
+    uint16 constant NO_AD = 323;
+    uint16 constant BAD_DELAY = 324;
+    uint16 constant BAD_ADDRESS = 325;
+    uint16 constant BAD_COUNTRY = 326;
+    uint16 constant BAD_CITY = 327;
+}

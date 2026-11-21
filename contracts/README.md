@@ -1,6 +1,6 @@
 # Контракты DEXonEVER
 
-Исходники контрактов биржи DEXonEVER (Everscale) и моста Everscale ↔ BSC.
+Исходники контрактов биржи DEXonEVER (Everscale), моста Everscale ↔ BSC и маркета объявлений (Everscale).
 
 ```
 contracts/
@@ -8,9 +8,12 @@ contracts/
 │   ├── libraries/       константы, газ, ошибки, математика пар и маршрутов
 │   ├── structures/      общие структуры и события
 │   └── tip3/            токен TIP-3: токены фабрики и LP-токены пар
-└── bridge/
-    ├── everscale/       мост, сторона Everscale (T-Sol)
-    └── evm/             мост, сторона BSC (Solidity)
+├── bridge/
+│   ├── everscale/       мост, сторона Everscale (T-Sol)
+│   └── evm/             мост, сторона BSC (Solidity)
+└── market/              маркет объявлений, Everscale (T-Sol)
+    ├── interfaces/      вызовы маркета и объявления друг к другу
+    └── libraries/       константы, газ, ошибки
 ```
 
 ## Биржа — `exchange/`
@@ -54,6 +57,18 @@ contracts/
 | `VaultProxy` | Прокси ERC-1967: постоянный адрес хранилища, код обновляется через UUPS |
 | `BridgeConstants` | Константы хранилища |
 
+## Маркет — `market/`
+
+Объявления о продаже: маркет только продаёт. Контракты маркета подключают библиотеки биржи (`DexPlatform`, `MsgFlag`,
+`Upgrade`, `DexGas`, `LaunchParams`) путями репозитория биржи — `../../../dexonever/everscale/contracts/contracts/…`;
+в этой выгрузке те же файлы лежат в `exchange/`.
+
+| Контракт | Назначение |
+|---|---|
+| `Market` | Маркет: настройки, приём публикаций за плату в EVER, правка и снятие объявлений владельцем, коды объявлений и их обновление, роли |
+| `Ad` | Одно объявление: автор, цена, заголовок, описание, ссылки на фото, страна (код ISO 3166-1 alpha-2) и город; снятие автором |
+| `MarketStructs`, `interfaces/`, `libraries/` | Структуры, вызовы маркета и объявления, константы, газ, ошибки |
+
 ## Адреса
 
 ### Everscale
@@ -71,8 +86,9 @@ contracts/
 | `TokenList`, зарезервированные пары | `0:39b05da882f55df90fcd2a7eb04ca76cad991b941cf669415d2bc1a0bd44dbff` |
 | `BridgeRoot` | `0:390b023c0acb7156110de1ea0964c142293666fee63278b4970eaefa1891e712` |
 | `TokenRoot` токена моста | `0:91c58e2bbf9a7885a6112c435a1917a88968d29c5c8a944176ac8154594cb7ac` |
+| `Market` | `0:65ac62543dabd3408b3cce21bc227e1e10b9648074de0307eb38228b677cab20` |
 
-Пары, хранилища, счета `LpAccount`, шарды реестра, узлы событий и кривые развёртываются через `DexPlatform`. Их адреса вычисляются от корня биржи: геттеры `DexRoot` (`getPairAddress`, `getVaultAddress`, `getNativeVaultAddress`, `getRegistryAddress`, `getHubAddress`, `expectedPlatformAddress`) и `Launchpad.getCurveAddress`.
+Пары, хранилища, счета `LpAccount`, шарды реестра, узлы событий и кривые развёртываются через `DexPlatform`. Их адреса вычисляются от корня биржи: геттеры `DexRoot` (`getPairAddress`, `getVaultAddress`, `getNativeVaultAddress`, `getRegistryAddress`, `getHubAddress`, `expectedPlatformAddress`) и `Launchpad.getCurveAddress`. Объявления маркета — тоже через `DexPlatform`, от маркета: `Market.adAddress`.
 
 ### BSC
 

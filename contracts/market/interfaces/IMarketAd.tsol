@@ -1,0 +1,16 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../MarketStructs.tsol";
+
+/// What the market asks of an ad
+interface IAd {
+    function removeByMarket(address sendGasTo) external;
+    function edit(AdContent content, address sendGasTo) external;
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external;
+}
+
+/// The answers of an ad to its market
+interface IMarketAnswers {
+    function onAdRemoved(uint64 id, bool byOwner, address sendGasTo) external;
+    function onAdEdited(uint64 id, address sendGasTo) external;
+}

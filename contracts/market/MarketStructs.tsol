@@ -1,0 +1,36 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// The settings of the market: the owner changes them (Market.setSettings)
+struct Settings {
+    /// What a publication costs, in nanoEVER: the ad's deploy, its storage deposit and the market's work are paid of it
+    uint128 fee;
+    /// What an ad keeps for its storage
+    uint128 storageDeposit;
+    /// The size of a title (1..titleMaxBytes) and of a description (0..descriptionMaxBytes), in bytes of UTF-8
+    uint16 titleMaxBytes;
+    uint16 descriptionMaxBytes;
+    /// How many photos an ad has at most
+    uint8 photosMax;
+}
+
+/// What an ad says (the market only sells): price in nanoEVER (0: none), title,
+/// description, links to photos (ipfs://<CID>) and where the item is: the country as an ISO 3166-1 alpha-2 code
+/// (two capital Latin letters) and the city. The title, the description and the city are bytes: the market checks only
+/// their size, and a string of invalid UTF-8 would fail the ABI decoders of the site and the scanner
+struct AdContent {
+    uint128 price;
+    bytes title;
+    bytes description;
+    string[] photos;
+    string country;
+    bytes city;
+}
+
+/// What an ad said in the state layout 1, before the country and the city: such an ad moves to AdContent with an empty
+/// country and city (Ad.onCodeUpgrade)
+struct AdContentLayout1 {
+    uint128 price;
+    bytes title;
+    bytes description;
+    string[] photos;
+}

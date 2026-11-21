@@ -1,0 +1,40 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../../../../dexonever/everscale/contracts/contracts/libraries/DexGas.tsol";
+
+/// Gas of the market and its ads, in gas units at the network's price (DexGas.gasValue, config param 21); forwarding
+/// fees in EVER. Each figure is checked against a measure (market/everscale/test/gas.test.js)
+library MarketGas {
+    /// The market's work on a publication or an owner's edit: the checks, the ad's state init and the message; the dearest
+    /// content the bounds allow measured about 760 000
+    uint128 constant PUBLISH = 900_000;
+    /// The ad's deploy: DexPlatform's constructor and the ad's first onCodeUpgrade (measured about 9 000)
+    uint128 constant AD_DEPLOY = 50_000;
+    /// Forwarding of the deploy message: the codes of the platform and the ad and the largest content (measured about
+    /// 0.033 EVER)
+    uint128 constant AD_FORWARD = 0.05 ever;
+    /// The market's work on an ad's answer (removed, edited): the check of the sender and the event (measured about 14 000)
+    uint128 constant ANSWER = 30_000;
+    /// The ad's work on a removal: the answer to the market and the transfer of its balance (measured about 9 000)
+    uint128 constant REMOVE = 50_000;
+    /// The ad's work on an edit and its answer (measured about 7 000 on the largest content)
+    uint128 constant EDIT = 50_000;
+    /// The market's work on an administrative call
+    uint128 constant ADMIN = 100_000;
+    /// An ad's move to a new code and the forwarding of the code
+    uint128 constant UPGRADE_AD = 100_000;
+    uint128 constant UPGRADE_FORWARD = 0.05 ever;
+    /// The market's work a move of an ad costs in a batch
+    uint128 constant UPGRADE_BATCH_ITEM = 20_000;
+
+    /// What a publication spends of the fee at the gas price `price` (DexGas.gasPrice, read once a call): the ad's
+    /// storage deposit, its deploy and the market's work
+    function publishCost(uint128 price, uint128 storageDeposit) internal returns (uint128) {
+        return storageDeposit + AD_FORWARD + DexGas.valueAt(price, AD_DEPLOY + PUBLISH);
+    }
+
+    /// What the deploy message carries: the storage deposit, its forwarding and the ad's deploy
+    function deployValue(uint128 price, uint128 storageDeposit) internal returns (uint128) {
+        return storageDeposit + AD_FORWARD + DexGas.valueAt(price, AD_DEPLOY);
+    }
+}

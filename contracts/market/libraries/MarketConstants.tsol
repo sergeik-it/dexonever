@@ -1,0 +1,34 @@
+pragma tvm-solidity >= 0.79.0;
+
+/// The market's constants: the platform type of an ad, the bounds of the settings, the
+/// code kinds and the state layouts
+library MarketConstants {
+    /// The type_id of an ad's DexPlatform (root: the market, params: the ad's number)
+    uint8 constant PLATFORM_TYPE_AD = 8;
+
+    /// Bounds of the settings: they bound the size of an ad, so of its message and its storage
+    uint128 constant MIN_STORAGE_DEPOSIT = 0.1 ever;
+    uint128 constant MAX_STORAGE_DEPOSIT = 10 ever;
+    uint16 constant MAX_TITLE_BYTES = 512;
+    uint16 constant MAX_DESCRIPTION_BYTES = 4096;
+    uint8 constant MAX_PHOTOS = 10;
+    /// the size of a country code (ISO 3166-1 alpha-2) and the bounds of a city, in bytes
+    uint8 constant COUNTRY_BYTES = 2;
+    uint8 constant MAX_CITY_BYTES = 64;
+
+    /// What the market keeps of its balance when the owner withdraws the collected fees
+    uint128 constant MARKET_MIN_BALANCE = 1 ever;
+
+    /// Kinds of code the upgrader proposes
+    uint8 constant CODE_KIND_MARKET = 1;
+    uint8 constant CODE_KIND_AD = 2;
+    /// A proposed code waits codeDelay (at most MAX_CODE_DELAY) and is applied within PROPOSAL_APPLY_WINDOW after it
+    uint32 constant MAX_CODE_DELAY = 2 days;
+    uint32 constant PROPOSAL_APPLY_WINDOW = 7 days;
+
+    /// Layouts of the state a code packs for the next one (Upgrade.tsol of the exchange)
+    uint16 constant MARKET_STATE_LAYOUT = 1;
+    uint16 constant AD_STATE_LAYOUT = 2;
+    /// the ad's state before the country and the city (AdContentLayout1)
+    uint16 constant AD_STATE_LAYOUT_NO_PLACE = 1;
+}

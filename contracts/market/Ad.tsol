@@ -1,0 +1,110 @@
+pragma tvm-solidity >= 0.79.0;
+
+import "../../../dexonever/everscale/contracts/contracts/libraries/MsgFlag.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/Upgrade.tsol";
+import "../../../dexonever/everscale/contracts/contracts/libraries/DexGas.tsol";
+import "./libraries/MarketConstants.tsol";
+import "./libraries/MarketErrors.tsol";
+import "./libraries/MarketGas.tsol";
+import "./interfaces/IMarketAd.tsol";
+
+/// @title Ad - one ad of the market: its author, price, title, description and photos. Deployed by its
+/// market through the exchange's DexPlatform (root: the market, params: the ad's number), so its address does not depend
+/// on its code. The author removes it; the market removes it, edits it and moves it to a new code on the owner's and the
+/// upgrader's calls. A removed ad is destroyed, its balance goes to the author
+#[ExternalMessage(time, expire, pubkey)]
+#[TimeReplayProt]
+contract Ad is IAd {
+    address public market;
+    uint64 public id;
+    uint32 public version;
+    address public author;
+    uint32 public createdAt;
+    uint32 public editedAt;
+    AdContent content;
+
+    modifier onlyMarket() {
+        require(msg.sender == market, MarketErrors.NOT_MARKET);
+        _;
+    }
+
+    /// @notice The author removes the ad: the market is told (its answer carries the rest of the call's value back to the
+    /// author) and the ad is destroyed, its balance goes to the author
+    function remove() external view {
+        require(msg.sender == author, MarketErrors.NOT_AUTHOR);
+        require(msg.value >= DexGas.gasValue(MarketGas.REMOVE + MarketGas.ANSWER), MarketErrors.LOW_VALUE);
+        _close(false, author);
+    }
+
+    /// @notice The market removes the ad on the owner's call; the rest of the call's value goes back to sendGasTo
+    function removeByMarket(address sendGasTo) external view override onlyMarket {
+        _close(true, sendGasTo);
+    }
+
+    function _close(bool byOwner, address sendGasTo) private view {
+        IMarketAnswers(market).onAdRemoved{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(id, byOwner, sendGasTo);
+        author.transfer({ value: 0, flag: MsgFlag.ALL_NOT_RESERVED + MsgFlag.DESTROY_IF_ZERO, bounce: false });
+    }
+
+    /// @notice The market replaces what the ad says on the owner's call (the market checks it as a publication); the
+    /// rest of the call's value goes back to sendGasTo through the market's answer
+    function edit(AdContent newContent, address sendGasTo) external override onlyMarket {
+        content = newContent;
+        editedAt = uint32(block.timestamp);
+        IMarketAnswers(market).onAdEdited{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(id, sendGasTo);
+    }
+
+    /// @notice The market moves the ad to its applied code on the upgrader's call: the market's latest version, never older
+    /// than the ad's
+    function upgrade(TvmCell code, uint32 newVersion, address sendGasTo) external override onlyMarket {
+        TvmCell state = abi.encode(market, id, author, createdAt, editedAt, content);
+        tvm.setcode(code);
+        tvm.setCurrentCode(code);
+        onCodeUpgrade(Upgrade.pack(MarketConstants.AD_STATE_LAYOUT, version, newVersion, sendGasTo, state));
+    }
+
+    /// @notice The first start from DexPlatform (its data: the market, type_id, the version, who gets the gas, the
+    /// platform's code, the params with the ad's number, the init data with the author and the content), or the state of
+    /// the old code (Upgrade.tsol): the layout 2 as it is, the layout 1 (before the country and the city) with an empty place.
+/// The ad keeps the whole value of its deploy: its storage deposit
+    function onCodeUpgrade(TvmCell data) private {
+        if (Upgrade.isUpgrade(data)) {
+            (uint16 layout, , uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
+            require(layout == MarketConstants.AD_STATE_LAYOUT || layout == MarketConstants.AD_STATE_LAYOUT_NO_PLACE, MarketErrors.UNKNOWN_LAYOUT);
+            tvm.resetStorage();
+            if (layout == MarketConstants.AD_STATE_LAYOUT) {
+                (market, id, author, createdAt, editedAt, content) = abi.decode(state, (address, uint64, address, uint32, uint32, AdContent));
+            } else {
+                // an ad from before the country and the city: the same content, the place stays empty
+                AdContentLayout1 old;
+                (market, id, author, createdAt, editedAt, old) = abi.decode(state, (address, uint64, address, uint32, uint32, AdContentLayout1));
+                content = AdContent(old.price, old.title, old.description, old.photos, "", "");
+            }
+            version = newVersion;
+            sendGasTo.transfer({ value: 0, flag: MsgFlag.REMAINING_GAS + MsgFlag.IGNORE_ERRORS, bounce: false });
+            return;
+        }
+        tvm.resetStorage();
+        TvmSlice s = data.toSlice();
+        market = s.load(address);
+        s.load(uint8);
+        version = s.load(uint32);
+        s.load(address);
+        s.loadRef();
+        id = s.loadRef().toSlice().load(uint64);
+        (author, content) = abi.decode(s.loadRef(), (address, AdContent));
+        createdAt = uint32(block.timestamp);
+    }
+
+    function getDetails() internalMsg externalMsg external view returns (
+        address _market,
+        uint64 _id,
+        uint32 _version,
+        address _author,
+        uint32 _createdAt,
+        uint32 _editedAt,
+        AdContent _content
+    ) {
+        return (market, id, version, author, createdAt, editedAt, content);
+    }
+}
