@@ -25,6 +25,10 @@ library DexConstants {
     uint32 constant OWNER_WITHDRAWAL_MAX_REASON_BYTES = 256;
     // a curve's question to a buyer's wallet without an answer this long is taken as lost: retryDelivery asks anew
     uint32 constant DELIVERY_ANSWER_TIMEOUT = 1 days;
+    // the first depositor of a new ordinary pair keeps the empty pool this long (the root's firstDepositWindow, the owner
+    // changes it for new pairs), at most the max; then anyone deposits first
+    uint32 constant FIRST_DEPOSIT_WINDOW = 2 days;
+    uint32 constant FIRST_DEPOSIT_WINDOW_MAX = 30 days;
 
     // ==========================================
     // Platform children: the kinds of contract the root deploys on DexPlatform (a part of their addresses) and the
@@ -42,12 +46,17 @@ library DexConstants {
     // an event hub (DexHub): the platform's params are its family and its index
     uint8 constant PLATFORM_TYPE_HUB = 7;
     // the layout of the state each contract packs for its next code (Upgrade.tsol); the root's layouts 1 to 4 are not taken.
-    // 6: a registry shard's or an event hub's deploy on its way keeps who gets its value back; the root takes layout 5 too
-    uint16 constant ROOT_STATE_LAYOUT = 6;
+    // 6: a registry shard's or an event hub's deploy on its way keeps who gets its value back; 7: the first deposit
+    // window. The root takes layouts 5 and 6 too
+    uint16 constant ROOT_STATE_LAYOUT = 7;
+    uint16 constant ROOT_STATE_LAYOUT_6 = 6;
     uint16 constant ROOT_STATE_LAYOUT_5 = 5;
     uint16 constant REGISTRY_STATE_LAYOUT = 1;
     uint16 constant HUB_STATE_LAYOUT = 1;
-    uint16 constant PAIR_STATE_LAYOUT = 2;
+    // 3: the mark of a launch token's pair apart from its first depositor and the end of the first depositor's time; the
+    // pair takes layout 2 too
+    uint16 constant PAIR_STATE_LAYOUT = 3;
+    uint16 constant PAIR_STATE_LAYOUT_2 = 2;
     uint16 constant TOKEN_VAULT_STATE_LAYOUT = 1;
     uint16 constant NATIVE_VAULT_STATE_LAYOUT = 1;
     // includes the halves in flight to the pair; layout 1 is not taken

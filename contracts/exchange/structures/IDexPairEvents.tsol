@@ -20,6 +20,9 @@ interface IDexPairEvents {
     event OperationRefunded(address recipient, address token, uint128 amount);
     event BeneficiaryFeePaid(address beneficiary, uint128 leftAmount, uint128 rightAmount);
     event BeneficiaryChanged(address beneficiary);
+    // the first depositor of the empty pool changed until `until` (DexRoot.clearPairFirstDepositor, claimFirstDeposit);
+    // zero: anyone deposits first
+    event FirstDepositorSet(address firstDepositor, uint32 until);
     event PairStatus(bool paused, bool frozen);
     /// The upgrader stopped the pair for a move to a new code, or the stop was lifted
     event UpgradeStatus(bool upgrading);

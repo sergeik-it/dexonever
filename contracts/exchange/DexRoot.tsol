@@ -13,6 +13,7 @@ import "./libraries/Upgrade.tsol";
 import "./EverSurplus.tsol";
 import "./TokenList.tsol";
 import "./libraries/LaunchParams.tsol";
+import "./tip3/TokenRoot.tsol";
 
 interface IDexStoppable {
     function setPaused(bool _paused, address sendGasTo) external;
@@ -28,6 +29,7 @@ interface IDexPairAdmin {
     function setAmplification(uint32 target, uint32 duration, address sendGasTo) external;
     function setLpAccountCode(TvmCell code, uint32 version, address sendGasTo) external;
     function collectLpRootSurplus(address sendGasTo) external;
+    function setFirstDepositor(address depositor, uint32 window, address sendGasTo) external;
 }
 
 /// The launchpad's answer to a registration of a launch token: the token's vault, its pair with EVER and the EVER vault,
@@ -112,6 +114,19 @@ contract DexRoot is EverSurplus {
         address payer;
     }
 
+    /// What a TIP-3 token root was deployed from but its owner (claimFirstDeposit): the address of the token is the hash
+    /// of its StateInit
+    struct TokenOrigin {
+        TvmCell code;
+        uint256 pubkey;
+        uint256 nonce;
+        address deployer;
+        string name;
+        string symbol;
+        uint8 decimals;
+        TvmCell walletCode;
+    }
+
     address public owner;
     address public pendingOwner;
     address public manager;
@@ -193,6 +208,10 @@ contract DexRoot is EverSurplus {
     address public reservedPairList;
     mapping(uint64 => PairRequest) pairRequests;
     uint64 pairRequestNonce;
+    // How long the first depositor of a new ordinary pair keeps its empty pool (DexPair.firstDepositUntil), then anyone
+    // deposits first. DexConstants.FIRST_DEPOSIT_WINDOW at the deploy, the owner changes it for new pairs
+    // (setFirstDepositWindow), at most DexConstants.FIRST_DEPOSIT_WINDOW_MAX
+    uint32 public firstDepositWindow;
 
     // How long a proposed code waits (proposeCode): set by the deploy, never changed, at most
     // DexConstants.CODE_UPGRADE_DELAY. 0: a proposed code may be applied at once
@@ -230,6 +249,7 @@ contract DexRoot is EverSurplus {
     event LaunchTokenReleased(address tokenRoot);
     // the launchpad refused a reservation of symbols (its call bounced): the factory was not asked
     event ReservedSymbolsRefused();
+    event FirstDepositWindowChanged(uint32 window);
 
     modifier onlyOwner() {
         require(msg.sender == owner, DexErrors.NOT_AUTHORIZED);
@@ -319,6 +339,7 @@ contract DexRoot is EverSurplus {
 
         poolNumerator = DexConstants.DEFAULT_POOL_FEE;
         beneficiaryNumerator = DexConstants.DEFAULT_BENEFICIARY_FEE;
+        firstDepositWindow = DexConstants.FIRST_DEPOSIT_WINDOW;
     }
 
     /// @notice Deterministic StateInit for child contracts
@@ -434,7 +455,10 @@ contract DexRoot is EverSurplus {
             (address left, address right, bool isStable) = p.load(address, address, bool);
             (uint8 decimalsLeft, uint8 decimalsRight, uint32 amplification, address pairBeneficiary, address firstDepositor, address creator) =
                 abi.decode(details, (uint8, uint8, uint32, address, address, address));
-            _deployPlatform(typeId, params, pairCode, pairVersion, _pairInitData(decimalsLeft, decimalsRight, amplification, pairBeneficiary, firstDepositor), payer);
+            // the pair of a launch token: its first depositor is the token's curve (migrateLaunchToken). No other pair of
+            // a token on a curve is deployed: deployPair refuses it and the curve's registration refuses a pair claimed
+            bool launchPair = _isCurveOf(left, firstDepositor) || _isCurveOf(right, firstDepositor);
+            _deployPlatform(typeId, params, pairCode, pairVersion, _pairInitData(decimalsLeft, decimalsRight, amplification, pairBeneficiary, firstDepositor, launchPair), payer);
             emit PairDeployed(target, left, right, isStable, creator);
         } else if (typeId == DexConstants.PLATFORM_TYPE_NATIVE_VAULT) {
             _deployPlatform(typeId, params, nativeVaultCode, nativeVaultVersion, empty, payer);
@@ -529,6 +553,11 @@ contract DexRoot is EverSurplus {
         return target.isStdAddrWithoutAnyCast() && target.wid == 0;
     }
 
+    function _isCurveOf(address tokenRoot, address curve) private view returns (bool) {
+        optional(address) found = launchCurves.fetch(tokenRoot);
+        return found.hasValue() && found.get() == curve;
+    }
+
     /// @notice A token on a curve of the launchpad gets no vault and no pair from anyone but its curve
     function _requireOffCurve(address tokenRoot) private view {
         require(!launchCurves.exists(tokenRoot), DexErrors.ON_CURVE);
@@ -548,13 +577,15 @@ contract DexRoot is EverSurplus {
     }
 
     /// @notice LP token and LpAccount codes, the current fees, the beneficiary, for a stable pair decimals (left, right)
-    /// and A, and the only first depositor (zero: anyone) handed to a new pair; they do not take part in the pair address
+    /// and A, the only first depositor (zero: anyone), whether it is a launch token's pair and how long the first depositor
+    /// keeps the empty pool (firstDepositWindow) handed to a new pair; they do not take part in the pair address
     function _pairInitData(
         uint8 decimalsLeft,
         uint8 decimalsRight,
         uint32 amplification,
         address pairBeneficiary,
-        address firstDepositor
+        address firstDepositor,
+        bool launchPair
     ) private view returns (TvmCell) {
         TvmBuilder b;
         b.store(lpRootCode);
@@ -565,14 +596,16 @@ contract DexRoot is EverSurplus {
         b.store(beneficiaryNumerator);
         b.store(pairBeneficiary);
         b.store(decimalsLeft, decimalsRight, amplification);
-        b.store(firstDepositor);
+        b.store(firstDepositor, launchPair, firstDepositWindow);
         return b.toCell();
     }
 
     /// @notice Deploys a constant-product pair; anyone, while the root is active. The caller pays:
     /// msg.value >= DexGas.deployPairValue() (plus PAIR_CHECK gas for a user). A user's deploy first
     /// asks the reserved pair list (one more round of messages, PAIR_CHECK): a pair in it is the owner's, the value goes
-    /// back; so does it if the list does not answer. The owner's deploy does not ask. Returns the pair's address either way
+    /// back; so does it if the list does not answer. The owner's deploy does not ask. Returns the pair's address either way.
+    /// The caller is the pair's first depositor: only its deposit fills the empty pool, so nobody sets the first price
+    /// ahead of it (the owner names another one with deployPairFor)
     function deployPair(address tokenA, address tokenB) external returns (address) {
         require(active, DexErrors.PAUSED);
         require(tokenA != tokenB, DexErrors.INVALID_TOKEN);
@@ -582,7 +615,7 @@ contract DexRoot is EverSurplus {
         _requireOffCurve(tokenB);
         if (msg.sender == owner || _noReservedPairList()) {
             require(msg.value >= DexGas.deployPairValue(), DexErrors.NOT_ENOUGH_GAS);
-            return _claimPair(tokenA, tokenB, false, 0, 0, 0, beneficiary, address(0), 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
+            return _claimPair(tokenA, tokenB, false, 0, 0, 0, beneficiary, msg.sender, 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
         }
         require(msg.value >= DexGas.deployPairValue() + DexGas.gasValue(DexGas.PAIR_CHECK), DexErrors.NOT_ENOUGH_GAS);
         address pair = getPairAddress(tokenA, tokenB, false);
@@ -610,7 +643,21 @@ contract DexRoot is EverSurplus {
             return;
         }
         delete pairRequests[id];
-        _claimPair(request.tokenA, request.tokenB, false, 0, 0, 0, beneficiary, address(0), 0, MsgFlag.REMAINING_GAS, request.payer, request.payer);
+        _claimPair(request.tokenA, request.tokenB, false, 0, 0, 0, beneficiary, request.payer, 0, MsgFlag.REMAINING_GAS, request.payer, request.payer);
+    }
+
+    /// @notice The owner deploys a constant-product pair and names its first depositor (zero: anyone deposits first), as
+    /// deployPair otherwise. The owner pays: msg.value >= DexGas.deployPairValue()
+    function deployPairFor(address tokenA, address tokenB, address firstDepositor) external onlyOwner returns (address) {
+        require(active, DexErrors.PAUSED);
+        require(tokenA != tokenB, DexErrors.INVALID_TOKEN);
+        require(_isStd0(firstDepositor), DexErrors.INVALID_AMOUNT);
+        _requireStdToken(tokenA);
+        _requireStdToken(tokenB);
+        _requireOffCurve(tokenA);
+        _requireOffCurve(tokenB);
+        require(msg.value >= DexGas.deployPairValue(), DexErrors.NOT_ENOUGH_GAS);
+        return _claimPair(tokenA, tokenB, false, 0, 0, 0, beneficiary, firstDepositor, 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
     }
 
     /// @notice A user's pair deploy that is not made: its value goes back to the payer
@@ -628,7 +675,8 @@ contract DexRoot is EverSurplus {
     }
 
     /// @notice Deploys a StableSwap pair: only the owner, since decimals and A are trusted and are not part of the
-    /// address (one stable pair per two tokens). The owner pays: msg.value >= DexGas.deployPairValue()
+    /// address (one stable pair per two tokens). The owner pays: msg.value >= DexGas.deployPairValue(). The owner is the
+    /// pair's first depositor (deployStablePairFor names another one)
     function deployStablePair(
         address tokenA,
         address tokenB,
@@ -636,6 +684,31 @@ contract DexRoot is EverSurplus {
         uint8 decimalsB,
         uint32 amplification
     ) external onlyOwner returns (address) {
+        return _deployStablePair(tokenA, tokenB, decimalsA, decimalsB, amplification, msg.sender);
+    }
+
+    /// @notice The owner deploys a StableSwap pair and names its first depositor (zero: anyone deposits first), as
+    /// deployStablePair otherwise
+    function deployStablePairFor(
+        address tokenA,
+        address tokenB,
+        uint8 decimalsA,
+        uint8 decimalsB,
+        uint32 amplification,
+        address firstDepositor
+    ) external onlyOwner returns (address) {
+        require(_isStd0(firstDepositor), DexErrors.INVALID_AMOUNT);
+        return _deployStablePair(tokenA, tokenB, decimalsA, decimalsB, amplification, firstDepositor);
+    }
+
+    function _deployStablePair(
+        address tokenA,
+        address tokenB,
+        uint8 decimalsA,
+        uint8 decimalsB,
+        uint32 amplification,
+        address firstDepositor
+    ) private returns (address) {
         require(active, DexErrors.PAUSED);
         require(tokenA != tokenB, DexErrors.INVALID_TOKEN);
         require(msg.value >= DexGas.deployPairValue(), DexErrors.NOT_ENOUGH_GAS);
@@ -651,7 +724,7 @@ contract DexRoot is EverSurplus {
         _requireOffCurve(tokenB);
 
         (uint8 decimalsLeft, uint8 decimalsRight) = tokenA < tokenB ? (decimalsA, decimalsB) : (decimalsB, decimalsA);
-        return _claimPair(tokenA, tokenB, true, decimalsLeft, decimalsRight, amplification, beneficiary, address(0), 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
+        return _claimPair(tokenA, tokenB, true, decimalsLeft, decimalsRight, amplification, beneficiary, firstDepositor, 0, MsgFlag.REMAINING_GAS, msg.sender, msg.sender);
     }
 
     /// `payer` gets a bounced deploy and the gas left back, `creator` goes into PairDeployed; the decimals (left, right),
@@ -1178,6 +1251,48 @@ contract DexRoot is EverSurplus {
         IDexPairAdmin(pair).setBeneficiary{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(_beneficiary, msg.sender);
     }
 
+    /// @notice The owner lifts the first depositor of a pair: anyone deposits first into its empty pool. The pair of a
+    /// launch token refuses it (DexPair.setFirstDepositor): its first deposit is its curve's
+    function clearPairFirstDepositor(address pair) external view onlyOwner {
+        _requireAdminGas();
+        IDexPairAdmin(pair).setFirstDepositor{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false }(address(0), 0, msg.sender);
+    }
+
+    /// @notice The owner sets how long the first depositor of a new ordinary pair keeps its empty pool (at most
+    /// DexConstants.FIRST_DEPOSIT_WINDOW_MAX); pairs deployed before keep theirs
+    function setFirstDepositWindow(uint32 window) external onlyOwner {
+        require(window <= DexConstants.FIRST_DEPOSIT_WINDOW_MAX, DexErrors.INVALID_AMOUNT);
+        firstDepositWindow = window;
+        emit FirstDepositWindowChanged(window);
+    }
+
+    /// @notice The creator of a token takes the first deposit of the empty pair of the token with `otherToken` for
+    /// firstDepositWindow from now: `origin` is what the token was deployed from with the sender as its owner
+    /// (rootOwner_), the token's address its hash. Another origin names another token, and its pair (if there is none, the
+    /// call bounces back to the root and the value stays) does not change. A filled pool and the pair of a launch token
+    /// keep their first depositor (DexPair.setFirstDepositor)
+    function claimFirstDeposit(TokenOrigin origin, address otherToken, bool isStable) external view {
+        _requireAdminGas();
+        TvmCell stateInit = abi.encodeStateInit({
+            contr: TokenRoot,
+            varInit: {
+                randomNonce_: origin.nonce,
+                deployer_: origin.deployer,
+                name_: origin.name,
+                symbol_: origin.symbol,
+                decimals_: origin.decimals,
+                rootOwner_: msg.sender,
+                walletCode_: origin.walletCode
+            },
+            pubkey: origin.pubkey,
+            code: origin.code
+        });
+        address token = address.makeAddrStd(0, tvm.hash(stateInit));
+        IDexPairAdmin(getPairAddress(token, otherToken, isStable)).setFirstDepositor{ value: 0, flag: MsgFlag.REMAINING_GAS, bounce: true }(
+            msg.sender, firstDepositWindow, msg.sender
+        );
+    }
+
     /// @notice The owner proposes a fee of an existing pair. Any fee change of an existing pair waits
     /// DexConstants.NEW_PAIR_FEE_INCREASE_DELAY and then applyPairFee, a decrease too; the pair of a
     /// launch token refuses a lower beneficiary part (DexPairGovernance.proposeFee). The root's own fees (setFees) are
@@ -1694,7 +1809,7 @@ contract DexRoot is EverSurplus {
             pendingFeeAvailableAt, pendingPoolNumerator, pendingBeneficiaryNumerator
         );
         TvmCell launch = abi.encode(launchpad, launchCurves);
-        TvmCell pairs = abi.encode(reservedPairList, pairRequests, pairRequestNonce);
+        TvmCell pairs = abi.encode(reservedPairList, pairRequests, pairRequestNonce, firstDepositWindow);
         TvmCell upgrades = abi.encode(upgrader, pendingUpgrader, upgradesRenounced, upgraderStopsDisabled, installedCodes, codeDelay);
         TvmCell registry = abi.encode(registryCode, registryVersion, registriesSent, registriesReady, registriesDeploying);
         TvmCell hubs = abi.encode(hubCode, hubVersion, hubsSent, hubsReady, hubsDeploying);
@@ -1711,8 +1826,12 @@ contract DexRoot is EverSurplus {
 
     function onCodeUpgrade(TvmCell data) private {
         (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
-        // layout 5 kept no payer of a shard's or a hub's deploy on its way: the owner gets a bounced one
-        require(layout == DexConstants.ROOT_STATE_LAYOUT || layout == DexConstants.ROOT_STATE_LAYOUT_5, DexErrors.UNKNOWN_STATE_LAYOUT);
+        // layout 5 kept no payer of a shard's or a hub's deploy on its way: the owner gets a bounced one; layouts 5 and 6
+        // had no first deposit window
+        require(
+            layout == DexConstants.ROOT_STATE_LAYOUT || layout == DexConstants.ROOT_STATE_LAYOUT_6 || layout == DexConstants.ROOT_STATE_LAYOUT_5,
+            DexErrors.UNKNOWN_STATE_LAYOUT
+        );
         tvm.resetStorage();
         TvmCell codes;
         TvmCell versions;
@@ -1726,7 +1845,7 @@ contract DexRoot is EverSurplus {
             state,
             (address, address, address, bool, TvmCell, TvmCell, TvmCell, TvmCell, optional(EverSurplusRequest), TvmCell, TvmCell, TvmCell, TvmCell)
         );
-        if (layout == DexConstants.ROOT_STATE_LAYOUT) {
+        if (layout != DexConstants.ROOT_STATE_LAYOUT_5) {
             (hubCode, hubVersion, hubsSent, hubsReady, hubsDeploying) = abi.decode(
                 hubs, (TvmCell, uint32, uint64, uint64, mapping(address => PendingDeploy))
             );
@@ -1744,7 +1863,12 @@ contract DexRoot is EverSurplus {
             registriesDeploying = _paidByOwner(shardIndexes);
         }
         (launchpad, launchCurves) = abi.decode(launch, (address, mapping(address => address)));
-        (reservedPairList, pairRequests, pairRequestNonce) = abi.decode(pairs, (address, mapping(uint64 => PairRequest), uint64));
+        if (layout == DexConstants.ROOT_STATE_LAYOUT) {
+            (reservedPairList, pairRequests, pairRequestNonce, firstDepositWindow) = abi.decode(pairs, (address, mapping(uint64 => PairRequest), uint64, uint32));
+        } else {
+            (reservedPairList, pairRequests, pairRequestNonce) = abi.decode(pairs, (address, mapping(uint64 => PairRequest), uint64));
+            firstDepositWindow = DexConstants.FIRST_DEPOSIT_WINDOW;
+        }
         (upgrader, pendingUpgrader, upgradesRenounced, upgraderStopsDisabled, installedCodes, codeDelay) = abi.decode(
             upgrades,
             (address, address, bool, bool, mapping(uint8 => InstalledCode), uint32)

@@ -61,10 +61,14 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
     uint128 public beneficiaryLeft;
     uint128 public beneficiaryRight;
 
-    // The pair of a launch token and EVER (DexRoot.migrateLaunchToken): while it is empty, only this depositor (the
-    // token's curve) may make the first deposit, so nobody sets the pool's first price ahead of the curve. Zero for
-    // every other pair
+    // While the pool is empty, only this depositor may make the first deposit, so nobody sets the pool's first price
+    // ahead of it: the pair's creator, the one the owner named, a token's creator (DexRoot.claimFirstDeposit) or the
+    // curve of a launch token. Zero: anyone. Until firstDepositUntil, then anyone; a launch token's pair keeps it for good
     address firstDepositor;
+    uint32 firstDepositUntil;
+    // The pair of a launch token and EVER (DexRoot.migrateLaunchToken): its beneficiary is the token's creator and its
+    // first depositor the token's curve, for good
+    bool launchPair;
 
     // Payouts ordered from a vault and not taken over yet: the reserves already gave the amount,
     // so a payout the vault refused must not vanish. The vault answers onPayoutTaken; a bounce keeps the amount for its
@@ -96,7 +100,7 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
             _returnExcess(sendGasTo);
             return;
         }
-        TvmCell identity = abi.encode(root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor);
+        TvmCell identity = abi.encode(root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor, launchPair, firstDepositUntil);
         TvmCell pool = abi.encode(
             leftReserve, rightReserve, lpSupply, fee, beneficiary, beneficiaryLeft, beneficiaryRight,
             pendingPoolNumerator, pendingBeneficiaryNumerator, pendingFeeAvailableAt
@@ -116,15 +120,24 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
 
     function _upgradeFrom(TvmCell data) private {
         (uint16 layout, uint32 oldVersion, uint32 newVersion, address sendGasTo, TvmCell state) = Upgrade.unpack(data);
-        require(layout == DexConstants.PAIR_STATE_LAYOUT, DexErrors.UNKNOWN_STATE_LAYOUT);
+        require(layout == DexConstants.PAIR_STATE_LAYOUT || layout == DexConstants.PAIR_STATE_LAYOUT_2, DexErrors.UNKNOWN_STATE_LAYOUT);
         tvm.resetStorage();
         (TvmCell identity, TvmCell pool, TvmCell stableState, TvmCell lp, TvmCell payoutJournal) =
             abi.decode(state, (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell));
         (nextPayoutId, payouts, unpaid) = abi.decode(payoutJournal, (uint64, mapping(uint64 => PendingPayout), mapping(address => Unpaid)));
-        (root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor) = abi.decode(
-            identity,
-            (address, address, address, address, address, TvmCell, TvmCell, uint32, address)
-        );
+        if (layout == DexConstants.PAIR_STATE_LAYOUT) {
+            (root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor, launchPair, firstDepositUntil) = abi.decode(
+                identity,
+                (address, address, address, address, address, TvmCell, TvmCell, uint32, address, bool, uint32)
+            );
+        } else {
+            // layout 2: only the pair of a launch token had a first depositor
+            (root, leftRoot, rightRoot, leftVault, rightVault, platformCode, lpAccountCode, lpAccountVersion, firstDepositor) = abi.decode(
+                identity,
+                (address, address, address, address, address, TvmCell, TvmCell, uint32, address)
+            );
+            launchPair = !firstDepositor.isStdZero();
+        }
         hub = Hubs.addressOf(root, platformCode, DexConstants.HUB_FAMILY_PAIR, address(this));
         (
             leftReserve, rightReserve, lpSupply, fee, beneficiary, beneficiaryLeft, beneficiaryRight,
@@ -204,11 +217,32 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
                 0
             );
         }
-        firstDepositor = init.load(address);
+        (address depositor, bool launch, uint32 window) = init.load(address, bool, uint32);
+        firstDepositor = depositor;
+        launchPair = launch;
+        firstDepositUntil = block.timestamp + window;
     }
 
     function _isLaunchPair() internal view override returns (bool) {
-        return !firstDepositor.isStdZero();
+        return launchPair;
+    }
+
+    /// @notice The only first depositor of the empty pool for `window` from now (zero: anyone). A filled pool and the pair of
+    /// a launch token (its first deposit is its curve's) keep theirs; gas back. Only the root
+    function setFirstDepositor(address depositor, uint32 window, address sendGasTo) external onlyRoot {
+        if (!launchPair && lpSupply == 0) {
+            firstDepositor = depositor;
+            firstDepositUntil = block.timestamp + window;
+            emit FirstDepositorSet(depositor, firstDepositUntil);
+            _ring();
+        }
+        _returnExcess(sendGasTo);
+    }
+
+    /// @notice Who alone may make the first deposit now: zero once the first depositor's time is over (a launch token's
+    /// pair keeps its curve)
+    function _firstDepositorNow() private view returns (address) {
+        return launchPair || block.timestamp < firstDepositUntil ? firstDepositor : address(0);
     }
 
     /// @notice Address of the vault of `token` (the native vault for address 0), as DexRoot computes it
@@ -412,7 +446,8 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
         optional(PairQuotes.DepositQuote) quote = PairQuotes.quoteAddLiquidity(_state(), _pool(), leftAmount, rightAmount);
 
         // The LpAccount has already zeroed both halves: a refusal returns them, it must not throw
-        bool waitsForFirst = lpSupply == 0 && !firstDepositor.isStdZero() && owner != firstDepositor;
+        address first = _firstDepositorNow();
+        bool waitsForFirst = lpSupply == 0 && !first.isStdZero() && owner != first;
         if (paused || _stopped() || waitsForFirst || !quote.hasValue() || quote.get().lpOut < minLpOut) {
             _refundHalves(owner, leftAmount, rightAmount);
             return;
@@ -826,10 +861,10 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
         return PairQuotes.quoteWithdraw(_state(), _pool(), lpAmount);
     }
 
-    /// @notice The only first depositor of a launch token's pair (zero for other pairs), until the first deposit, and the LP
+    /// @notice Who alone may make the first deposit now (zero: anyone; it matters until the first deposit) and the LP
     /// issued: the curve asks it to learn that its pair exists and whether its first deposit is in. Anyone (responsible getter)
     function getFirstDeposit() internalMsg externalMsg external view responsible returns (address firstDepositor_, uint128 lpSupply_) {
-        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (firstDepositor, lpSupply);
+        return { value: 0, flag: MsgFlag.REMAINING_GAS, bounce: false } (_firstDepositorNow(), lpSupply);
     }
 
     /// @notice Address of the LpAccount of `owner` in this pair. Anyone (getter)
