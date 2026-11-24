@@ -815,14 +815,20 @@ contract DexPair is DexPairGovernance, EverSurplus, IDexPairVaultOperation, IDex
         );
     }
 
-    /// @notice StableSwap data of a stable pair: decimals, the ramp of A, A now and a proposed change. Anyone (getter)
+    /// @notice StableSwap data of a stable pair: decimals, the ramp of A, A now and a proposed change (none once its window
+    /// has passed: it can no longer start). Anyone (getter)
     function getStableData() internalMsg externalMsg external view returns (
         StableStructures.StableConfig _stable,
         uint32 _amplification,
         optional(StableStructures.PendingAmplification) _pendingA
     ) {
         require(isStable, DexErrors.NOT_STABLE);
-        return (stable, PairQuotes.amplificationAt(stable, uint32(block.timestamp)), pendingA);
+        uint32 nowTime = uint32(block.timestamp);
+        optional(StableStructures.PendingAmplification) shown;
+        if (pendingA.hasValue() && nowTime <= pendingA.get().expiresAt) {
+            shown = pendingA;
+        }
+        return (stable, PairQuotes.amplificationAt(stable, nowTime), shown);
     }
 
     /// @notice Expected results: the same calculation the operation does now; empty — the pair refuses it.

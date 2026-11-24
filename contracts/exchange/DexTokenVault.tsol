@@ -500,9 +500,9 @@ contract DexTokenVault is VaultJournal, EverSurplus, IAcceptTokensTransferCallba
     }
 
     /// @notice Only the root: users' withdrawals from a stopped vault, allowed or taken back by the owner. Allowing them for a vault
-    /// that is not stopped is refused (they work anyway, and the flag would outlive no stop)
+    /// that is not stopped is refused (they work anyway, and the flag would outlive no stop); the same value changes nothing and emits no event
     function setWithdrawalsAllowed(bool allowed, address sendGasTo) external onlyRoot {
-        if (!allowed || _stopped()) {
+        if (allowed != withdrawalsAllowed && (!allowed || _stopped())) {
             withdrawalsAllowed = allowed;
             emit WithdrawalsAllowed(allowed);
             _ring();
